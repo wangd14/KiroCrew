@@ -41,12 +41,27 @@ def _req_with_store(store: ScriptHookStore, hook_id: str, context: str) -> make_
 @pytest.mark.asyncio
 async def test_stop_hook_test_supplies_full_assistant_text(tmp_path):
     store = ScriptHookStore(tmp_path)
-    hook = store.create({"name": "stop-hook", "event": HOOK_EVENT_STOP, "matcher": "", "command": "cat"})
+    hook = store.create(
+        {"name": "stop-hook", "event": HOOK_EVENT_STOP, "matcher": "", "command": "cat"}
+    )
     full = ("x" * 900) + "\n[OPTIONS: A | B | C]"
 
-    fake_result = type("R", (), {"exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1, "error": "", "hook_name": "stop-hook"})()
+    fake_result = type(
+        "R",
+        (),
+        {
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 1,
+            "error": "",
+            "hook_name": "stop-hook",
+        },
+    )()
     with (
-        patch("kiro_crew.hooks.run_script_hook", new_callable=AsyncMock, return_value=fake_result) as mock_run,
+        patch(
+            "kiro_crew.hooks.run_script_hook", new_callable=AsyncMock, return_value=fake_result
+        ) as mock_run,
         patch("kiro_crew.dashboard.handlers.hooks._sel", return_value=MagicMock()),
     ):
         resp = await api_hook_test(_req_with_store(store, hook.id, full))
@@ -61,14 +76,78 @@ async def test_stop_hook_test_supplies_full_assistant_text(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_non_stop_hook_test_uses_default_payload(tmp_path):
-    # A non-Stop hook keeps the default (None) payload — run_script_hook builds it.
+async def test_user_prompt_submit_hook_test_supplies_full_prompt(tmp_path):
+    # A UserPromptSubmit hook reads its context from the stdin ``prompt`` key
+    # (fire() sets it there); the env var is capped at 500 for every event, so
+    # the test endpoint must carry the FULL prompt on stdin or a >500-char test
+    # context is truncated on both paths and the hook receives incomplete input.
     store = ScriptHookStore(tmp_path)
-    hook = store.create({"name": "ups-hook", "event": HOOK_EVENT_USER_PROMPT_SUBMIT, "matcher": "", "command": "cat"})
+    hook = store.create(
+        {
+            "name": "ups-hook",
+            "event": HOOK_EVENT_USER_PROMPT_SUBMIT,
+            "matcher": "",
+            "command": "cat",
+        }
+    )
+    full = "p" * 900
 
-    fake_result = type("R", (), {"exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1, "error": "", "hook_name": "ups-hook"})()
+    fake_result = type(
+        "R",
+        (),
+        {
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 1,
+            "error": "",
+            "hook_name": "ups-hook",
+        },
+    )()
     with (
-        patch("kiro_crew.hooks.run_script_hook", new_callable=AsyncMock, return_value=fake_result) as mock_run,
+        patch(
+            "kiro_crew.hooks.run_script_hook", new_callable=AsyncMock, return_value=fake_result
+        ) as mock_run,
+        patch("kiro_crew.dashboard.handlers.hooks._sel", return_value=MagicMock()),
+    ):
+        resp = await api_hook_test(_req_with_store(store, hook.id, full))
+
+    assert resp.status == 200
+    _args, _kwargs = mock_run.call_args
+    hook_event = _args[2] if len(_args) > 2 else _kwargs.get("hook_event")
+    assert hook_event is not None
+    assert hook_event["hook_event_name"] == HOOK_EVENT_USER_PROMPT_SUBMIT
+    assert hook_event["prompt"] == full
+
+
+@pytest.mark.asyncio
+async def test_other_event_hook_test_uses_default_payload(tmp_path):
+    # An event whose context fire() sends only via the env var (not a dedicated
+    # stdin key) keeps the default (None) payload — run_script_hook builds it,
+    # matching production, so the diagnostic path does not diverge.
+    from kiro_crew.hooks import HOOK_EVENT_PRE_TOOL_USE
+
+    store = ScriptHookStore(tmp_path)
+    hook = store.create(
+        {"name": "ptu-hook", "event": HOOK_EVENT_PRE_TOOL_USE, "matcher": "", "command": "cat"}
+    )
+
+    fake_result = type(
+        "R",
+        (),
+        {
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 1,
+            "error": "",
+            "hook_name": "ptu-hook",
+        },
+    )()
+    with (
+        patch(
+            "kiro_crew.hooks.run_script_hook", new_callable=AsyncMock, return_value=fake_result
+        ) as mock_run,
         patch("kiro_crew.dashboard.handlers.hooks._sel", return_value=MagicMock()),
     ):
         resp = await api_hook_test(_req_with_store(store, hook.id, "hello"))

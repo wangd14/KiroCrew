@@ -359,7 +359,11 @@ async def api_hook_test(request: web.Request) -> web.Response:
         return denied
     # circular import: kiro_crew.hooks pulls dashboard state at module load, so
     # this handler defers the import to call time (matches _get_hook_store above).
-    from kiro_crew.hooks import HOOK_EVENT_STOP, run_script_hook  # noqa: F811
+    from kiro_crew.hooks import (  # noqa: F811
+        HOOK_EVENT_STOP,
+        HOOK_EVENT_USER_PROMPT_SUBMIT,
+        run_script_hook,
+    )
     from kiro_crew.platform import redact_via_context
 
     store = _get_hook_store(request.app["state"])
@@ -374,12 +378,23 @@ async def api_hook_test(request: web.Request) -> web.Response:
     context = sanitize_string(raw_context)
     if len(context) > 10000:  # Max context length for hook test
         context = context[:10000]
-    # Mirror ScriptHookStore.fire()'s Stop payload so a Stop hook reading the
-    # stdin ``assistant_text`` key (the full segment; the env var is capped at
-    # 500 in run_script_hook) is testable through this endpoint too. Other
-    # events keep the default payload (run_script_hook builds it when None).
+    # Mirror ScriptHookStore.fire()'s per-event stdin payload so the FULL
+    # context reaches the hook here exactly as it does on a live fire. The env
+    # var KIROCREW_HOOK_CONTEXT is capped at 500 chars in run_script_hook for
+    # every event (ARG_MAX safety), so an event whose context travels on stdin
+    # (UserPromptSubmit -> ``prompt``, Stop -> ``assistant_text``) must carry it
+    # here too, or a >500-char test context is truncated on both paths and the
+    # hook receives incomplete input. Events fire() sends context only via the
+    # env var keep the default payload (run_script_hook builds it when None),
+    # matching production.
     hook_event = None
-    if hook.event == HOOK_EVENT_STOP:
+    if hook.event == HOOK_EVENT_USER_PROMPT_SUBMIT:
+        hook_event = {
+            "hook_event_name": hook.event,
+            "cwd": os.getcwd(),
+            "prompt": context,
+        }
+    elif hook.event == HOOK_EVENT_STOP:
         hook_event = {
             "hook_event_name": hook.event,
             "cwd": os.getcwd(),
