@@ -27,7 +27,9 @@ touched is the user's and is left in place.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+import contextlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -90,3 +92,70 @@ async def test_a_clean_shutdown_still_resets(tmp_path):
 
     assert not settings.exists()
     assert client._session_id is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_recycles_a_process_when_activation_drifts_on(tmp_path, monkeypatch):
+    """A live process spawned NON-activated is recycled once gating activates (codex F1).
+
+    The client's credential mask is fixed at spawn; activation is a manual keystone write with
+    no watcher. So a process spawned while gating was OFF keeps full git credentials after an
+    operator activates it -- an opaque subprocess could publish an unjudged commit.
+    ``ensure_ready`` detects the OFF->ON drift on the warm path and kills+resets the process so
+    the cold-start below respawns it under the mask. We stub the spawn work to a no-op and only
+    assert the recycle fired.
+    """
+    from unittest.mock import AsyncMock
+
+    client = AcpClient(work_dir=tmp_path)
+    client._work_dir_ready = True
+    client._process = SimpleNamespace(returncode=None)  # type: ignore[assignment]
+    client._session_id = "sess-1"
+    client._spawn_push_verdict_activation = False  # spawned before activation
+
+    monkeypatch.setattr("kiro_crew.acp.client._push_verdict_masks_ssh", lambda: True)
+    killed = AsyncMock()
+    client._kill_process = killed  # type: ignore[method-assign]
+    client._discard_claude_settings_seed = AsyncMock()  # type: ignore[method-assign]
+
+    def _reset():
+        client._process = None
+        client._session_id = None
+
+    client._reset_state = MagicMock(side_effect=_reset)  # type: ignore[method-assign]
+    # After the recycle the warm-path early return is not taken; stop cold-start at the spawn
+    # so the test exercises only the drift recycle, not a real process launch.
+    client._spawn = AsyncMock(side_effect=RuntimeError("stop before spawn"))  # type: ignore[method-assign]
+
+    with contextlib.suppress(Exception):
+        await client.ensure_ready()
+
+    killed.assert_awaited()  # the drifted process was recycled
+    client._reset_state.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_keeps_a_process_spawned_already_activated(tmp_path, monkeypatch):
+    """A process spawned WHILE activated has no OFF->ON drift; the warm path is not disturbed.
+
+    It must not consult the activation keystone (only a non-activated spawn can drift on), and
+    a live, session-bound process is reused unchanged.
+    """
+    from unittest.mock import AsyncMock
+
+    client = AcpClient(work_dir=tmp_path)
+    client._work_dir_ready = True
+    client._process = SimpleNamespace(returncode=None)  # type: ignore[assignment]
+    client._session_id = "sess-1"
+    client._spawn_push_verdict_activation = True  # spawned already activated
+
+    def _must_not_read():
+        pytest.fail("activation keystone read for a process spawned already-activated")
+
+    monkeypatch.setattr("kiro_crew.acp.client._push_verdict_masks_ssh", _must_not_read)
+    killed = AsyncMock()
+    client._kill_process = killed  # type: ignore[method-assign]
+
+    await client.ensure_ready()  # warm-path early return
+
+    killed.assert_not_awaited()

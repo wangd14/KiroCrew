@@ -314,7 +314,13 @@ class TestLeafOnlyPopulationIsRecorded:
     #: launch fingerprints; ``mcp/resolved`` holds executables substituted for an
     #: approved launch. Each sits beside writable siblings, so no parent stand-in
     #: can hold it.
-    EXPECTED: dict[str, int] = {"standard": 253, "cc": 260, "strict": 261}
+    #:
+    #: Raised by six per tier for the gateway-owned push-verdict gate: the two
+    #: leaf-only names ``push-verdict-activation.json`` (the operator activation
+    #: leaf) and ``push-verdict-mirrors`` (the recorded publish targets) each sit
+    #: beside writable siblings, so like the launch dirs they cannot be held by an
+    #: enclosing parent stand-in and are pinned by their own leaf name.
+    EXPECTED: dict[str, int] = {"standard": 259, "cc": 266, "strict": 267}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:
