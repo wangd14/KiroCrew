@@ -111,7 +111,13 @@ def _judge_pr_targets(judge: Mapping[str, Any] | None) -> list[str]:
         return []
 
 
-def infer_subject(message: str, judge: Mapping[str, Any] | None = None) -> "targets.Target | None":
+def infer_subject(
+    message: str,
+    judge: Mapping[str, Any] | None = None,
+    *,
+    watch: str = "",
+    slot_key: str = "",
+) -> "targets.Target | None":
     """WHICH pull request a loop is about: its judge brief first, then its instruction.
 
     One function, because the answer is needed in five places -- the arm, the
@@ -165,7 +171,7 @@ def infer_subject(message: str, judge: Mapping[str, Any] | None = None) -> "targ
         identity = (found.kind, found.subject, found.host_key)
         if all(identity != (other.kind, other.subject, other.host_key) for other in listed):
             listed.append(found)
-    from_message = targets.infer(message)
+    from_message = targets.infer(message, watch=watch, slot_key=slot_key)
     if len(listed) == 1:
         only = listed[0]
         if not targets.names_pull_request(message):
@@ -214,7 +220,14 @@ def loop_subject(loop: Any) -> "targets.Target | None":
     """The subject one stored loop is about, from that loop's own two strings."""
     from kiro_crew import autonudge_judge as _judge
 
-    return infer_subject(str(getattr(loop, "message", "") or ""), _judge.spec_of(loop))
+    _monitor = getattr(loop, "monitor", None)
+    _watch_kind = getattr(_monitor, "kind", "") if _monitor is not None else ""
+    return infer_subject(
+        str(getattr(loop, "message", "") or ""),
+        _judge.spec_of(loop),
+        watch=_watch_kind or "",
+        slot_key=getattr(loop, "slot_key", "") or "",
+    )
 
 
 def infer_monitor(
@@ -223,6 +236,8 @@ def infer_monitor(
     *,
     creation_surface: MonitorCreationSurface = MonitorCreationSurface.UNKNOWN,
     judge: Mapping[str, Any] | None = None,
+    watch: str = "",
+    slot_key: str = "",
 ) -> MonitorState | None:
     """Build a monitor for this loop's subject, or ``None`` to stay ungated.
 
@@ -250,7 +265,7 @@ def infer_monitor(
     decision controller that owns the rest of the budget vocabulary, and is
     deliberately not smuggled in behind a token saving.
     """
-    target = infer_subject(message, judge)
+    target = infer_subject(message, judge, watch=watch, slot_key=slot_key)
     if target is None:
         return None
     try:

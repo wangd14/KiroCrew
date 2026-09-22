@@ -76,6 +76,11 @@ def _terminal_poll(state: str = "MERGED", body: str = "read"):
 
     def _poll(identity, message, probe):
         probe.observation = _reading(state)
+        # The real gh-pr probe is a FETCHER: it returns ``observations=[]`` and never
+        # attributes a TERMINAL key, so the kernel's verdict carries no keys on this
+        # path. Emitting a key here would feed the code a signal the real probe never
+        # produces and mask the merged-versus-blocked decision, which for a pull
+        # request comes from ``observation.merged``, not from ``verdict.keys``.
         return _an.irq.Verdict(_an.irq.Outcome.QUIET, body)
 
     return _poll
@@ -650,6 +655,60 @@ async def test_only_a_merged_subject_is_recorded_as_a_success(
         assert loop.monitor is not None
         assert loop.monitor.outcome is not None
         assert loop.monitor.outcome.value == expected
+    finally:
+        service.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_settled_work_ledger_reaches_the_terminal_branch_and_deactivates(
+    tmp_path, monkeypatch
+):
+    """A finished work-ledger loop settles, though it exposes no ``probe.observation``.
+
+    The work-ledger probe is not a fetcher: it never sets ``probe.observation``, so
+    ``_pr_observation_of`` finds nothing and the observation-based half of the
+    terminal gate is false for this kind forever. Its finish surfaces the OTHER way
+    -- the kernel attributes a ``Severity.TERMINAL`` observation, which the tick sees
+    as ``verdict.outcome is TERMINAL`` carrying the probe's own success key
+    (``all-accepted``). Gating on the observation alone left a settled ledger with
+    ``terminal`` false, so it never deactivated and re-polled its own finished ledger
+    every interval. The gate must honour the kernel's typed terminal, and the finish
+    must record as a SUCCESS from ``terminal_succeeded`` (not from ``merged``, which
+    only a pull request ever sets).
+    """
+    import kiro_crew.autonudge as _an
+
+    async def on_fire(loop):
+        return True
+
+    def _ledger_settled(identity, message, probe):
+        # Faithful to the real work-ledger probe: NO ``probe.observation`` is set,
+        # and the terminal verdict rides the kernel's own Outcome.TERMINAL with the
+        # ledger's ``all-accepted`` success key.
+        return _an.irq.Verdict(_an.irq.Outcome.TERMINAL, "all items accepted", ("all-accepted",))
+
+    monkeypatch.setattr(_an.irq, "poll", _ledger_settled)
+    service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+    loop = NudgeLoop(
+        id="monitor-wl",
+        slot_key="chat-1-123",
+        message="wake the conductor from its work ledger",
+        idle_secs=30,
+        # A work-ledger watch's subject IS its slot -- ``targets.work_ledger_target``
+        # derives the subject from ``slot_key``, so the monitor's canonical target
+        # must equal it for ``loop_subject`` to bind and the tick to reach the poll.
+        monitor=_structured_monitor(kind="work-ledger", target="chat-1-123"),
+        gate=True,
+    )
+    service._loops[loop.id] = loop
+
+    try:
+        # A terminal tick delivers no turn, so the tick reports quiet.
+        assert await service._monitor_tick_is_quiet(loop) is True
+        assert loop.monitor is not None
+        assert loop.monitor.outcome is not None, "a settled ledger must reach the terminal branch"
+        assert loop.monitor.outcome.value == "success", "an all-accepted ledger finished well"
+        assert loop.active is False, "and the watch deactivates rather than polling forever"
     finally:
         service.stop()
 

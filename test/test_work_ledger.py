@@ -2179,22 +2179,24 @@ def test_acquiring_a_lock_does_not_truncate_the_lock_file():
 
 
 #: The ONLY modules that may import the store. Phase 1 asserted the set was empty,
-#: which made that phase revertable by deleting two files; Phase 2 adds exactly ONE
-#: importer and the check becomes an allowlist rather than disappearing, because the
-#: intent it enforces outlived the empty set. One entry is the strong form of that
-#: intent: even ``mcp_work.py``, the server whose four tools this store exists for,
-#: does not import it — it reaches the store over the dashboard HTTP API like every
-#: other consumer, which is what keeps identity resolved server-side and lets the
-#: Crew page read the same rows. A second importer is therefore a design change —
-#: some module building paths or resolving identity for itself — and must argue for
-#: itself in review rather than arrive with a passing suite.
+#: which made that phase revertable by deleting two files; the check becomes an
+#: allowlist rather than disappearing, because the intent it enforces outlived the
+#: empty set. The bar for each entry is the same one Phase 1's emptiness stood for:
+#: even ``mcp_work.py``, the server whose four tools this store exists for, does not
+#: import it — it reaches the store over the dashboard HTTP API like every other
+#: consumer, which is what keeps identity resolved server-side and lets the Crew
+#: page read the same rows. Every entry below is therefore a design decision that
+#: has to argue for itself HERE, in its own comment, rather than arrive with a
+#: passing suite — which is why the allowlist carries a justification per line and a
+#: module that reaches the store only for a constant (as ``ledger_wake.py`` once did,
+#: for one int) belongs OUT of this set, mirroring the value instead.
 _PERMITTED_STORE_IMPORTERS = frozenset(
     {
         # The four tools' HTTP routes, and the ONLY module that touches the store
         # directly: identity comes from X-Session-Key, never from the body.
         "dashboard/handlers/work_ledger.py",
         # The operator-run cleanup sweep behind ``kirocrew ledger-sweep``.
-        # It is a second seam deliberately, and it does not weaken the rule the
+        # It is a seam deliberately, and it does not weaken the rule the
         # allowlist exists for: it resolves NO caller identity — there is no
         # request and no session to attribute — and it reads the store by
         # enumerating its directories rather than by folding a key someone
@@ -2220,6 +2222,14 @@ _PERMITTED_STORE_IMPORTERS = frozenset(
         # page never needs the key, and its action route resolves the key from the
         # store rather than accepting one from the body.
         "dashboard/handlers/work_ledger_board.py",
+        # The work-ledger PROBE. A monitor whose subject is a conductor's own
+        # ledger has to READ that ledger to observe it — folding its items into a
+        # terminal/quiet verdict — and no HTTP route exists for the in-process
+        # driver to reach the store the way the tools' handler does. It resolves
+        # no external caller's identity (the subject is the slot's own conductor,
+        # taken from the loop, not from a supplied key) and is read-only. This is
+        # the single new store seam this PR adds.
+        "probes/work_ledger.py",
     }
 )
 

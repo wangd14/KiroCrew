@@ -698,6 +698,7 @@ class AutoNudgeService:
         on_monitor_tick: Callable[[NudgeLoop], Awaitable[None]] | None = None,
         collect_judge_evidence: Callable[[NudgeLoop], Awaitable[Any]] | None = None,
         emit_judge_notice: Callable[[NudgeLoop, str], Awaitable[None]] | None = None,
+        worker_running: Callable[[str], bool] | None = None,
     ) -> None:
         self._base_dir = base_dir or config_dir()
         # The durable store's state and file protocol (see autonudge_service.store). The
@@ -720,6 +721,13 @@ class AutoNudgeService:
         #: costs the verdict nothing -- it is already on the loop record and in the
         #: decisions log.
         self._emit_judge_notice = emit_judge_notice
+        #: ``session_key -> that slot has a turn in flight``. Injected because the
+        #: slot table is the dashboard's, and this service is constructed with
+        #: callbacks rather than a handle on it. Only the work-ledger probe reads
+        #: it, to answer the "not running" half of the staleness conjunction; when
+        #: it is absent every worker reads as idle, which can only make that probe
+        #: louder, never quieter. See :mod:`kiro_crew.probes.work_ledger`.
+        self._worker_running_resolver = worker_running
         self._loops: dict[str, NudgeLoop] = {}
         self._timers: dict[str, asyncio.Task] = {}
         # Loop ids whose re-arm was requested while their fire window was open.
@@ -1639,6 +1647,25 @@ class AutoNudgeService:
                 logger.warning("AutoNudge: deadline persist failed", exc_info=t.exception())
 
         task.add_done_callback(_finish)
+
+    def _worker_running(self, session_key: str) -> bool:
+        """Whether *session_key*'s slot has a turn in flight.
+
+        False when no resolver was injected, which is the direction that cannot
+        lose a signal: the work-ledger probe uses this for the "not running" half
+        of the staleness conjunction, so an unknown liveness produces a stall wake
+        the conductor may not have needed (one turn) rather than silence about a
+        worker that stopped without reporting (the task). A resolver that raises is
+        treated the same way -- a slot-table read must not kill a tick.
+        """
+        resolver = self._worker_running_resolver
+        if resolver is None or not session_key:
+            return False
+        try:
+            return bool(resolver(session_key))
+        except Exception:  # pragma: no cover - a liveness read must not fail a tick
+            logger.debug("AutoNudge: worker liveness read failed for %s", session_key)
+            return False
 
     # ── Owner methods ──
     # Each name below IS its owner's function, bound here by name: one

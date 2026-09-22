@@ -73,6 +73,7 @@ async def add(
     # if that PR is already merged, deactivates it before its first turn.
     gate: bool = False,
     judge: dict | None = None,
+    watch: str = "",
     replace_existing: bool = True,
     replace_stopped: bool = False,
     self_armed: bool = False,
@@ -103,6 +104,7 @@ async def add(
             admission_check=admission_check,
             gate=gate,
             judge=judge,
+            watch=watch,
             replace_existing=replace_existing,
             replace_stopped=replace_stopped,
             self_armed=self_armed,
@@ -153,6 +155,7 @@ async def _add_locked(
     admission_check: Callable[[], bool] | None = None,
     gate: bool = False,
     judge: dict | None = None,
+    watch: str = "",
     replace_existing: bool = True,
     replace_stopped: bool = False,
     self_armed: bool = False,
@@ -171,6 +174,7 @@ async def _add_locked(
             admission_check=admission_check,
             gate=gate,
             judge=judge,
+            watch=watch,
             replace_existing=replace_existing,
             replace_stopped=replace_stopped,
             self_armed=self_armed,
@@ -192,6 +196,7 @@ async def _add_unserialized(
     admission_check: Callable[[], bool] | None = None,
     gate: bool = False,
     judge: dict | None = None,
+    watch: str = "",
     replace_existing: bool = True,
     replace_stopped: bool = False,
     self_armed: bool = False,
@@ -324,11 +329,29 @@ async def _add_unserialized(
             # subject; keying that only on the wording of the instruction made a
             # cadence contract depend on prose.
             monitor=(
-                infer_monitor(message, now, creation_surface=creation_surface, judge=stored_judge)
-                if gate
+                infer_monitor(
+                    message,
+                    now,
+                    creation_surface=creation_surface,
+                    judge=stored_judge,
+                    watch=watch,
+                    slot_key=slot_key,
+                )
+                # An explicit ``watch`` gates on its own, without ``gate``. This
+                # path defaults to UNGATED for the reason above, so requiring
+                # both would make the field work from monitor_start and do
+                # nothing here -- and no caller means "observe this subject, and
+                # ignore it". ``slot_key`` is what makes a work-ledger watch
+                # possible at all: its subject is the session being armed, which
+                # no amount of reading the message can recover.
+                if (gate or watch)
                 else None
             ),
-            gate=gate,
+            # ``watch`` is folded in here as well as above, because the tick path
+            # reads the STORED flag and refuses to poll a loop whose ``gate`` is
+            # False even when it carries a monitor. Leaving the two to disagree is
+            # what makes a watch that looks armed and never observes anything.
+            gate=bool(gate or watch),
             banner=banner,
             self_armed=self_armed,
         )
@@ -640,8 +663,23 @@ async def _update_unserialized(
         # Reached by a changed instruction and by a replaced brief alike, because
         # either can name a different pull request and only the pair says which.
         if rebind_monitor:
+            # The loop's OWN kind, fed back into every derivation below. A
+            # work-ledger watch's subject is this session, which no message
+            # names, so re-inferring from text alone would answer "this
+            # instruction names nothing observable" and CLEAR the monitor --
+            # turning the documented way to reword an instruction into a
+            # silent way to disarm the watch. For gh-pr it changes nothing.
+            watch_kind = loop.monitor.kind if loop.monitor is not None else ""
             inferred = (
-                infer_monitor(loop.message, time.time(), judge=loop.judge) if loop.gate else None
+                infer_monitor(
+                    loop.message,
+                    time.time(),
+                    judge=loop.judge,
+                    watch=watch_kind,
+                    slot_key=loop.slot_key,
+                )
+                if loop.gate
+                else None
             )
             current = loop.monitor
             # The stored spelling is a canonical shorthand and cannot
@@ -650,8 +688,18 @@ async def _update_unserialized(
             # "unchanged" and keep polling the wrong server. This is the
             # third of the three places that comparison had to reach; the
             # other two are the post-poll binding and the dedupe identity.
-            old_probe = infer_subject(str(previous.get("message") or ""), previous.get("judge"))
-            new_probe = infer_subject(loop.message, loop.judge)
+            old_probe = infer_subject(
+                str(previous.get("message") or ""),
+                previous.get("judge"),
+                watch=watch_kind,
+                slot_key=loop.slot_key,
+            )
+            new_probe = infer_subject(
+                loop.message,
+                loop.judge,
+                watch=watch_kind,
+                slot_key=loop.slot_key,
+            )
             same_host = (old_probe.host_key if old_probe else None) == (
                 new_probe.host_key if new_probe else None
             )
