@@ -38,3 +38,41 @@ _KILL_BY_NAME_PROGRAMS = frozenset({"pkill", "killall"})
 # subcommand word because ``action`` is required, so the bare and ``--help`` forms
 # dispatch nothing and refusing them would refuse a read-only golden path.
 _SELF_FILE_DELIVERY_VERBS = frozenset({"approve"})
+# The dev-mode escape hatch flag ``kirocrew`` accepts to run OUT of its install
+# root. It is a FLAG, not a program: the self-protection floor keys on the token
+# alone, so the shell reader's over-cap fold must treat a word resolving to it as
+# dangerous even though no program name is present.
+_DEV_MODE_CONFIRM_FLAG = "--confirm-out-of-install-root"
+
+# The over-cap guarded-reading fold's protected TOKEN vocabulary, in ONE place: the
+# ssh-like programs that can open a channel back to this host, and the protected
+# FLAGS a flag-based self-protection floor keys on with no program word present. A
+# new flag-based floor is covered by adding its flag here, so a fold gap of that
+# class cannot recur without touching this vocabulary (found in review). Nested-shell
+# programs/verbs keep their shared definition in the reader and are handed to the
+# fold beside these; the cli and protected-path names are dynamic predicates.
+_SSH_LIKE_PROGRAMS = frozenset({"ssh", "scp", "sftp"})
+_FOLD_PROTECTED_FLAGS = frozenset({_DEV_MODE_CONFIRM_FLAG})
+
+# The over-cap fold's COMMAND-POSITION allowlist: the only program basenames an
+# over-cap guarded group may resolve to in command position and still fold to
+# allowed.  The fold is fail-closed BY CONSTRUCTION -- a group folds to allowed only
+# when every command word is provably inert -- so this is a closed ALLOWLIST, not a
+# denylist: a program missing from it can only OVER-refuse (its group reads
+# fail-closed), never bypass a floor.  Capability is added by EXTENDING this set from
+# the SecScope over-refusal corpus, which is the safe direction.  It holds only the
+# benign programs and toolchain scripts that corpus lists -- NO interpreters, no
+# nested shells, no self/kill/ssh names, no guarded modules or flags.  ``git`` is NOT
+# here: it is benign only as a read-only verb, so the fold decides it by the presence
+# of a publish operand rather than by the program name.
+_FOLD_BENIGN_COMMAND_PROGRAMS = frozenset(
+    {
+        "echo",
+        "cp",
+        "rsync",
+        "hg",
+        "deploy.sh",
+        "build.sh",
+        "run.sh",
+    }
+)
