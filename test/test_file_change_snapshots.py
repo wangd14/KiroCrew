@@ -16,6 +16,7 @@ touching the live ACP runtime — every test stays in pure-Python land.
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import os
 import shutil
@@ -703,6 +704,167 @@ class TestFlushFileChanges:
         for r in rows:
             _note_reply_row(slot, r)
         assert slot._turn_reply_mids == [row_mid(rows[1]), row_mid(rows[2])]
+
+    def test_every_coroutine_caller_drains_the_flush_worker(self):
+        """`_flush_file_changes` MUTATES slot state -- the assistant message's meta,
+        `_dirty` and `_file_changes` -- so a coroutine must not hand it to a plain
+        `asyncio.to_thread`. A cancellation at that await returns control while the
+        worker is still writing, and `_run_chat`'s exit path then starts a SECOND
+        flush on the same slot with the first in flight; two concurrent writers are
+        how the metadata goes missing or lands on the wrong message.
+        `drained_to_thread` keeps the await alive until the worker finishes, so
+        control only ever returns with no write outstanding.
+
+        Pinned on the source because the defect is which helper the call site names,
+        and a behavioural test would have to cancel a real turn mid-snapshot to see
+        it."""
+        import re
+        from pathlib import Path as _Path
+
+        from kiro_crew.dashboard import chat_runner as runner_mod
+
+        source = _Path(runner_mod.__file__).read_text(encoding="utf-8")
+        calls = re.findall(r"await (\w+)\(_build_file_change_snapshot_into, slot, \w+\)", source)
+        assert calls, "no awaited snapshot-build call site found"
+        assert set(calls) == {"drained_to_thread"}, calls
+        assert "asyncio.to_thread(_build_file_change_snapshot" not in source
+        # The applier is loop-only, so it must never be handed to a worker at all.
+        assert "to_thread(_flush_file_changes" not in source
+
+
+#: The ONE site that hands a loop-affine mutator to a worker and is not this
+#: change's to fix. ``_expand_dollar_skills`` calls ``slot.append`` and
+#: ``state.push_slots_update`` -- both sinks the invariant names -- and it does so
+#: on ``main`` as well, reached from a worker there too. Named rather than
+#: excluded by shape, so it stays visible and any NEW site fails the gate.
+_LOOP_AFFINE_OFFLOAD_ALLOWED = {"_expand_dollar_skills"}
+
+#: Loop-owned sinks, in the words of ``_surface_prompt_chip``'s own docstring:
+#: ``slot.append`` ends in ``slot.event.set()``, whose waiters resolve through
+#: the loop's non-threadsafe ``call_soon``, and ``push_slots_update``
+#: broadcasts. Receivers are named so a local list's ``.append()`` is not a hit.
+_LOOP_OWNED_CALLS = {"append", "push_slots_update"}
+_LOOP_OWNED_RECEIVERS = {"slot", "_slot", "self", "state", "st"}
+_LOOP_READ_SLOT_ATTRS = {"_dirty", "_file_changes", "_pending", "messages", "event"}
+
+
+class TestNoWorkerMutatesLoopAffineSlotState:
+    """The invariant ``chat_runner`` states in ``_surface_prompt_chip``, enforced.
+
+    Its words: ``slot.append`` ends in ``slot.event.set()``, an ``asyncio.Event``
+    whose waiters are resolved through the loop's ``call_soon`` -- not its
+    threadsafe variant -- so a foreign-thread caller queues a callback the loop
+    is never woken for, and raises outright under asyncio debug mode. The same
+    docstring adds ``push_slots_update``, which broadcasts.
+
+    The gate keys on the CONDITION -- a function handed to an offload helper
+    reaching one of those sinks -- rather than on resemblance to any one site, so
+    a second call site cannot appear without failing it.
+    """
+
+    @staticmethod
+    def _offenders() -> list[str]:
+        import ast
+        from pathlib import Path as _Path
+
+        nested = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+        def own_frame(node):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, nested):
+                    continue
+                yield child
+                yield from own_frame(child)
+
+        out: list[str] = []
+        root = _Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "dashboard"
+        assert root.is_dir(), f"dashboard package not found at {root}"
+        scanned = 0
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            scanned += 1
+            defs = {
+                n.name: n
+                for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not node.args:
+                    continue
+                fn = ast.unparse(node.func)
+                if not any(
+                    fn == h or fn.endswith("." + h)
+                    for h in ("to_thread", "drained_to_thread", "run_in_executor")
+                ):
+                    continue
+                arg = node.args[0]
+                callee = (
+                    arg.id
+                    if isinstance(arg, ast.Name)
+                    else arg.attr if isinstance(arg, ast.Attribute) else ""
+                )
+                if not callee or callee in _LOOP_AFFINE_OFFLOAD_ALLOWED:
+                    continue
+                body = defs.get(callee)
+                if body is None:
+                    continue
+                for n in own_frame(body):
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                        recv = ast.unparse(n.func.value).split(".")[0].split("[")[0]
+                        if n.func.attr in _LOOP_OWNED_CALLS and recv in _LOOP_OWNED_RECEIVERS:
+                            out.append(
+                                f"{path.name}:{node.lineno} offloads {callee}(), which calls "
+                                f"{ast.unparse(n.func)}() at line {n.lineno}"
+                            )
+                    if isinstance(n, ast.Assign):
+                        for t in n.targets:
+                            if isinstance(t, ast.Attribute) and t.attr in _LOOP_READ_SLOT_ATTRS:
+                                if ast.unparse(t).split(".")[0] in _LOOP_OWNED_RECEIVERS:
+                                    out.append(
+                                        f"{path.name}:{node.lineno} offloads {callee}(), which "
+                                        f"writes {ast.unparse(t)} at line {n.lineno}"
+                                    )
+        assert scanned > 10, f"scan covered only {scanned} modules"
+        return out
+
+    def test_no_offloaded_callee_touches_a_loop_owned_sink(self) -> None:
+        offenders = self._offenders()
+        assert not offenders, "loop-affine state mutated from a worker:\n" + "\n".join(offenders)
+
+    def test_the_gate_would_catch_a_regression(self) -> None:
+        """Non-vacuity: the detector reports the shape the fix removed."""
+        import ast
+
+        src = (
+            "def _mutator(slot):\n"
+            "    slot.append('system', 'x', 'c')\n"
+            "    slot._dirty = True\n"
+            "async def caller(slot):\n"
+            "    await drained_to_thread(_mutator, slot)\n"
+        )
+        tree = ast.parse(src)
+        defs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        body = defs["_mutator"]
+        hits = [
+            n
+            for n in ast.walk(body)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in _LOOP_OWNED_CALLS
+        ]
+        assert len(hits) == 1
+        writes = [
+            t
+            for n in ast.walk(body)
+            if isinstance(n, ast.Assign)
+            for t in n.targets
+            if isinstance(t, ast.Attribute) and t.attr in _LOOP_READ_SLOT_ATTRS
+        ]
+        assert len(writes) == 1
+
+    def test_the_one_allowed_site_is_named_not_shaped(self) -> None:
+        """The exception is a NAME, so a new site cannot inherit its pass."""
+        assert _LOOP_AFFINE_OFFLOAD_ALLOWED == {"_expand_dollar_skills"}
 
 
 # ── Regression tests: real event ordering & content-block paths ────────────
@@ -1715,6 +1877,13 @@ def snapshot_turn():
     Extracting these statements avoids starting an ACP session or duplicating
     the admission code. Both event sites and both exit sites must exist, and a
     mutation to either executes in the test.
+
+    A flush is now TWO production statements: the off-loop snapshot build and
+    the loop-side attach that consumes it. Both are lifted, and the build is
+    matched by its own call shape -- ``drained_to_thread`` over
+    ``_build_file_change_snapshot`` -- rather than by sitting next to the
+    flush, so the pairing is exact and a site that stopped draining fails the
+    count instead of being picked up anyway.
     """
     tree = ast.parse(inspect.getsource(_run_chat))
     [runner] = tree.body
@@ -1725,6 +1894,21 @@ def snapshot_turn():
             if isinstance(node, ast.If)
             and isinstance(node.test, ast.Name)
             and node.test.id in {"_file_snapshot", "_file_snapshot_upd"}
+        ),
+        key=lambda node: node.lineno,
+    )
+    builds = sorted(
+        (
+            node
+            for node in ast.walk(runner)
+            if isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "drained_to_thread"
+            and any(
+                isinstance(arg, ast.Name) and arg.id == "_build_file_change_snapshot_into"
+                for arg in node.value.args
+            )
         ),
         key=lambda node: node.lineno,
     )
@@ -1739,10 +1923,89 @@ def snapshot_turn():
         ),
         key=lambda node: node.lineno,
     )
-    assert len(admissions) == len(flushes) == 2
+
+    # Each drained build feeds a holder that the loop-side flush recovers in a
+    # `finally`, so the two attach sites are lifted as their enclosing `Try`
+    # (the holder assignment just above it, plus the try/finally), which is the
+    # runnable unit: a build whose flush stopped riding the finally would fail
+    # to attach here rather than being picked up anyway, and a `drained_to_thread`
+    # that stopped draining fails the build count above. Matched on the INNER
+    # try -- the drained build in its own `body`, the flush in its own
+    # `finalbody` -- so the outer `try/except` that swallows the deferred cancel
+    # is not double-counted.
+    def _is_flush_unit(node: ast.Try) -> bool:
+        body_builds = any(
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Await)
+            and isinstance(stmt.value.value, ast.Call)
+            and isinstance(stmt.value.value.func, ast.Name)
+            and stmt.value.value.func.id == "drained_to_thread"
+            and any(
+                isinstance(arg, ast.Name) and arg.id == "_build_file_change_snapshot_into"
+                for arg in stmt.value.value.args
+            )
+            for stmt in node.body
+        )
+        final_flushes = any(
+            isinstance(inner, ast.Expr)
+            and isinstance(inner.value, ast.Call)
+            and isinstance(inner.value.func, ast.Name)
+            and inner.value.func.id == "_flush_file_changes"
+            for stmt in node.finalbody
+            for inner in ast.walk(stmt)
+        )
+        return body_builds and final_flushes
+
+    flush_units = sorted(
+        (node for node in ast.walk(runner) if isinstance(node, ast.Try) and _is_flush_unit(node)),
+        key=lambda node: node.lineno,
+    )
+    assert len(admissions) == len(builds) == len(flushes) == len(flush_units) == 2
+
+    # The single-slot holder each flush unit recovers its snapshot from is
+    # assigned just above its `try`; lift the two together so the lifted unit
+    # wires the holder exactly as the runner does.
+    holder_inits = sorted(
+        (
+            node
+            for node in ast.walk(runner)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and isinstance(node.value, ast.List)
+            and not node.value.elts
+            and any(
+                isinstance(t, ast.Name) and t.id.startswith("_fc") and t.id.endswith("_holder")
+                for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            )
+        ),
+        key=lambda node: node.lineno,
+    )
+    assert len(holder_inits) == 2
 
     def run(nodes, env):
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<snapshot-turn>", "exec"), env)  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected -- runs the PRODUCTION admission statements lifted out of this repo's own source by AST, never external input; a hand-copied duplicate of them is exactly what this test exists to rule out  # noqa: E501  # fmt: skip
+        """Run lifted statements, inside a real coroutine when they await.
+
+        The flush pair awaits the off-loop build, so it cannot execute at module
+        level. Wrapping it in a coroutine runs the production
+        ``drained_to_thread`` hop for real instead of eliding it, and leaves the
+        names the pair binds function-local -- which is where the runner binds
+        them too.
+        """
+        if any(isinstance(inner, ast.Await) for node in nodes for inner in ast.walk(node)):
+            lifted = ast.AsyncFunctionDef(
+                name="_lifted_turn_statements",
+                args=ast.arguments(
+                    posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
+                ),
+                body=list(nodes),
+                decorator_list=[],
+                returns=None,
+                type_params=[],
+            )
+            module = ast.fix_missing_locations(ast.Module(body=[lifted], type_ignores=[]))
+            exec(compile(module, "<snapshot-turn>", "exec"), env)  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected -- runs the PRODUCTION flush statements lifted out of this repo's own source by AST, never external input; a hand-copied duplicate of them is exactly what this test exists to rule out  # noqa: E501  # fmt: skip
+            asyncio.run(env["_lifted_turn_statements"]())
+            return
+        exec(compile(ast.Module(body=list(nodes), type_ignores=[]), "<snapshot-turn>", "exec"), env)  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected -- runs the PRODUCTION admission statements lifted out of this repo's own source by AST, never external input; a hand-copied duplicate of them is exactly what this test exists to rule out  # noqa: E501  # fmt: skip
 
     def start(slot):
         # The flush sites read the runner's turn boundary; the harness has no
@@ -1765,7 +2028,9 @@ def snapshot_turn():
             run([admissions[site]], env)
 
         return SimpleNamespace(
-            record=record, flush=lambda site=0: run([flushes[site]], env), env=env
+            record=record,
+            flush=lambda site=0: run([holder_inits[site], flush_units[site]], env),
+            env=env,
         )
 
     return start

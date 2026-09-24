@@ -32,6 +32,7 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -385,6 +386,56 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+#: Windows ``os.replace`` errors that mean "the destination is momentarily held",
+#: not "the caller asked for something impossible". ``ERROR_SHARING_VIOLATION``
+#: (32) is raised while another opener holds a handle on the target;
+#: ``ERROR_ACCESS_DENIED`` (5) is what a second rename LANDING on the same name at
+#: the same instant surfaces as. CPython raises both as ``PermissionError`` and
+#: exposes the OS code on ``.winerror``. POSIX has no equivalent -- ``rename`` is
+#: atomic and a concurrent publish of identical bytes is harmless -- so this set
+#: is consulted only on the ``os.replace`` (Windows fallback) path.
+_WINDOWS_TRANSIENT_REPLACE_WINERRORS = frozenset({5, 32})
+
+#: Bounded backoff for the retry below: total worst-case wait ~1.5s across 8
+#: attempts. The competing publisher's handle is momentary -- it closes right
+#: after its OWN replace -- so a short retry lands as soon as the winner clears,
+#: rather than turning a race the loser would win milliseconds later into a hard
+#: failure of its whole action. The publish is idempotent (same seed bytes from
+#: every entrant), so retrying re-publishes nothing the winner did not already.
+_REPLACE_RETRY_DELAYS_SEC = (0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 0.5)
+
+
+def _replace_over_transient_windows_share(src: str, dst: str) -> None:
+    """``os.replace(src, dst)``, retrying a TRANSIENT Windows sharing violation.
+
+    On POSIX (and on Windows for any error not in
+    :data:`_WINDOWS_TRANSIENT_REPLACE_WINERRORS`) this is a single ``os.replace``
+    with no added behaviour: the first call either succeeds or raises, exactly as
+    before. The retry exists only for the documented Windows race in
+    :func:`layout_lock` -- several review PROCESSES each observing one absent seed
+    and each publishing it, where ``os.replace`` fails for the loser because the
+    winner still holds the destination for the instant between its rename and its
+    close. The advisory lock narrows that window but, being advisory and
+    cross-process, does not close it; retrying the loser removes the race rather
+    than narrowing it further. On exhaustion the LAST error is re-raised, so a
+    genuinely stuck destination (a held handle that never clears) still fails
+    loudly instead of hanging.
+    """
+    last: PermissionError | None = None
+    for delay in (0.0, *_REPLACE_RETRY_DELAYS_SEC):
+        if delay:
+            time.sleep(delay)
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in _WINDOWS_TRANSIENT_REPLACE_WINERRORS:
+                raise
+            last = exc
+    assert last is not None  # only reachable after a transient PermissionError
+    raise last
+
+
 def atomic_write_locked(path: str | os.PathLike, data: bytes) -> None:
     """Write *data* to *path* atomically, resolving the parent directory ONCE.
 
@@ -477,7 +528,10 @@ def atomic_write_locked(path: str | os.PathLike, data: bytes) -> None:
                 _write_all(fd, data)
             finally:
                 os.close(fd)
-            os.replace(tmp, target)
+            # Windows-only: a concurrent publisher can hold the destination for
+            # the instant between its own rename and close, so the loser retries
+            # a transient sharing violation rather than failing its whole action.
+            _replace_over_transient_windows_share(tmp, str(target))
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)

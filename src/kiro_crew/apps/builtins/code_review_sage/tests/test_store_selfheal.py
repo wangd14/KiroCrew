@@ -141,6 +141,85 @@ class TestPinnedAtomicWrite(unittest.TestCase):
         self.assertEqual(list(impostor.iterdir()), [])
 
 
+class TestReplaceRetriesTransientWindowsShare(unittest.TestCase):
+    """``_replace_over_transient_windows_share`` retries a transient Windows
+    sharing violation and nothing else.
+
+    The concurrent-publish race in ``layout_lock`` makes the loser's
+    ``os.replace`` raise ``PermissionError`` (``winerror`` 32 or 5) while the
+    winner still holds the destination for the instant between its rename and its
+    close. The handle is momentary, so the loser retries and lands -- rather than
+    failing its whole action. These pin that the retry fires ONLY for those
+    transient codes, that it re-raises when the destination is genuinely stuck,
+    and that the ordinary path is a single ``os.replace``. Platform-independent
+    because the helper dispatches on ``.winerror``, which is simulated here.
+    """
+
+    @staticmethod
+    def _perm_error(winerror: int) -> PermissionError:
+        exc = PermissionError("simulated sharing violation")
+        # CPython sets .winerror on Windows; assigning it drives the same branch.
+        exc.winerror = winerror  # type: ignore[attr-defined]
+        return exc
+
+    def test_a_single_replace_is_all_the_ordinary_path_does(self):
+        calls: list[tuple[str, str]] = []
+
+        def once(src, dst):
+            calls.append((src, dst))
+
+        with mock.patch.object(os, "replace", once):
+            store._replace_over_transient_windows_share("tmp", "target")
+
+        self.assertEqual(calls, [("tmp", "target")], "the ordinary path retried")
+
+    def test_a_transient_sharing_violation_is_retried_until_it_lands(self):
+        for winerror in sorted(store._WINDOWS_TRANSIENT_REPLACE_WINERRORS):
+            with self.subTest(winerror=winerror):
+                attempts = {"n": 0}
+
+                def flaky(src, dst, _w=winerror):
+                    attempts["n"] += 1
+                    if attempts["n"] < 3:  # fail twice, then succeed
+                        raise self._perm_error(_w)
+
+                with mock.patch.object(os, "replace", flaky), \
+                        mock.patch.object(store.time, "sleep", lambda _s: None):
+                    store._replace_over_transient_windows_share("tmp", "target")
+
+                self.assertEqual(attempts["n"], 3, "the loser did not retry to success")
+
+    def test_a_non_transient_permission_error_is_not_retried(self):
+        attempts = {"n": 0}
+
+        def denied(src, dst):
+            attempts["n"] += 1
+            raise self._perm_error(1)  # ERROR_INVALID_FUNCTION: not in the set
+
+        with mock.patch.object(os, "replace", denied), \
+                mock.patch.object(store.time, "sleep", lambda _s: None):
+            with self.assertRaises(PermissionError):
+                store._replace_over_transient_windows_share("tmp", "target")
+
+        self.assertEqual(attempts["n"], 1, "a non-transient error must not be retried")
+
+    def test_a_permanently_held_destination_re_raises_after_exhausting_retries(self):
+        attempts = {"n": 0}
+
+        def always_held(src, dst):
+            attempts["n"] += 1
+            raise self._perm_error(32)  # ERROR_SHARING_VIOLATION, never clears
+
+        with mock.patch.object(os, "replace", always_held), \
+                mock.patch.object(store.time, "sleep", lambda _s: None):
+            with self.assertRaises(PermissionError) as caught:
+                store._replace_over_transient_windows_share("tmp", "target")
+
+        # Every attempt is made (initial + each backoff delay), then it fails loud.
+        self.assertEqual(attempts["n"], 1 + len(store._REPLACE_RETRY_DELAYS_SEC))
+        self.assertEqual(getattr(caught.exception, "winerror", None), 32)
+
+
 class TestSeedConfigUpgrade(unittest.TestCase):
     """_seed_config upgrade path must add resolved_paths if missing."""
 

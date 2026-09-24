@@ -490,10 +490,18 @@ class _BatchRuntimeHolder:
         # disk before spawn. Keyed on the resolved model (config override -> agent
         # default). Best-effort — a bad overlay never blocks the review.
         if self._work_dir:
+            work_dir = self._work_dir
             try:
-                _write_effort_overlay(
-                    self._work_dir, _reviewer_model(self._agent),
-                    _get_review_settings().get("effort", _DEFAULT_EFFORT))
+                # Offloaded: on Windows atomic_write_locked's os.replace can hit a
+                # transient sharing violation and back off with time.sleep for up
+                # to ~1.5s, which would block the gateway event loop. A thread
+                # keeps the loop free while it waits.
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: _write_effort_overlay(
+                        work_dir, _reviewer_model(self._agent),
+                        _get_review_settings().get("effort", _DEFAULT_EFFORT)))
             except Exception:
                 logger.debug("could not write review effort overlay", exc_info=True)
         # work_dir + sandbox_mode="auto" mirror the old AcpClient worker: the
@@ -695,7 +703,7 @@ class ReviewPool:
                 # turn died has no findings to be asked about, and recording it
                 # would leave a file nothing will ever load.
                 if keep_session_key:
-                    self._keep_resumable(handle, keep_session_key)
+                    await self._keep_resumable(handle, keep_session_key)
                 return "".join(parts)
             finally:
                 if handle is not None:
@@ -704,13 +712,18 @@ class ReviewPool:
                     except Exception:
                         logger.debug("session destroy error", exc_info=True)
 
-    def _keep_resumable(self, handle: object, key: str) -> None:
+    async def _keep_resumable(self, handle: object, key: str) -> None:
         """Mark this session's transcript to survive teardown and record it.
 
         ``keep_transcript`` is set BEFORE the descriptor is written: if the write
         fails the file is merely orphaned (and aged out by the follow-up pruner),
         whereas the reverse order can point a descriptor at a transcript that
         ``destroy()`` has already unlinked.
+
+        The descriptor write is offloaded to a thread: on Windows
+        ``followup.write_descriptor`` reaches ``atomic_write_locked``'s
+        ``os.replace``, whose transient sharing-violation backoff sleeps up to
+        ~1.5s, which would block the gateway event loop if run inline.
         """
         sid = str(getattr(handle, "session_id", "") or "")
         if not sid:
@@ -720,9 +733,12 @@ class ReviewPool:
             return
         try:
             handle.keep_transcript = True  # type: ignore[attr-defined]
-            followup.write_descriptor(
-                run_id, change_id, sid=sid, agent=self._agent,
-                cwd=self._work_dir or "")
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: followup.write_descriptor(
+                    run_id, change_id, sid=sid, agent=self._agent,
+                    cwd=self._work_dir or ""))
         except Exception:
             logger.debug("could not keep the review session resumable",
                          exc_info=True)
