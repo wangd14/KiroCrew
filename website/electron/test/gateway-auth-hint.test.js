@@ -7,7 +7,7 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { classifyAuthBlock, defaultedPort } = require("../gateway-auth-hint");
+const { classifyAuthBlock, defaultedPort, portIsSchemeDefault } = require("../gateway-auth-hint");
 
 test("our own local gateway points at THIS machine", () => {
   assert.equal(classifyAuthBlock({ localOwner: "kirocrew" }), "local");
@@ -70,6 +70,28 @@ test("defaultedPort returns '' for an unparseable URL rather than guessing", () 
   }
 });
 
+test("portIsSchemeDefault says when parsing yielded no port", () => {
+  // The companion question: a reader that must know whether the port was READ or
+  // RESOLVED needs this, because only a URL whose port was resolved could have
+  // produced a record under the empty key.
+  //
+  // Writing the default out changes nothing, which is the informative case: the
+  // URL API strips it either way, so `http://localhost:80` and
+  // `http://localhost` are the same URL by the time anything reads a port.
+  assert.equal(portIsSchemeDefault("http://localhost:80/"), true);
+  assert.equal(portIsSchemeDefault("http://localhost/"), true);
+  assert.equal(portIsSchemeDefault("https://localhost:443/"), true);
+  assert.equal(portIsSchemeDefault("https://localhost/"), true);
+  assert.equal(portIsSchemeDefault("http://127.0.0.1/"), true);
+  // A port that is not its scheme's default survives, in either direction.
+  assert.equal(portIsSchemeDefault("http://localhost:5476/"), false);
+  assert.equal(portIsSchemeDefault("http://localhost:443/"), false);
+  assert.equal(portIsSchemeDefault("https://localhost:80/"), false);
+  for (const bad of ["", "not a url", undefined, null]) {
+    assert.equal(portIsSchemeDefault(bad), false, String(bad));
+  }
+});
+
 // ── No shell module may read a port off a URL without this normalizer ───────
 
 test("no shell module keys anything off the raw URL.port property", () => {
@@ -90,7 +112,19 @@ test("no shell module keys anything off the raw URL.port property", () => {
   // LAUNCH TARGET, not to key a lookup. Resolving a scheme default there would
   // newly admit :80 as a target, which `isSelectablePort` in host-config.js
   // exists to refuse -- so that decision belongs with port selection.
-  const ALLOWED = new Set(["data-home.js"]);
+  //
+  // The two cookie sites are the opposite case: `mc_token_<port>` is named by
+  // the GATEWAY, after its own listen port when the Host header carries none, so
+  // a client that resolved the URL's default port would name whichever gateway
+  // last served that port -- and cookies are host-scoped only, so that cookie is
+  // in the same jar. They state the port or decline.
+  const ALLOWED = new Set([
+    // This module IS the normalizer, so the raw property is its input.
+    "gateway-auth-hint.js",
+    "data-home.js",
+    "mochi-session-token.js",
+    path.join("mochi", "index.js"),
+  ]);
 
   const offenders = [];
   const walk = (dir) => {

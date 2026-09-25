@@ -1,7 +1,5 @@
 "use strict";
 
-const { defaultedPort } = require("./gateway-auth-hint");
-
 /**
  * Borrow the gateway session the MAIN WINDOW already established, for
  * Mochi's poller — a plain Node process in the main process with no browser
@@ -33,12 +31,23 @@ const { defaultedPort } = require("./gateway-auth-hint");
  */
 async function borrowSessionToken({ electronSession, backendUrl }) {
   if (!electronSession || typeof electronSession.cookies?.get !== "function") return "";
-  // `defaultedPort`, not `URL.port`: the cookie is named `mc_token_<port>` after
-  // the port the BROWSER reached, and the gateway falls back to its own listen
-  // port when the Host header carries none -- which is exactly what a browser
-  // sends for a scheme default. A raw `URL.port` is "" there, so the lookup
-  // would ask for `mc_token_` and borrow nothing on a gateway on :80.
-  const port = defaultedPort(backendUrl);
+  // Deliberately the RAW port, and deliberately fail closed when it is empty.
+  //
+  // `mc_token_<port>` is named by the GATEWAY, after the port the browser's Host
+  // header carried -- and a browser omits a scheme's default port from `Host`,
+  // so the gateway falls back to its OWN listen port there. Behind a tunnel that
+  // listen port is the remote one, which this process cannot know. Resolving the
+  // URL's default port would therefore name a cookie belonging to whichever
+  // gateway last served that port, and cookies are host-scoped only, so such a
+  // cookie is present in this jar. Borrowing it would hand one gateway's session
+  // credential to another. A port the URL states is unambiguous; an absent one
+  // is a guess, and this path declines to guess.
+  let port;
+  try {
+    port = new URL(backendUrl).port;
+  } catch {
+    return "";
+  }
   if (!port) return "";
   try {
     const cookies = await electronSession.cookies.get({ url: backendUrl, name: `mc_token_${port}` });

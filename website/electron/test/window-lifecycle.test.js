@@ -22,6 +22,7 @@ const {
   createWindowLifecycle,
 } = require("../window-lifecycle");
 const { registerCaptureSurface } = require("../capture-trust");
+const { setRemoteHostConfig } = require("../host-config");
 
 function validOptions(overrides = {}) {
   return {
@@ -456,6 +457,71 @@ describe("local gateway ownership policy", () => {
       assert.equal(win(url), false, `${url} is not loopback`);
     }
   });
+
+  it("still reads a crew an older version recorded under the empty key as remote", () => {
+    // An older version keyed this map off the raw `URL.port`, so an install that
+    // configured its crew while on a scheme-default port persisted it under
+    // `remoteHosts[""]` -- and the gate of the day read that same empty key, so
+    // it answered "remote" by accident. Resolving the key without honouring that
+    // record would classify the crew as local on the first launch after upgrade
+    // and put this machine's internal secret through the tunnel.
+    const lifecycle = createWindowLifecycle(validOptions({
+      port: 80,
+      store: { get: (key) => (key === "remoteHosts" ? { "": { host: "legacy.example.test" } } : null) },
+    }));
+    const isLocal = lifecycle.security.isGatewayLocalForWindow;
+    const win = (url) => isLocal({ isDestroyed: () => false, _mcBackendUrl: url });
+
+    // Every URL shape that could have produced that record: the port was resolved
+    // rather than stated, under either scheme.
+    for (const url of [
+      "http://localhost/",
+      "http://localhost:80/",
+      "http://127.0.0.1/",
+      "https://localhost/",
+      "https://localhost:443/",
+    ]) {
+      assert.equal(win(url), false, `${url} must honour the legacy record`);
+    }
+
+    // And no other shape: a stated non-default port could not have written that
+    // record, so it must not be dragged into it.
+    assert.equal(win("http://localhost:5476/"), true, "a stated port is unaffected");
+    assert.equal(win("http://localhost:6124/"), true, "a stated port is unaffected");
+
+    // An entry under the empty key holding only a window name is a title
+    // setting, which the same older versions also wrote there. It is not a crew.
+    const named = createWindowLifecycle(validOptions({
+      port: 80,
+      store: { get: (key) => (key === "remoteHosts" ? { "": { defaultName: "Pinned" } } : null) },
+    }));
+    assert.equal(
+      named.security.isGatewayLocalForWindow({
+        isDestroyed: () => false,
+        _mcBackendUrl: "http://localhost/",
+      }),
+      true,
+      "a defaultName-only legacy entry names no crew",
+    );
+
+    // A resolved-key entry wins, so the legacy record cannot override a crew the
+    // user has since restated.
+    const healed = createWindowLifecycle(validOptions({
+      port: 80,
+      store: {
+        get: (key) => (key === "remoteHosts"
+          ? { "": { host: "legacy.example.test" }, "80": { host: "current.example.test" } }
+          : null),
+      },
+    }));
+    assert.equal(
+      healed.security.isGatewayLocalForWindow({
+        isDestroyed: () => false,
+        _mcBackendUrl: "http://localhost/",
+      }),
+      false,
+    );
+  });
 });
 
 describe("window lifecycle source contracts", () => {
@@ -493,8 +559,155 @@ describe("window lifecycle source contracts", () => {
     const gate = SOURCE.slice(gateStart, SOURCE.indexOf("\n  }\n", gateStart));
     assert.match(
       gate,
-      /getRemoteHostConfig\(store, defaultedPort\(url\)\)/,
-      "the gate must read remoteHosts by the same normalized port",
+      /getRemoteHostConfigForUrl\(store, url\)/,
+      "the gate must read remoteHosts through the URL-aware resolver",
+    );
+  });
+
+  it("only claims SSH failed when an SSH attempt reported one", () => {
+    // `fetchRemoteToken` keys its own lookup by port, so on a record the resolver
+    // reached under the empty key it returns without running ssh at all. Naming
+    // that "SSH to <host> failed" describes an attempt that never happened and
+    // sends the reader to check a connection nothing used.
+    const start = SOURCE.indexOf("async function refreshToken(");
+    assert.notEqual(start, -1);
+    const body = SOURCE.slice(start, SOURCE.indexOf("\n  }\n", start));
+    assert.match(body, /detail: sshError\s*\n\s*\? `SSH to \$\{config\?\.host/, "the SSH wording must be gated on sshError");
+    assert.match(body, /no SSH attempt was made/, "the no-attempt state must say so");
+    assert.doesNotMatch(
+      body,
+      /sshError \|\| "Check your connection\."/,
+      "a falsy sshError must not be papered over with generic advice under an SSH heading",
+    );
+    // The selectability predicate must coerce to a number: `defaultedPort`
+    // returns a STRING and `isSelectablePort` gates on `Number.isInteger`, so a
+    // raw-string test is always false and sends every port down the unselectable
+    // branch -- which then (below) prescribes an action that reopens the leak.
+    assert.match(
+      body,
+      /isSelectablePort\(Number\(targetPort\)\)/,
+      "the selectability test must coerce the string port with Number(...)",
+    );
+    // The unselectable-port remedy must NOT tell the user to Clear: on a live
+    // ssh -L tunnel the crew record is the only thing marking the window remote,
+    // and clearing it makes isGatewayLocalForWindow read the loopback window as a
+    // local gateway -- putting X-Internal-Secret through the tunnel, the exact
+    // exposure this PR closes. Direct them to reopen on another port instead.
+    const unselectableBranch = body.slice(body.indexOf("can't be used to save one"));
+    assert.doesNotMatch(
+      unselectableBranch,
+      /choose Clear|and clear the host/,
+      "the unselectable-port remedy must not prescribe Clear (it removes the record marking a live tunnel remote)",
+    );
+    assert.match(
+      unselectableBranch,
+      /Reconnect the crew on a different local/,
+      "the unselectable-port remedy must direct the user to reconnect on a different local port",
+    );
+  });
+
+  it("retires a superseded empty-key record only after the write is durable", () => {
+    // Order is the whole point. Retiring FIRST erases the record on a write that
+    // is refused -- and `saveRemoteCrewConfig` refuses an unselectable port, so
+    // on an http window resolving to :80 no write ever succeeds. The crew would
+    // then read as this machine's own gateway with no way back. Pinned on the
+    // source because the write runs inside a BrowserWindow's `closed` handler.
+    const start = SOURCE.indexOf("function promptRemoteHost(");
+    assert.notEqual(start, -1);
+    const body = SOURCE.slice(start, SOURCE.indexOf("\n  }\n", start));
+    assert.match(
+      body,
+      /const retireLegacy = \(\) => \{\s*\n\s*if \(portIsSchemeDefault\(focused\._mcBackendUrl\)\) \{\s*\n\s*retireLegacyEmptyPortHost\(store, focusedPort\);/,
+      "retire only for a URL whose port is its scheme default, keyed to the resolved port so the pinned name migrates",
+    );
+    const save = body.indexOf("saveRemoteCrewConfig(store, focusedPort, fields)");
+    const refusedReturn = body.indexOf("return;", body.indexOf("title: \"Invalid Input\""));
+    const calls = [...body.matchAll(/retireLegacy\(\);/g)].map((m) => m.index);
+    assert.ok(save !== -1 && refusedReturn !== -1, "the save write and the refusal must exist");
+    // Retirement runs on the SAVE path only. The clear path never retires: a
+    // scheme-default host-bearing record is intercepted by the Clear refusal
+    // above, and on any other port there is no empty-key record to retire.
+    assert.equal(calls.length, 1, "one retirement, on the save path only");
+    assert.ok(
+      calls[0] > refusedReturn,
+      "the save path retires only past the refusal guard, so a refused save keeps the record",
+    );
+  });
+
+  it("refuses a Clear on a scheme-default port that still resolves to a legacy remote record", () => {
+    // A Clear on a scheme-default port (:80/:443) can't write a per-port record,
+    // so the only record marking this crew remote is the empty-key legacy one.
+    // Deleting the resolved-key record AND retiring the legacy record here would
+    // leave a FRESH default-port window later reading no crew --
+    // isGatewayLocalForWindow then classifies the loopback window as a local
+    // gateway and the host-presence heartbeat puts X-Internal-Secret through the
+    // still-open ssh tunnel, the exact exposure this PR closes, re-opened across
+    // windows past the per-window latch. With no in-app probe that a scheme-default
+    // port is positively local (a :80 write is refused outright), the Clear must
+    // REFUSE and keep BOTH records (a future default-port window still resolves
+    // REMOTE from the store = fail-closed). Pinned on source: the write runs
+    // inside a BrowserWindow `closed` handler that node:test cannot drive.
+    const start = SOURCE.indexOf("function promptRemoteHost(");
+    assert.notEqual(start, -1, "promptRemoteHost must exist");
+    const body = SOURCE.slice(start, SOURCE.indexOf("\n  }\n", start));
+    const clearBranch = body.indexOf("if (!host) {");
+    assert.notEqual(clearBranch, -1, "the Clear branch must exist");
+    const guard = body.indexOf("portIsSchemeDefault(focused._mcBackendUrl)", clearBranch);
+    const clearWrite = body.indexOf("setRemoteHostConfig(store, focusedPort, {})", clearBranch);
+    const retire = body.indexOf("retireLegacy();", clearBranch);
+    assert.ok(
+      guard !== -1 && clearWrite !== -1 && retire !== -1,
+      "the scheme-default guard and the clear write/retire must all exist in the Clear branch",
+    );
+    // The refusal must be decided BEFORE the Clear deletes the resolved-key
+    // record or retires the legacy one -- otherwise the exposure has already
+    // been re-opened by the time the dialog shows.
+    assert.ok(
+      guard < clearWrite && guard < retire,
+      "the scheme-default refusal must be checked before the clear deletes or retires anything",
+    );
+    // The guard reads a HOST-BEARING legacy empty-key record (a hostless record
+    // names no crew, so clearing it is safe) and refuses with an error dialog
+    // that returns before the deletes.
+    const guardBlock = body.slice(guard, clearWrite);
+    assert.match(
+      guardBlock,
+      /getRemoteHostConfigForUrl\(store, focused\._mcBackendUrl\)\?\.host/,
+      "the refusal must be conditioned on the URL resolver so a host under the empty key OR the resolved 80/443 key is caught",
+    );
+    assert.match(guardBlock, /type: "error"/, "the refusal must be an error dialog");
+    // The remedy must NOT prescribe a route that cannot clear the record: the
+    // default-port record lives under the resolved/empty key, so reconnecting on
+    // a different selectable port and clearing THERE removes a different record
+    // and leaves this one intact -- a dead end. It must tell the truth (the
+    // setting is kept on purpose) and give a real way to stop reaching the crew.
+    assert.doesNotMatch(
+      guardBlock,
+      /clear it there|then open that tab and clear/,
+      "the refusal must not send the user to clear the record on another tab (that clears a different record)",
+    );
+    assert.match(
+      guardBlock,
+      /kept on purpose/,
+      "the refusal must explain the setting is retained deliberately, not present clearing as pending",
+    );
+    assert.match(
+      guardBlock,
+      /close this tab/,
+      "the refusal must give a real way to stop reaching the crew (close the tab / stop the tunnel)",
+    );
+    assert.match(
+      guardBlock,
+      /\breturn;/,
+      "the refusal must return before setRemoteHostConfig / retireLegacy run",
+    );
+    // A selectable-port Clear is unaffected: portIsSchemeDefault is false there,
+    // so control falls through the guard to the existing delete + retire + info
+    // dialog. Pin that the normal clear path still follows the refusal guard.
+    const clearedInfo = body.indexOf("cleared (using local token)", guard);
+    assert.ok(
+      clearedInfo > guard && clearedInfo > clearWrite,
+      "the selectable-port Clear must still delete the record and show the cleared info dialog",
     );
   });
 
