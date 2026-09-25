@@ -58,7 +58,10 @@ from typing import TYPE_CHECKING, Literal, NamedTuple
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import fsync_dir, refuse_linked_parent
 from kiro_crew.config.paths import config_dir, kiro_agents_dir
-from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
+from kiro_crew.constants import (
+    KIROCREW_SPAWNED_ENV,
+    KIROCREW_SPAWNED_VALUE,
+)
 from kiro_crew.identity_stores import AUTH_SQLITE_DB, AUTH_SQLITE_SIDECAR_SUFFIXES
 from kiro_crew.pinned_fs import fd_real_path
 from kiro_crew.platform import current_context

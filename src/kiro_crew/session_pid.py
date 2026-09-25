@@ -3942,6 +3942,24 @@ def _env_spawn_instance(pid: int, proc_root: Path | None = None) -> str | None:
     return None
 
 
+def process_spawn_instance(pid: int, proc_root: Path | None = None) -> str | None:
+    """*pid*'s per-spawn ``KIROCREW_SPAWN_INSTANCE``, or ``None``.
+
+    The public reading of :func:`_env_spawn_instance`, for callers outside this
+    module that need to ask whether a live process belongs to a spawn they have a
+    record of. The token is read from the process's EXEC-TIME environment, which
+    the process itself cannot rewrite, so a match is positive attribution rather
+    than a claim the process makes about itself.
+
+    ``None`` covers every negative in one value -- no such process, no token on
+    its environment, an unreadable environment, and a host with no environment
+    oracle -- so a caller that needs a positive answer fails closed on all of
+    them. :func:`group_vouching_available` says whether this host can answer at
+    all, which is what lets a caller tell "not ours" from "cannot see".
+    """
+    return _env_spawn_instance(pid, proc_root)
+
+
 def _env_has_kirocrew_marker(pid: int, proc_root: Path | None = None) -> bool:
     """True if *pid*'s environment carries the ``KIROCREW_SPAWNED`` marker.
 
