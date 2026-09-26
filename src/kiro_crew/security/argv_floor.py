@@ -118,7 +118,7 @@ from .shell_normalizer import (
     _split_shell_words,
     _strip_redirect,
     _substitution_bodies,
-    _substitution_depth_delta,
+    _SubstitutionDepth,
     _xargs_here_string_rebuild,
 )
 from .vocabulary import _KILL_BY_NAME_PROGRAMS, _SELF_FILE_DELIVERY_VERBS, _SELF_NAME_RE
@@ -479,7 +479,7 @@ def _is_credential_mint(text_lower: str, *, raw_text: "str | None" = None) -> bo
             # scan: ``if true; then <name> <verb>; fi`` hands the verb over as
             # ``<verb>;`` -- one token that both IS the verb and carries the boundary,
             # so testing the boundary first discards the very argument that names it.
-            depth = 0
+            depth = _SubstitutionDepth(rest=tokens[i + 1 :])
             inline_payload_next = False
             for later in tokens[i + 1 :]:
                 if _is_mint_verb(later):
@@ -494,24 +494,29 @@ def _is_credential_mint(text_lower: str, *, raw_text: "str | None" = None) -> bo
                 # the CLI is denied above, before this loop runs, because it can construct the
                 # verb internally. The skip covers the remaining case —
                 # a payload that does NOT import us, followed by a real `token` argument.
+                # A skipped token is still shown to the walker as DATA (``feed_data``).
                 if inline_payload_next:
                     inline_payload_next = False
+                    if depth.feed_data(later):
+                        break
                     continue
                 _operand = _shell_normalizer._normalize_operand(later).strip("\"'")
                 if _operand in _PYTHON_INLINE_PROGRAM_FLAGS:
                     inline_payload_next = True
+                    if depth.feed_data(later):
+                        break
                     continue
                 # `-c<payload>` attached: the payload is already inside this token, so it is
                 # data in the same way — skip it without expecting a following one.
                 if len(_operand) > 2 and _operand[:2] in _PYTHON_INLINE_PROGRAM_FLAGS:
+                    if depth.feed_data(later):
+                        break
                     continue
                 # A separator NESTED in a command substitution is part of that
                 # substitution, not the end of this argv: ``<name> $(true; echo <verb>)``
                 # is still one command.  Only a top-level separator ends the scan.
-                depth += _substitution_depth_delta(later)
-                if depth <= 0 and _ends_argv(later):
+                if depth.feed(later):
                     break
-                depth = max(depth, 0)
     return False
 
 
@@ -566,7 +571,7 @@ def _bare_kill_raw_bodies(source: str) -> "list[str]":
     """Substitution bodies inside a bare ``kill``'s own argv, read from the RAW text.
 
     The token walk in :func:`_is_self_kill` bounds the same window with
-    :func:`_substitution_depth_delta`, which counts parens on tokens
+    :class:`_SubstitutionDepth`, which counts parens on tokens
     ``normalize_shell_command`` has already stripped the quotes from -- so by the
     time the counter runs, a QUOTED close-paren is indistinguishable from a real
     closer and it ends the window early: ``kill $(printf ')' ; pgrep -f
@@ -877,7 +882,7 @@ def _is_self_kill(text_lower: str) -> bool:
             # so testing the boundary first would discard the very argument that
             # names the target.  Stopping after it keeps an unrelated later command
             # out of the match (``pkill other; echo kirocrew`` is not a self-kill).
-            depth = 0
+            depth = _SubstitutionDepth(rest=tokens[i + 1 :])
             for arg in tokens[i + 1 :]:
                 # Search the raw arg AND its normalized form.  Normalizing alone is
                 # not enough: a pkill pattern is an ERE, so a ``>`` inside it is part
@@ -889,10 +894,8 @@ def _is_self_kill(text_lower: str) -> bool:
                     _shell_normalizer._normalize_operand(arg)
                 ):
                     return True
-                depth += _substitution_depth_delta(arg)
-                if depth <= 0 and _ends_argv(arg):
+                if depth.feed(arg):
                     break
-                depth = max(depth, 0)
     # Bare ``kill`` whose PID comes out of a substitution naming the product.
     # The VERB is matched on tokens (so ``/usr/bin/kill``, ``$(which kill)`` and a
     # quoted spelling all count -- a raw-text pattern anchored on separators sees
@@ -908,14 +911,13 @@ def _is_self_kill(text_lower: str) -> bool:
             # ``kill 123; echo $(cat /tmp/kirocrew)`` was denied for a substitution
             # belonging to a different command.
             own = [token]
-            depth = 0
+            depth = _SubstitutionDepth(rest=frame[i + 1 :])
             for later in frame[i + 1 :]:
                 own.append(later)
                 # A separator INSIDE a substitution belongs to the substitution, not to
                 # this command line: ``kill $(echo x; pgrep <name>)`` is ONE argument, so
                 # ending the scan at that ``;`` would drop the half naming the target.
-                depth += _substitution_depth_delta(later)
-                if depth <= 0 and _ends_argv(later):
+                if depth.feed(later):
                     break
             # An operand of THIS kill that resolves to the protected name is a self-kill.
             # `kill` takes PIDs, so a bare name is not something a person types -- it gets
@@ -934,15 +936,12 @@ def _is_self_kill(text_lower: str) -> bool:
                     _resolve_param_defaults(body)
                 ):
                     return True
-        # The window above is bounded by ``_substitution_depth_delta`` on
-        # DE-QUOTED tokens, so a quoted close-paren reads as a real closer and
-        # closes the window early, dropping the clause that names the target
+        # The window above is bounded by ``_SubstitutionDepth`` on DE-QUOTED
+        # tokens, so a quoted close-paren reads as a real closer and closes the
+        # window early, dropping the clause that names the target
         # (``kill $(printf ')' ; pgrep -f kirocrew)``).  Re-derive the same
-        # window from the RAW text, where the quotes still exist.  The counter
-        # also scores a ``case`` PATTERN's ``)`` as a closer, so a lookup placed
-        # after ``case ... esac`` in the body's list falls outside the token
-        # window too -- only this raw window reaches it.  Search each body raw,
-        # with parameter defaults resolved, AND per WORD of the ``_self_tokens``
+        # window from the RAW text, where the quotes still exist.  Search each
+        # body raw, with parameter defaults resolved, AND per WORD of the ``_self_tokens``
         # view (de-quoting only exists as a product of tokenization, and that
         # view folds a ``backslash-newline`` split name whole and swallows an
         # untokenizable body instead of raising out of the gate): each word
@@ -997,19 +996,23 @@ def _self_cli_operands(tokens: "list[str]", i: int) -> "list[str]":
     boundary so a chained later command's words are not attributed here.
     """
     operands: "list[str]" = []
-    depth = 0
+    depth = _SubstitutionDepth(rest=tokens[i + 1 :])
     skip_target = False
     for later in tokens[i + 1 :]:
         is_redirect, expects_target = _redirect_consumes_next(later)
         if skip_target:
             # A separate redirection target (``> FILE``) is a filename: its bytes are
             # data, not an argv boundary, so a quoted ``;``/``|`` in it (``> 'a;b'``)
-            # must NOT end the scan. Consume it without the boundary/depth bookkeeping.
+            # must NOT end the scan. Consume it as data (``feed_data``).
             skip_target = False
+            if depth.feed_data(later):
+                break
             continue
         if is_redirect:
             # The redirection operator itself is not an operand and never ends the argv.
             skip_target = expects_target
+            if depth.feed_data(later):
+                break
             continue
         operand = _shell_normalizer._normalize_operand(later)
         # ANSI-C ($'...') and locale ($"...") quoting: shlex strips the quotes
@@ -1022,10 +1025,8 @@ def _self_cli_operands(tokens: "list[str]", i: int) -> "list[str]":
             operand = _decode_printf_escapes(operand[1:])
         if operand and not operand.startswith("-"):
             operands.append(operand)
-        depth += _substitution_depth_delta(later)
-        if depth <= 0 and _ends_argv(later):
+        if depth.feed(later):
             break
-        depth = max(depth, 0)
     return operands
 
 
@@ -2844,7 +2845,7 @@ def _is_ssh_to_self(text_lower: str) -> bool:
         rsync_rsh_assigned: dict[str, str] = {}
         prev_stripped_tok: "str | None" = None
         cmd_start = True  # the next token sits in program position
-        outer_depth = 0
+        outer_depth = _SubstitutionDepth(command_position=True)
         xargs_prefix_index: "int | None" = None  # a bare ``xargs`` in this simple command
         # Once per FRAME, not once per verb token: see ``_is_credential_mint``.
         disqualified: "bool | None" = None
@@ -2884,13 +2885,11 @@ def _is_ssh_to_self(text_lower: str) -> bool:
                         rsync_rsh_export_marked.add(exported_name)
                         if exported_name in rsync_rsh_assigned:
                             rsync_rsh_exported[exported_name] = rsync_rsh_assigned[exported_name]
-                    outer_depth += _substitution_depth_delta(token)
-                    if outer_depth <= 0 and _ends_argv(token):
+                    if outer_depth.feed(token):
                         # A command separator ends the simple command the
                         # leading assignment prefixed; pending does not cross it.
                         rsync_rsh_pending.clear()
                         xargs_prefix_index = None
-                    outer_depth = max(outer_depth, 0)
                 # round-35 (GPT): xargs turns its stdin into argv for the
                 # program it launches -- remember a bare ``xargs`` in this
                 # simple command (any position: wrappers keep it off program
@@ -2976,14 +2975,16 @@ def _is_ssh_to_self(text_lower: str) -> bool:
             rsh_value_pending = False  # previous token was rsync -e/--rsh (value is a local cmd)
             proxyjump_value_pending = False  # previous token was a detached -J (value = hop chain)
             opts_terminated = False  # an exact ``--`` ended option parsing (POSIX)
-            depth = 0
+            depth = _SubstitutionDepth(rest=tokens[i + 1 :])
             for arg in tokens[i + 1 :]:
                 stripped = arg.strip("\"'")
                 # Classify BEFORE testing whether the token ends the argv
                 # (same order as the self-kill floor): a quoted remote payload
                 # may contain separator characters, and for scp/rsync a
                 # target can legally follow it.
-                if redirect_target_pending:
+                if depth.grammar_next:
+                    pass  # a ``case`` WORD, ``in`` or PATTERN is grammar, not an operand
+                elif redirect_target_pending:
                     # The filename after a detached ``>``/``2>``/``<`` — bash
                     # removes both words from argv before exec.
                     redirect_target_pending = False
@@ -3168,17 +3169,15 @@ def _is_ssh_to_self(text_lower: str) -> bool:
                         _unmask_separators(stripped), value_slot=option_shadow
                     ):
                         return True
-                    if not value_shadow:
-                        # round-18: same consumption rule as the redirect
-                        # branch above.
+                    if not value_shadow and depth.top_level and "$(" not in arg and "`" not in arg:
+                        # round-18 rule, for a plain TOP-LEVEL word only: a word opening
+                        # or inside a substitution (``$(case … esac)``) is not the destination.
                         positional_pending = False
                     option_shadow = False
                     value_shadow = False
                     value_shadow_ambiguous = False
-                depth += _substitution_depth_delta(arg)
-                if depth <= 0 and _ends_argv(arg):
+                if depth.feed(arg):
                     break
-                depth = max(depth, 0)
         # End of frame: a leading RSYNC_RSH selector that SURVIVED to here was
         # consumed by the frame's command (which may spawn a nested payload),
         # and an exported one persists for the whole line -- either way, if it

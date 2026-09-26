@@ -126,12 +126,19 @@ def _url_payload_command(n: int) -> str:
 #: Three incomplete dumps in a row log one warning, so a host whose table never
 #: reads can be told apart from a target that is really this machine.
 #:
+#: Raised again, from 27,942, for the case-aware substitution-depth walker
+#: (``_SubstitutionDepth`` and ``_reduce_expansions``, ~300 lines) that every
+#: argv window bounds itself with in place of the bare paren counter -- its glued
+#: segments fed in a loop rather than by recursion, so a long clause run cannot
+#: raise out of the gate; its ``grammar_next`` tells the ssh-family walk that a case
+#: WORD, ``in`` or PATTERN is not an operand (a ``*)`` pattern read as every self host).
+#:
 #: The number IS the package's measured total, carrying no spare room: a ratchet with
 #: headroom admits exactly the unreviewed growth it exists to catch, so the next line
 #: added here fails this gate and has to be re-pinned deliberately, with its reason
 #: written above. The guards that detect a monolith growing back are the per-file cap
 #: and the facade's share below, and both must stay untouched.
-_PACKAGE_LINE_BUDGET = 27_942
+_PACKAGE_LINE_BUDGET = 28_246
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
