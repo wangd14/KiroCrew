@@ -83,6 +83,34 @@ Other shared modules:
 - `ColumnResizer.tsx` + `hooks/useTableColumnWidths` (the drag grip on a TABLE
   column) — see below
 
+### Composer goal suggestions
+
+`SessionAutomationPopover` keeps one mounted trigger as a saved, inactive
+`suggested` goal becomes a started goal. Its single instance stays in a separate
+row above the composer text input for empty, manual-loop, watch and typed-goal
+states. The row sits outside the manually resized input wrapper, inside the same
+animated Glass dock, so its height does not consume the saved input height and it
+collapses with the composer. That row holds only the details trigger and the
+suggestion's Start or Refresh status action. Goal status wraps within the available
+width; the bottom toolbar keeps its controls on their own row without
+goal-specific wrapping.
+The suggestion asks “Keep working until this is verified?” beside its clickable
+objective and explicit Start action.
+Opening the objective shows its scope, completion criteria and saved continuation
+cycle limit; runtime appears only when the saved value is positive. There is no
+money estimate or implied permission grant. Rendering, opening details and changing
+recognition never start a goal. Start uses the existing owner resume request with
+the displayed goal's generation; a missing generation requires a read and a
+separate click. Existing started-goal Pause, Resume and refusal notices remain.
+
+The popup's reversible `monitoring.goal_suggestions` toggle uses the shared
+`kirocrewConfig` query and config PATCH, without polling. Recognition defaults to
+true when the loaded config omits the key. Disabling it stops new suggestions.
+Existing suggestions stay visible, so their saved record never silently occupies
+the session's automation slot; the details name `/goal clear` as the way to discard
+one. Started goals and manual `/goal` remain available. A failed config read offers
+retry and keeps the toggle disabled; it does not remove saved-goal controls.
+
 ### User-resizable table columns
 
 A data table whose values get truncated lets the user drag its column

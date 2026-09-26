@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
 
-from kiro_crew import name_grant, runtime_death
+from kiro_crew import goal_actions, name_grant, runtime_death
 from kiro_crew.acp.client import AcpError, AcpProcessDied, AcpPromptBusy, AcpTimeoutError
 from kiro_crew.acp.types import (
     STOP_REASON_CANCELLED,
@@ -1853,9 +1853,17 @@ async def _handle_slash_command(
         # Against the thread's OWNING session -- a linked thread's turns run
         # under the dashboard session that owns it, and that is the key the
         # replay reads -- resolved the way the OPTIONS expiry below resolves it.
-        note_user_stop(sessions, sessions.get_session_for_thread(reply_ts) or session_key)
-        has_session = sessions.has_session(session_key)
+        control_key = sessions.get_session_for_thread(reply_ts) or session_key
+        goal_state = get_dashboard_state()
+
+        def stop_reply(text: str) -> str:
+            warning = goal_actions.goal_pause_warning(control_key, state=goal_state)
+            return f"{text}\n\n{warning}" if warning else text
+
+        note_user_stop(sessions, control_key)
+        has_session = sessions.has_session(control_key)
         if not has_session:
+            await goal_actions.pause_session_goal(control_key, state=goal_state)
             sel().log_tool_invocation(
                 session_key=session_key,
                 source="slack",
@@ -1864,7 +1872,7 @@ async def _handle_slash_command(
                 outcome="no_session",
                 metadata={"user": user_id, "channel": channel},
             )
-            await slack.post_message(channel, "Nothing running.", reply_ts)
+            await slack.post_message(channel, stop_reply("Nothing running."), reply_ts)
             return ""
 
         # Post ephemeral "Stopping…" block with Kill Now button
@@ -1879,16 +1887,20 @@ async def _handle_slash_command(
         )
 
         async def _on_soft() -> None:
-            await slack.post_message(channel, "⏹ Execution stopped.", reply_ts)
+            await slack.post_message(channel, stop_reply("⏹ Execution stopped."), reply_ts)
 
         async def _on_hard() -> None:
-            await slack.post_message(channel, "⛔ Execution stopped — session reset.", reply_ts)
+            await slack.post_message(
+                channel, stop_reply("⛔ Execution stopped — session reset."), reply_ts
+            )
 
-        outcome = await sessions.stop_turn(session_key, on_soft=_on_soft, on_hard=_on_hard)
+        outcome = await sessions.stop_turn(
+            control_key, on_soft=_on_soft, on_hard=_on_hard, goal_state=goal_state
+        )
         # If stop_turn returned "idle" (no active turn), neither callback
         # fired — dismiss the stale "Stopping…" ephemeral explicitly.
         if outcome == "idle":
-            await slack.post_message(channel, "Nothing running.", reply_ts)
+            await slack.post_message(channel, stop_reply("Nothing running."), reply_ts)
         sel().log_tool_invocation(
             session_key=session_key,
             source="slack",

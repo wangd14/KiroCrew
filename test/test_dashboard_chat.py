@@ -18557,8 +18557,9 @@ class TestStopTurnSlotState:
         force_called = []
 
         async def fake_stop_turn(
-            key, *, force=False, preserve_queue=False, on_soft=None, on_hard=None
+            key, *, force=False, preserve_queue=False, on_soft=None, on_hard=None, goal_state=None
         ):
+            assert goal_state is state
             force_called.append(force)
             if on_hard:
                 await on_hard()
@@ -18590,8 +18591,9 @@ class TestStopTurnSlotState:
         force_called = []
 
         async def fake_stop_turn(
-            key, *, force=False, preserve_queue=False, on_soft=None, on_hard=None
+            key, *, force=False, preserve_queue=False, on_soft=None, on_hard=None, goal_state=None
         ):
+            assert goal_state is state
             force_called.append(force)
             if on_hard:
                 await on_hard()
@@ -18646,8 +18648,9 @@ class TestStopTurnSlotState:
             slot.queue_append(content)
 
         async def fake_stop_turn(
-            key, *, force=False, preserve_queue=False, on_soft=None, on_hard=None
+            key, *, force=False, preserve_queue=False, on_soft=None, on_hard=None, goal_state=None
         ):
+            assert goal_state is state
             if on_hard:
                 await on_hard()
             return "hard"
@@ -18696,8 +18699,9 @@ class TestStopTurnSlotState:
         assert len(slot._queue) == 0
 
         async def fake_stop_turn(
-            key, *, force=False, preserve_queue=False, on_soft=None, on_hard=None
+            key, *, force=False, preserve_queue=False, on_soft=None, on_hard=None, goal_state=None
         ):
+            assert goal_state is state
             if on_hard:
                 await on_hard()
             return "hard"

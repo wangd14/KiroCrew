@@ -37,6 +37,10 @@ valid member or template identity. Session context doubles implement the async
 `memory_mode_for_session()` accessor and return a concrete retention mode.
 Session-start collector tests declare their
 MCP roster explicitly rather than inheriting the installed agent's tools.
+`SessionManager.stop_turn` doubles declare `goal_state` explicitly when their
+callers supply it. Assert the exact dashboard-state identity, including the
+keyword's presence when the expected value is `None`; preserve the soft/hard
+callbacks and their existing behavior assertions instead of accepting `**kwargs`.
 
 ```python
 @pytest.mark.asyncio
@@ -113,6 +117,19 @@ Cancellation-during-persistence tests must wait for a worker-entered handshake
 before cancelling, not infer entry from a short sleep. Keep the worker's wait
 bounded, release it in `finally`, and await the cancelled task's write drain;
 assertions must still prove the lock stays held and the real write completes.
+
+SQLite contention tests open the writer's own connection before taking the holder's
+transaction, observe its actual `BEGIN IMMEDIATE`, and require completion to remain
+pending while the lock is held. Release the holder before awaiting completion and
+assert the persisted row: `sync` can swallow a failed write. Do not compare a real
+clock delta with the requested sleep duration. Bound every handshake and join, release
+the holder in `finally`, and close each thread's connection on that thread.
+
+A delayed executable fixture must be absent or ready to execute at its public path.
+Write and chmod a private sibling first, then atomically rename it into place. Writing
+the public path before chmod exposes a non-executable file to the real child; EACCES
+must remain terminal, not become another retry case. Assert initial absence and the
+child's successful exit, and cancel/join the publisher and reap the child on failure.
 
 The same handshake applies when the cancel comes from a PRODUCTION deadline rather
 than the test. `run_with_recall_deadline` arms its timer the moment it is awaited;
@@ -775,6 +792,12 @@ measures, never above.
 
 ## Rules
 
+- Remote Crew chaining cases using a real `HopPortGuard` obtain a kernel-selected
+  loopback port with `bind(("127.0.0.1", 0))`; fake-only cases retain inert guards
+  and their fake port band. The released port is only a hint: tests still exercise
+  the production handoff, assert real ownership and cross-process bind refusal,
+  and close real guards in `finally`.
+
 - **Host-floor patches use `_floor_monkeypatch`, never the test's shared
   `monkeypatch`.** The rootdir fixtures keep path redirects, service guards,
   download/telemetry switches and policy/preload scrubs on a private undo stack.
@@ -1206,6 +1229,28 @@ measures, never above.
   is the shape) or resolve the tool to its real executable before building the env. Do
   NOT drop the `HOME` substitution to fix it — that is usually a blast-radius bound
   somebody chose on purpose.
+
+- **A child must use the tool the fixture discovered.** In
+  `test_ai_review_workflows.py`, keep the temporary `gh`/`sleep` stub directory
+  first, the directory of `shutil.which("jq")` next, and Unix defaults last.
+  Putting defaults before the discovered directory can select an older system
+  jq that misparses adjacent JSON pages. Keep the adversarial input and the
+  missing-tool skip; check other commands used by consumers before promoting a
+  directory that also contains sibling tools.
+
+- **Bootstrap fixtures must match the child's libc target.** In
+  `test_playwright_cli_installer.py`, `_expected_node_base` uses native
+  `os.confstr("CS_GNU_LIBC_VERSION")` on Linux/x64 to select `glibc-217` below
+  glibc 2.28. OS and architecture alone give the fake mirror the wrong archive,
+  failing before checksum and cleanup assertions. Keep the real platform tool
+  outputs and verification assertions.
+
+- **Pin discovery inputs beyond the mocked call.** A test controlling
+  `shutil.which` must also pin explicit candidate locations consulted first
+  (`TestPySpy`). Service fixtures modeling absent files must move `ENV_DIR` and
+  `ENV_FILE_PATH` under `tmp_path` alongside `UNIT_PATH`; a host's untouched seed
+  can otherwise add legitimate uninstall cleanup calls. Preserve the candidate
+  discovery and edited/untouched-seed assertions.
 
 - **A spawn that can outlive the test gets a process-GROUP reap, not `kill()`.** A child
   is routinely a wrapper that forks, so killing the direct pid reaps the wrapper and
@@ -4179,6 +4224,18 @@ mark is the tool for a test that genuinely cannot share a worker.
 
 Mutate process globals through `monkeypatch`, which reverts on teardown even when the
 test fails. Raw assignment does not.
+
+Tests that reimport a module must restore both its `sys.modules` entry and its
+parent package's child attribute, including their original absence. Remove temporary
+module entries before restoring the saved objects. The pysqlite3 fallback tests left
+`kiro_crew.knowledge.store` pointing at the stdlib-backed temporary module even after
+restoring `sys.modules`; the next schema-behind test then failed to catch the optional
+driver's exception. Verify restoration by running the fallback and its consumer in order
+in the same `-n0` process, keeping optional-driver coverage and schema assertions intact.
+
+Keep source annotations outside generated configuration text. An inline
+`# wokeignore:rule=master` belongs on the Python literal, not inside its SSH config
+value, where OpenSSH treats it as extra option arguments.
 
 **Sharding does not just scatter this class, it hides it — so a full-suite run is the wrong
 place to be finding it.** `ci.yml` assigns whole files to Linux/Windows shards

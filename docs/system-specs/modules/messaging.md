@@ -2,6 +2,27 @@
 
 ## Overview
 
+Slack, Discord and Webex's supported goal sessions pass authenticated human
+versus gateway-wake provenance to the shared session-directive consumer.
+Discord and Webex capture the wake marker at dispatch entry, before the turn
+ceiling spends it. The shared queue drain expires any unspent marker before
+pumping queued messages or waking peer sessions, so queued humans retain their
+own turn identity and ordinary ceiling accounting even after a monitor turn or
+a return before the ceiling gate. If a generated wake reaches a busy dispatcher,
+it is refused before steering, queueing or acknowledging delivery. The gateway
+honors that busy outcome for plain goal wakes as well as monitor wakes; a skipped
+wake is not delivered later as a human message.
+Discord and Webex also return `BUSY` when admission or channels governance
+refuses a plain goal wake before its turn starts. Human refusals keep their
+existing return behavior; Discord monitor refusals remain `BUSY` at admission
+and `UNAVAILABLE` at governance, including inside a generated-turn scope.
+The consumer also captures the session Stop generation and rechecks it when a
+goal mutation commits. Channel Stop commands pause the existing goal as well
+as cancelling the current response. Other transports keep their existing
+directive behavior until they support the auto-nudge binding contract.
+Slack goal wakes run through the shared directive-capable driver. A failed pause
+save stays paused in memory and appears in the Stop reply with a restart warning.
+
 `kiro_crew.messaging` is the channel-neutral transport abstraction used by the shipped Slack, Discord, Telegram, Webex, WeCom, Microsoft Teams, Weixin, iMessage, WhatsApp, and Feishu integrations; its conservative contract also leaves room for a further channel. It avoids re-implementing streaming, tool approval, session identity, or rendering for each integration. It holds the channel-neutral core of the Slack turn loop (`slack/handler.py::handle_message`) so a new channel implements only two small interfaces (a `MessagingTransport` + a `Renderer`) and inherits everything else.
 
 **Dependency direction is one-way:** `slack` / `dashboard` → `messaging`, never the reverse. The `kiro_crew.messaging` package imports nothing from `kiro_crew.slack` or `kiro_crew.dashboard`; its only first-party dependencies are the shared lower-level helpers — `acp.types` event constants, the `security` redactors (`redact_credentials` / `redact_exfiltration_urls`), `sel` for audit, and, function-locally from `privacy_mode`, `session_map` (the durable flag) and `history` (the transcript header the mode is stamped into).
@@ -1643,6 +1664,23 @@ dispatcher also records the user's own words on the live renderer via
 `note_steer` so the rendered chip quotes the user rather than the redacted
 backend echo.
 
+During a generated Discord or Webex turn, `GoalSteerState` registers human
+steers before the write awaits. The driver's `on_steer_consumed` callback
+matches the backend consumption echo through `settle_consumed_steers`; a
+confirmed human match permits goal directives to act on that correction.
+The matcher lives in the shared `kiro_crew.steer_settle` leaf, below both
+messaging and dashboard; main chat and the sidecar call the same implementation.
+Its comparison redaction delegates through `agent_sdk.drivers.acp.redact_text`
+to the backend's exact redactor, resolved at call time so imports stay ACP-free.
+Write acknowledgements, inline display markers, empty or unmatched echoes,
+and automation-origin steers confer no human authority. Other directives keep
+the turn's original provenance, and every goal mutation still checks its live
+Stop generation and admission. This record belongs to the turn, independently
+of whether its renderer is muted, and is discarded when the turn exits.
+Pending evidence is bounded by `MAX_PENDING_GOAL_STEERS` and
+`MAX_GOAL_STEER_CHARS`; overflow follows the existing queue path with the full
+message. Ordinary human-started turns retain their steering behavior.
+
 Attachments force the queue path on Discord: `_session/steer` carries text only,
 so a mid-turn message with files would lose them.
 
@@ -1976,8 +2014,21 @@ the receipt -- finalizing it to `🛑 Cancelled` only once nothing else is queue
 `clear_queue` and the receipt finalize run together under `ReceiptQueue.lock`.
 All of that, including both reply strings, is
 `messaging/commands.py::stop_running_turn(sessions, session_key, *, queue,
-surface, owner)`; a dispatcher supplies the session key, its bound
-`ReceiptSurface` and the caller's owner token, and sends the returned text.
+surface, owner, goal_state=None)`; a dispatcher supplies the session key, its bound
+`ReceiptSurface`, the caller's owner token and its existing dashboard state,
+and sends the returned text. Goal pause and pause-save warnings use the shared
+`goal_actions` binding collection with that state's explicit session links,
+including retained exact dashboard aliases after channel reconciliation. Stop
+pauses every typed goal on those bindings and warns if any pause is unsaved,
+while preserving goal-less watches and foreign name-fold lookalikes. The shared messaging
+layer imports no dashboard implementation to obtain this state.
+
+WhatsApp and the native Slack fallback append the same pause-save warning to
+their existing stopped or idle reply. They capture the dashboard state and
+resolved control key before pausing, and use those same values when reading the
+warning. The native Slack fallback also pauses retained goals when no provider
+session exists; suffix forms such as `!stop please` keep the same owner as the
+thread's Stop control.
 
 **The queue drop is the CALLER's, not the session's.** Under `unified` one queue
 holds several principals, so `clear_queue` takes an ownership predicate over an
@@ -5462,6 +5513,10 @@ and `/compact` act on whichever bucket is live (`_live_session_key`); a refused 
 is a configuration answer and is not charged to the session's circuit breaker. They may talk to the agent; they cannot make it act. Steering
 is gated the same way, since it injects text into a turn already running, which
 under a unified DM scope is the operator's.
+
+Stop selects the live session key once and passes the captured dashboard state
+to `SessionManager.stop_turn` as `goal_state`. Its pause-durability warning uses
+that same key and state.
 
 **Private context is withheld per SESSION, not per sender.** `minimal_context` is
 `group or not is_operator`, and the `group` half is the one that is easy to get

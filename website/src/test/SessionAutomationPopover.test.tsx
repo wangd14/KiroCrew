@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import SessionAutomationPopover from '../components/SessionAutomationPopover'
 import {
@@ -27,6 +27,11 @@ vi.mock('../api/client', async importOriginal => ({
     monitorStop: vi.fn(),
     monitorClear: vi.fn(),
     monitorRestart: vi.fn(),
+    stopChatSlot: vi.fn(),
+    autonudgeForSlot: vi.fn(),
+    autonudgeResume: vi.fn(),
+    kirocrewConfig: vi.fn(),
+    patchConfig: vi.fn(),
   },
 }))
 
@@ -47,6 +52,14 @@ const activeLegacyLoop: LegacyGoalLoop = {
   nextDueAt: 1_900_000_000, maxRuntimeSecs: 14_400, stoppedReason: '',
 }
 
+const suggestedGoal: LegacyGoalLoop = {
+  ...activeLegacyLoop, active: false, cycleCount: 0, maxCycles: 50, maxRuntimeSecs: 0, goalGeneration: 0,
+  goal: {
+    objective: 'Verify keyboard navigation', criteria: ['Arrow keys move focus', 'Run the focus tests'],
+    progress: '', status: 'suggested', evidence: [],
+  },
+}
+
 /* The popover opens on the goal loop, so a test about the BOUNDED form has to
    walk to it exactly as a reader does. Pressed only when the offer is on
    screen: a slot that already holds a monitor opens on the bounded view, and a
@@ -65,7 +78,7 @@ function renderPopover(
   sessionMode = '',
   { enterBounded = true }: { enterBounded?: boolean } = {},
 ) {
-  const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   const props = (next: AutomationRecord | null, slotKey = 'chat-1', open = true) => (
     <QueryClientProvider client={client}>
       <SessionAutomationPopover
@@ -95,6 +108,11 @@ function renderPopover(
 describe('SessionAutomationPopover', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.mocked(api.stopChatSlot).mockReset()
+    vi.mocked(api.autonudgeForSlot).mockReset()
+    vi.mocked(api.autonudgeResume).mockReset()
+    vi.mocked(api.kirocrewConfig).mockReset().mockResolvedValue({})
+    vi.mocked(api.patchConfig).mockReset().mockResolvedValue({ ok: true })
     framerMocks.reducedMotion = false
     /* The bounded view reads the live runtime ceiling off the per-slot monitor
        read. Default it to the contract's absolute maximum so the existing
@@ -107,6 +125,743 @@ describe('SessionAutomationPopover', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+  })
+
+  it('offers a saved suggestion without arming and shows its scope, criteria, and actual limits', async () => {
+    renderPopover(suggestedGoal)
+    const details = await screen.findByRole('dialog', { name: 'Verify keyboard navigation' })
+    expect(screen.getByRole('button', { name: 'Keep working until this is verified?: Verify keyboard navigation' })).toHaveAttribute('aria-expanded', 'true')
+    expect(within(details).getByText('Suggested goal')).toBeVisible()
+    expect(within(details).getByText('Scope')).toBeVisible()
+    expect(within(details).getByText('Arrow keys move focus')).toBeVisible()
+    expect(within(details).getByText('Run the focus tests')).toBeVisible()
+    expect(within(details).getByText('50')).toBeVisible()
+    expect(within(details).queryByText('Maximum runtime')).not.toBeInTheDocument()
+    expect(within(details).getByText(/Existing permissions still apply/)).toBeVisible()
+    expect(screen.queryByRole('button', { name: /^(Pause|Resume)$/ })).not.toBeInTheDocument()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+    expect(api.stopChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('shows a runtime limit only when this saved suggestion has a positive one', async () => {
+    renderPopover({ ...suggestedGoal, maxRuntimeSecs: 3661 })
+    const details = await screen.findByRole('dialog', { name: 'Verify keyboard navigation' })
+    expect(within(details).getByText('Maximum runtime')).toBeVisible()
+    expect(within(details).getByText('1 hour 1 minute 1 second')).toBeVisible()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+  })
+
+  it.each([0, 7])('starts only on an explicit click with captured generation %s and keeps the mounted trigger', async generation => {
+    const proposal = { ...suggestedGoal, goalGeneration: generation }
+    const started: LegacyGoalLoop = {
+      ...proposal, active: true, goalGeneration: generation + 1,
+      goal: { ...proposal.goal!, status: 'working' },
+    }
+    vi.mocked(api.autonudgeResume).mockResolvedValue({ loop: {
+      id: proposal.id, slot_key: proposal.slotKey, active: true,
+      config_generation: generation + 1, goal: started.goal,
+    } })
+    const { onChange, rerenderAutomation } = renderPopover(proposal)
+    rerenderAutomation(proposal, 'chat-1', false)
+    const trigger = await screen.findByRole('button', { name: /Keep working until this is verified/ })
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    await waitFor(() => expect(api.autonudgeResume).toHaveBeenCalledExactlyOnceWith(proposal.id, generation))
+    await waitFor(() => expect(onChange).toHaveBeenCalled())
+    rerenderAutomation(started)
+    expect(screen.getByRole('button', { name: 'Working toward your goal: Verify keyboard navigation' })).toBe(trigger)
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Start' })).not.toBeInTheDocument()
+  })
+
+  it('refreshes a suggestion missing its revision and requires a separate Start click', async () => {
+    const unknown = { ...suggestedGoal, goalGeneration: undefined }
+    vi.mocked(api.autonudgeForSlot).mockResolvedValue({ loop: {
+      id: suggestedGoal.id, slot_key: suggestedGoal.slotKey, active: false,
+      config_generation: 8, goal: suggestedGoal.goal,
+    } } as never)
+    const { rerenderAutomation, onChange } = renderPopover(unknown)
+    const details = await screen.findByRole('dialog', { name: 'Verify keyboard navigation' })
+    fireEvent.click(within(details).getByRole('button', { name: 'Refresh status' }))
+    await waitFor(() => expect(onChange).toHaveBeenCalled())
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+    rerenderAutomation({ ...suggestedGoal, goalGeneration: 8 })
+    expect(within(details).getByRole('button', { name: 'Start' })).toBeVisible()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+  })
+
+  it('keeps a refused Start inactive and does not retry a newer generation automatically', async () => {
+    vi.mocked(api.autonudgeResume).mockRejectedValue(new ApiError(409, '{"error":"Goal changed"}'))
+    const { onChange } = renderPopover(suggestedGoal)
+    const details = await screen.findByRole('dialog', { name: 'Verify keyboard navigation' })
+    fireEvent.click(within(details).getByRole('button', { name: 'Start' }))
+    expect(await screen.findByText('Could not start this goal. Review its current details before trying again.')).toBeVisible()
+    expect(api.autonudgeResume).toHaveBeenCalledExactlyOnceWith(suggestedGoal.id, 0)
+    expect(onChange).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: /^(Pause|Resume)$/ })).not.toBeInTheDocument()
+  })
+
+  it('saves and reverses new-goal recognition without hiding, arming or removing the saved suggestion', async () => {
+    let enabled = true
+    vi.mocked(api.kirocrewConfig).mockImplementation(async () => ({ monitoring: { goal_suggestions: enabled } }))
+    vi.mocked(api.patchConfig).mockImplementation(async (_key, value) => { enabled = value as boolean; return { ok: true } })
+    const { onChange } = renderPopover(suggestedGoal)
+    const toggle = await screen.findByRole('switch', { name: 'Suggest new goals' })
+    await waitFor(() => expect(toggle).not.toHaveAttribute('aria-disabled', 'true'))
+    expect(toggle.closest('[data-setting-key]')).toHaveAttribute('data-setting-key', 'monitoring.goal_suggestions')
+    fireEvent.click(toggle)
+    await waitFor(() => expect(api.patchConfig).toHaveBeenCalledWith('monitoring.goal_suggestions', false))
+    await waitFor(() => expect(toggle).not.toBeChecked())
+    const details = screen.getByRole('dialog', { name: 'Verify keyboard navigation' })
+    expect(within(details).getByText('Verify keyboard navigation')).toBeVisible()
+    expect(within(details).getByRole('button', { name: 'Start' })).toBeVisible()
+    expect(screen.getByText('Use /goal clear in chat to discard this suggestion. Manual /goal remains available.')).toBeVisible()
+    fireEvent.click(screen.getByRole('switch', { name: 'Suggest new goals' }))
+    await screen.findByRole('dialog', { name: 'Verify keyboard navigation' })
+    expect(api.patchConfig).toHaveBeenLastCalledWith('monitoring.goal_suggestions', true)
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it.each([true, false])('keeps started goal controls when recognition is disabled (active %s)', async active => {
+    vi.mocked(api.kirocrewConfig).mockResolvedValue({ monitoring: { goal_suggestions: false } })
+    renderPopover({
+      ...suggestedGoal, active, goal: { ...suggestedGoal.goal!, status: active ? 'working' : 'paused' },
+    })
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Suggest new goals' })).not.toBeChecked())
+    expect(screen.getByRole('button', { name: active ? 'Pause' : 'Resume' })).toBeVisible()
+    expect(within(screen.getByRole('dialog', { name: 'Verify keyboard navigation' })).getByText('Verify keyboard navigation')).toBeVisible()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+  })
+
+  it('keeps manual setup and the recognition toggle reachable with no goal', async () => {
+    vi.mocked(api.kirocrewConfig).mockResolvedValue({ monitoring: { goal_suggestions: false } })
+    renderPopover(null, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Suggest new goals' })).not.toHaveAttribute('aria-disabled', 'true'))
+    expect(screen.getByRole('button', { name: 'Start loop' })).toBeVisible()
+    expect(screen.getByRole('textbox', { name: /goal/i })).toBeVisible()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+  })
+
+  it('keeps the suggestion visible when saving the recognition setting fails', async () => {
+    vi.mocked(api.patchConfig).mockRejectedValue(new Error('config write failed'))
+    renderPopover(suggestedGoal)
+    const details = await screen.findByRole('dialog', { name: 'Verify keyboard navigation' })
+    await waitFor(() => expect(within(details).getByRole('switch', { name: 'Suggest new goals' })).not.toHaveAttribute('aria-disabled', 'true'))
+    fireEvent.click(within(details).getByRole('switch', { name: 'Suggest new goals' }))
+    expect(await screen.findByText('Could not save the goal suggestion setting.')).toBeVisible()
+    expect(within(details).getByRole('switch', { name: 'Suggest new goals' })).toBeChecked()
+    expect(within(details).getByRole('button', { name: 'Start' })).toBeVisible()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+  })
+
+  it('keeps a saved suggestion visible when recognition cannot be read and offers retry', async () => {
+    vi.mocked(api.kirocrewConfig).mockRejectedValue(new Error('config unavailable'))
+    renderPopover(suggestedGoal)
+    expect(within(screen.getByRole('dialog', { name: 'Verify keyboard navigation' })).getByRole('button', { name: 'Start' })).toBeVisible()
+    expect(await screen.findByText('Could not load the goal suggestion setting.')).toBeVisible()
+    expect(screen.getByRole('switch', { name: 'Suggest new goals' })).toHaveAttribute('aria-disabled', 'true')
+    vi.mocked(api.kirocrewConfig).mockResolvedValue({ monitoring: { goal_suggestions: true } })
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }))
+    await screen.findByRole('dialog', { name: 'Verify keyboard navigation' })
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+  })
+
+  it('shows an automatically pursued goal with progress, criteria, and a visible status', () => {
+    renderPopover({
+      ...activeLegacyLoop,
+      goal: {
+        objective: 'Add keyboard navigation',
+        criteria: ['Arrow keys move focus'],
+        progress: 'Verifying focus behavior',
+        status: 'working',
+        evidence: [],
+      },
+    })
+    expect(screen.getByRole('button', { name: 'Working toward your goal: Add keyboard navigation' })).toBeInTheDocument()
+    expect(screen.getByText('Arrow keys move focus')).toBeInTheDocument()
+    expect(screen.getByText('Verifying focus behavior')).toBeInTheDocument()
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeInTheDocument()
+  })
+
+  it.each(['chat-1', 'slack:123.456'])('pauses the visible session when its goal is bound to %s', async binding => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop,
+      slotKey: binding,
+      goal: {
+        objective: 'Build the feature', criteria: ['Tests pass'],
+        progress: '', status: 'working', evidence: [],
+      },
+    }
+    vi.mocked(api.stopChatSlot).mockResolvedValue({ ok: true })
+    vi.mocked(api.autonudgeForSlot).mockResolvedValue({
+      enabled: true,
+      loop: {
+        id: loop.id, slot_key: loop.slotKey, active: false,
+        goal: { ...loop.goal, status: 'paused' },
+      },
+    })
+    const { onChange } = renderPopover(loop)
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    await waitFor(() => expect(api.stopChatSlot).toHaveBeenCalledWith('chat-1'))
+    await waitFor(() => expect(api.autonudgeForSlot).toHaveBeenCalledWith(binding))
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+      active: false, goal: expect.objectContaining({ status: 'paused' }),
+    })))
+  })
+
+  it('keeps completion evidence visible and removes the resume action', () => {
+    renderPopover({
+      ...activeLegacyLoop, active: false, stoppedReason: 'goal_complete',
+      goal: {
+        objective: 'Build the feature', criteria: ['Tests pass'], progress: 'Delivered',
+        status: 'complete', evidence: ['Keyboard tests pass'],
+      },
+    })
+    expect(screen.getByText('Keyboard tests pass')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Goal achieved: Build the feature' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Resume' })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['complete', 'goal_complete', undefined],
+    ['ended', 'goal_ended', undefined],
+    ['complete', 'goal_complete', 3],
+    ['ended', 'goal_ended', 3],
+    ['paused', 'manual', 3],
+    ['paused', 'goal_pause_unsaved', 3],
+  ] as const)('preserves %s (%s, generation %s) before a Resume response arrives', async (status, reason, generation) => {
+    const paused: LegacyGoalLoop = {
+      ...activeLegacyLoop, active: false, stoppedReason: 'manual', goalGeneration: 1,
+      goal: {
+        objective: 'Build the feature', criteria: ['Tests pass'], progress: '',
+        status: 'paused', evidence: [],
+      },
+    }
+    let resolveResume!: (value: { loop: unknown }) => void
+    const pendingResume = new Promise<{ loop: unknown }>(resolve => { resolveResume = resolve })
+    vi.mocked(api.autonudgeResume).mockReturnValue(pendingResume)
+    const { client, onChange, rerenderAutomation } = renderPopover(paused)
+    const queryKey = ['session-automation', 'chat-1']
+    client.setQueryData(queryKey, paused)
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    await waitFor(() => expect(api.autonudgeResume).toHaveBeenCalledWith(paused.id, 1))
+
+    const newer = normalizeAutomationRecord({
+      id: paused.id, slot_key: paused.slotKey, active: false,
+      stopped_reason: reason, generation,
+      goal: { ...paused.goal!, status, evidence: ['Keyboard tests pass'] },
+    }) as LegacyGoalLoop
+    // The WebSocket handler publishes this before the older HTTP response lands.
+    client.setQueryData(queryKey, newer)
+    rerenderAutomation(newer)
+    expect(screen.getByText('Keyboard tests pass')).toBeInTheDocument()
+    await act(async () => {
+      resolveResume({
+        loop: {
+          id: paused.id, slot_key: paused.slotKey, active: true,
+          config_generation: 2,
+          goal: { ...paused.goal, status: 'working' },
+        },
+      })
+      await pendingResume
+    })
+    // onSettled runs after onSuccess; wait for it before checking for stale publication.
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey }))
+    expect(onChange).not.toHaveBeenCalled()
+    expect(client.getQueryData(queryKey)).toEqual(newer)
+    if (reason === 'manual') {
+      expect(screen.getByRole('button', { name: 'Resume' })).toBeEnabled()
+    } else if (reason === 'goal_pause_unsaved') {
+      expect(screen.getByRole('button', { name: 'Retry saving pause' })).toBeEnabled()
+    } else {
+      expect(screen.queryByRole('button', { name: 'Resume' })).not.toBeInTheDocument()
+    }
+  })
+
+  it.each([false, true])('accepts a current Resume response (already observed: %s)', async observed => {
+    const wire = {
+      id: activeLegacyLoop.id, slot_key: activeLegacyLoop.slotKey,
+      active: false, config_generation: 1, stopped_reason: 'manual',
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: 'paused', evidence: [] },
+    }
+    const paused = normalizeAutomationRecord(wire) as LegacyGoalLoop
+    const resumed = { ...wire, active: true, config_generation: 3, stopped_reason: '', goal: { ...wire.goal, status: 'working' } }
+    let resolveResume!: (value: { loop: unknown }) => void
+    const pendingResume = new Promise<{ loop: unknown }>(resolve => { resolveResume = resolve })
+    vi.mocked(api.autonudgeResume).mockReturnValue(pendingResume)
+    const { client, onChange, rerenderAutomation } = renderPopover(paused)
+    const queryKey = ['session-automation', 'chat-1']
+    client.setQueryData(queryKey, paused)
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    await waitFor(() => expect(api.autonudgeResume).toHaveBeenCalledWith(paused.id, 1))
+    if (observed) {
+      const current = normalizeAutomationRecord(resumed)
+      client.setQueryData(queryKey, current)
+      rerenderAutomation(current)
+    }
+    await act(async () => {
+      resolveResume({ loop: resumed })
+      await pendingResume
+    })
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith(normalizeAutomationRecord(resumed)))
+  })
+
+  it.each(['replaced', 'removed'] as const)('preserves a %s goal after the Resume control unmounts', async change => {
+    const paused: LegacyGoalLoop = {
+      ...activeLegacyLoop, active: false, stoppedReason: 'manual', goalGeneration: 1,
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: 'paused', evidence: [] },
+    }
+    let resolveResume!: (value: { loop: unknown }) => void
+    const pendingResume = new Promise<{ loop: unknown }>(resolve => { resolveResume = resolve })
+    vi.mocked(api.autonudgeResume).mockReturnValue(pendingResume)
+    const { client, onChange, unmount } = renderPopover(paused)
+    const queryKey = ['session-automation', 'chat-1']
+    client.setQueryData(queryKey, paused)
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    await waitFor(() => expect(api.autonudgeResume).toHaveBeenCalledWith(paused.id, 1))
+    unmount()
+    const current = change === 'replaced' ? { ...paused, id: 'replacement-goal' } : null
+    client.setQueryData(queryKey, current)
+    await act(async () => {
+      resolveResume({
+        loop: {
+          id: paused.id, slot_key: paused.slotKey, active: true,
+          config_generation: 2, goal: { ...paused.goal, status: 'working' },
+        },
+      })
+      await pendingResume
+    })
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey }))
+    expect(onChange).not.toHaveBeenCalled()
+    expect(client.getQueryData(queryKey)).toEqual(current)
+  })
+
+  it('directs required information to chat without submitting a resume request', () => {
+    renderPopover({
+      ...activeLegacyLoop, active: false, stoppedReason: 'goal_needs_input',
+      goal: {
+        objective: 'Build the feature', criteria: [], progress: 'Which repository should change?',
+        status: 'needs_input', evidence: [],
+      },
+    })
+    expect(screen.getByText('Reply in chat with the requested information.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^(Pause|Resume|Retry)$/ })).not.toBeInTheDocument()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['cycle_cap', 1250, 14400, 'Automatic turn limit reached', 'automatic turn limit (1,250 / 1,250)'],
+    ['cycle_cap', 0, 14400, 'Automatic turn limit reached', 'automatic turn limit.'],
+    ['runtime_budget', 50, 14400, 'Time limit reached', 'elapsed-time limit (4 hours)'],
+    ['runtime_budget', 50, 3661, 'Time limit reached', 'elapsed-time limit (1 hour 1 minute 1 second)'],
+    ['runtime_budget', 50, undefined, 'Time limit reached', 'elapsed-time limit.'],
+  ] as const)('explains exhausted %s bounds (%s/%s) without offering Resume', (reason, maxCycles, maxRuntimeSecs, label, explanation) => {
+    renderPopover({
+      ...activeLegacyLoop, active: false, stoppedReason: reason,
+      maxCycles, cycleCount: maxCycles, maxRuntimeSecs,
+      goal: { objective: 'Build the feature', criteria: [], progress: 'Tests remain', status: 'paused', evidence: [] },
+    })
+    const trigger = screen.getByRole('button', { name: `${label}: Build the feature` })
+    expect(within(trigger).getByRole('status')).toHaveTextContent(label)
+    expect(within(screen.getByRole('dialog', { name: 'Build the feature' })).getByText(label)).toBeVisible()
+    expect(screen.getByText(content => content.includes(explanation))).toHaveTextContent(
+      'Review progress, then ask in chat to end this goal and start a new one for the remaining work.',
+    )
+    expect(screen.queryByRole('button', { name: /^(Pause|Resume|Retry)$/ })).not.toBeInTheDocument()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+  })
+
+  it('resumes work after an approval stall with the captured revision', async () => {
+    vi.mocked(api.autonudgeResume).mockResolvedValue({ loop: null })
+    renderPopover({
+      ...activeLegacyLoop, active: false, stoppedReason: 'approval_stalled', goalGeneration: 0,
+      goal: {
+        objective: 'Build the feature', criteria: ['Tests pass'], progress: '',
+        status: 'paused', evidence: [],
+      },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    await waitFor(() => expect(api.autonudgeResume).toHaveBeenCalledWith(activeLegacyLoop.id, 0))
+    expect(api.stopChatSlot).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Approval timed out: Build the feature' })).toBeInTheDocument()
+  })
+
+  it.each([
+    [true, '', 'Pause', 'The pause request failed. Please try again.'],
+    [false, 'manual', 'Resume', 'The resume request failed. Please try again.'],
+    [false, 'approval_stalled', 'Resume', 'The resume request failed. Please try again.'],
+    [false, 'goal_pause_unsaved', 'Retry saving pause', 'The request to save the pause failed. Please try again.'],
+  ] as const)('attributes a failed %s/%s request to the captured action after live state changes', async (active, stoppedReason, action, message) => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, active, stoppedReason, goalGeneration: 1,
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: active ? 'working' : 'paused', evidence: [] },
+    }
+    let rejectWrite!: (error: Error) => void
+    const pending = new Promise<never>((_resolve, reject) => { rejectWrite = reject })
+    const pauseRequest = active || stoppedReason === 'goal_pause_unsaved'
+    if (pauseRequest) vi.mocked(api.stopChatSlot).mockReturnValue(pending)
+    else vi.mocked(api.autonudgeResume).mockReturnValue(pending)
+    const { rerenderAutomation, onChange } = renderPopover(loop)
+    fireEvent.click(screen.getByRole('button', { name: action }))
+    await waitFor(() => expect(pauseRequest ? api.stopChatSlot : api.autonudgeResume).toHaveBeenCalled())
+    const newer: LegacyGoalLoop = {
+      ...loop, active: !active, stoppedReason: active ? 'manual' : '',
+      goal: { ...loop.goal!, status: active ? 'paused' : 'working' },
+    }
+    rerenderAutomation(newer)
+    await act(async () => { rejectWrite(new Error('offline')); await pending.catch(() => {}) })
+    expect(await screen.findByText(message)).toBeInTheDocument()
+    expect(api.autonudgeForSlot).not.toHaveBeenCalled()
+    expect(onChange).not.toHaveBeenCalled()
+    rerenderAutomation({ ...newer, id: 'another-goal' })
+    expect(screen.queryByText(message)).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['active explicit refusal', true, '', { ok: false, code: 'remote_stop_unreachable' }, 'Pause', 'The pause request failed. Please try again.'],
+    ['active missing acknowledgement', true, '', {}, 'Pause', 'The pause request failed. Please try again.'],
+    ['unsaved-pause retry refusal', false, 'goal_pause_unsaved', { ok: false, code: 'remote_stop_unreachable' }, 'Retry saving pause', 'The request to save the pause failed. Please try again.'],
+  ] as const)('reports an unaccepted %s Stop reply without claiming a pause', async (_case, active, stoppedReason, reply, action, message) => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, active, stoppedReason, goalGeneration: 1,
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: active ? 'working' : 'paused', evidence: [] },
+    }
+    vi.mocked(api.stopChatSlot).mockResolvedValue(reply)
+    vi.mocked(api.autonudgeForSlot).mockResolvedValue({
+      enabled: true,
+      loop: { id: loop.id, slot_key: loop.slotKey, active, goal: loop.goal },
+    })
+    const { onChange } = renderPopover(loop)
+    fireEvent.click(screen.getByRole('button', { name: action }))
+    const notice = await screen.findByRole('alert')
+    await waitFor(() => expect(notice).toHaveTextContent(message))
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(within(notice).getByRole('button', { name: 'Ask the agent' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: action })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Refresh status' })).not.toBeInTheDocument()
+    expect(api.stopChatSlot).toHaveBeenCalledTimes(1)
+    expect(api.stopChatSlot).toHaveBeenCalledWith('chat-1')
+    expect(api.autonudgeForSlot).not.toHaveBeenCalled()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it('refreshes an accepted Stop carrying an unsaved-pause warning', async () => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, goalGeneration: 1,
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: 'working', evidence: [] },
+    }
+    vi.mocked(api.stopChatSlot).mockResolvedValue({ ok: true, goal_pause_saved: false })
+    vi.mocked(api.autonudgeForSlot).mockResolvedValue({
+      enabled: true,
+      loop: {
+        id: loop.id, slot_key: loop.slotKey, active: false, config_generation: 2,
+        stopped_reason: 'goal_pause_unsaved', goal: { ...loop.goal, status: 'paused' },
+      },
+    })
+    const { onChange, rerenderAutomation } = renderPopover(loop)
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+      active: false, stoppedReason: 'goal_pause_unsaved', goalGeneration: 2,
+    })))
+    rerenderAutomation(onChange.mock.calls[0][0])
+    expect(screen.getByRole('button', { name: 'Retry saving pause' })).toBeEnabled()
+    expect(screen.getByRole('alert')).toHaveTextContent('Work is paused now')
+    expect(screen.queryByText('The pause request failed. Please try again.')).not.toBeInTheDocument()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+  })
+
+  it.each(['', 'goal_pause_unsaved'])('distinguishes a failed refresh after an accepted pause (%s)', async stoppedReason => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, active: !stoppedReason, stoppedReason,
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: stoppedReason ? 'paused' : 'working', evidence: [] },
+    }
+    vi.mocked(api.stopChatSlot).mockResolvedValue({ ok: true })
+    vi.mocked(api.autonudgeForSlot).mockRejectedValue(new Error('refresh unavailable'))
+    const { onChange } = renderPopover(loop)
+    fireEvent.click(screen.getByRole('button', { name: stoppedReason ? 'Retry saving pause' : 'Pause' }))
+    expect(await screen.findByText("The pause request was received, but the goal's status could not be refreshed.")).toBeInTheDocument()
+    expect(api.stopChatSlot).toHaveBeenCalledWith('chat-1')
+    expect(api.autonudgeForSlot).toHaveBeenCalledWith(loop.slotKey)
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+    expect(onChange).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Pause requested — status unconfirmed: Build the feature' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh status' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: /^(Pause|Resume|Retry saving pause)$/ })).not.toBeInTheDocument()
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+  })
+
+  it('acknowledges a failed save retry while retaining current pause facts and the captured failure', async () => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, active: false, stoppedReason: 'goal_pause_unsaved', goalGeneration: 2,
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: 'paused', evidence: [] },
+    }
+    let rejectWrite!: (error: Error) => void
+    const pending = new Promise<never>((_resolve, reject) => { rejectWrite = reject })
+    vi.mocked(api.stopChatSlot).mockReturnValue(pending)
+    const { rerenderAutomation } = renderPopover(loop)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry saving pause' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Retry saving pause' })).toBeDisabled())
+    await act(async () => { rejectWrite(new Error('offline')); await pending.catch(() => {}) })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Retry saving pause' })).toBeEnabled())
+    const notice = screen.getByRole('alert')
+    expect(api.stopChatSlot).toHaveBeenCalledWith(loop.slotKey)
+    expect(api.stopChatSlot).toHaveBeenCalledTimes(1)
+    expect(notice).toHaveTextContent('The request to save the pause failed.')
+    expect(notice).toHaveTextContent('Work is paused now')
+    expect(notice).toHaveTextContent('saving the pause failed')
+    expect(notice).toHaveTextContent('pause may be lost and work may resume automatically')
+    expect(within(notice).getAllByRole('button', { name: 'Ask the agent' })).toHaveLength(1)
+    rerenderAutomation({
+      ...loop, active: true, stoppedReason: '', goalGeneration: 4,
+      goal: { ...loop.goal!, status: 'working' },
+    })
+    expect(screen.getByRole('alert')).toHaveTextContent('The request to save the pause failed.')
+    expect(screen.getByRole('alert')).not.toHaveTextContent('Work is paused now')
+  })
+
+  it.each(['manual', 'approval_stalled'])('reads a missing revision before a separate %s resume click', async reason => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, active: false, stoppedReason: reason,
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: 'paused', evidence: [] },
+    }
+    vi.mocked(api.autonudgeForSlot).mockResolvedValue({
+      enabled: true,
+      loop: { id: loop.id, slot_key: loop.slotKey, active: false, stopped_reason: reason, config_generation: 0, goal: loop.goal },
+    })
+    vi.mocked(api.autonudgeResume).mockRejectedValue(new ApiError(409, 'Conflict', '{"code":"goal_generation_conflict"}'))
+    const { onChange, rerenderAutomation } = renderPopover(loop)
+    expect(screen.queryByRole('button', { name: /^(Resume|Retry)$/ })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }))
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ goalGeneration: 0 })))
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+    rerenderAutomation(onChange.mock.calls[0][0])
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    // The wire fence must preserve zero and must never retry a 409 with a fresh revision.
+    await waitFor(() => expect(api.autonudgeResume).toHaveBeenCalledWith(loop.id, 0))
+    expect(await screen.findByText('The resume request failed. Please try again.')).toBeInTheDocument()
+    expect(api.autonudgeResume).toHaveBeenCalledTimes(1)
+    expect(api.autonudgeForSlot).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['manual', 'approval_stalled'])('recovers a failed missing-revision %s refresh with GET before a separate Resume', async reason => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, active: false, stoppedReason: reason,
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: 'paused', evidence: [] },
+    }
+    vi.mocked(api.autonudgeForSlot).mockRejectedValueOnce(new Error('offline'))
+    vi.mocked(api.autonudgeResume).mockResolvedValue({ loop: null })
+    const { onChange, rerenderAutomation } = renderPopover(loop)
+    expect(screen.getByText('Refresh to confirm this goal’s current status before resuming.')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }))
+    expect(await screen.findByText('The goal status could not be refreshed.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh status' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: /^(Resume|Retry)$/ })).not.toBeInTheDocument()
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.getAllByRole('button', { name: 'Ask the agent' })).toHaveLength(1)
+    expect(api.autonudgeForSlot).toHaveBeenCalledWith(loop.slotKey)
+    expect(api.autonudgeForSlot).toHaveBeenCalledTimes(1)
+    expect(api.stopChatSlot).not.toHaveBeenCalled()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+    expect(onChange).not.toHaveBeenCalled()
+
+    vi.mocked(api.autonudgeForSlot).mockResolvedValue({
+      enabled: true,
+      loop: { id: loop.id, slot_key: loop.slotKey, active: false, stopped_reason: reason, config_generation: 0, goal: loop.goal },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }))
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ goalGeneration: 0 })))
+    expect(api.autonudgeForSlot).toHaveBeenCalledTimes(2)
+    expect(api.stopChatSlot).not.toHaveBeenCalled()
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+    rerenderAutomation(onChange.mock.calls[0][0])
+    expect(screen.queryByText('Refresh to confirm this goal’s current status before resuming.')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    await waitFor(() => expect(api.autonudgeResume).toHaveBeenCalledWith(loop.id, 0))
+    expect(api.autonudgeResume).toHaveBeenCalledTimes(1)
+  })
+
+  it('clarifies blocked recovery and resumes with the revision observed at the click', async () => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, active: false, stoppedReason: 'goal_blocked', goalGeneration: 7,
+      goal: { objective: 'Build the feature', criteria: [], progress: 'A dependency is missing', status: 'blocked', evidence: [] },
+    }
+    vi.mocked(api.autonudgeResume).mockResolvedValue({ loop: null })
+    renderPopover(loop)
+    expect(screen.getByText('Resolve the blocker or change the plan in chat, then select Resume to try this goal again.')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    await waitFor(() => expect(api.autonudgeResume).toHaveBeenCalledWith(loop.id, 7))
+  })
+
+  it('refreshes an unconfirmed pause with GET only and reconciles the active projection', async () => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, goalGeneration: 1,
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: 'working', evidence: [] },
+    }
+    vi.mocked(api.stopChatSlot).mockResolvedValue({ ok: true })
+    vi.mocked(api.autonudgeForSlot).mockRejectedValueOnce(new Error('offline'))
+    const { client, onChange, rerenderAutomation } = renderPopover(loop)
+    client.setQueryData(['session-automation', 'chat-1'], loop)
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    await screen.findByText("The pause request was received, but the goal's status could not be refreshed.")
+    // Closing the popup must not lose the uncertainty displayed in the composer.
+    rerenderAutomation(loop, 'chat-1', false)
+    expect(screen.getByRole('button', { name: 'Pause requested — status unconfirmed: Build the feature' })).toBeInTheDocument()
+    rerenderAutomation(loop)
+    vi.mocked(api.autonudgeForSlot).mockRejectedValueOnce(new Error('still offline'))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }))
+    await waitFor(() => expect(api.autonudgeForSlot).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText("The pause request was received, but the goal's status could not be refreshed.")).toBeInTheDocument()
+    let resolveRead!: (value: { enabled: boolean; loop: unknown }) => void
+    vi.mocked(api.autonudgeForSlot).mockReturnValue(new Promise(resolve => { resolveRead = resolve }))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }))
+    await waitFor(() => expect(api.autonudgeForSlot).toHaveBeenCalledTimes(3))
+    expect(screen.getByRole('button', { name: 'Pause requested — status unconfirmed: Build the feature' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh status' })).toBeDisabled()
+    await act(async () => resolveRead({
+      enabled: true,
+      loop: { id: loop.id, slot_key: loop.slotKey, active: false, config_generation: 2, stopped_reason: 'manual', goal: { ...loop.goal, status: 'paused' } },
+    }))
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+      active: false, goalGeneration: 2, goal: expect.objectContaining({ status: 'paused' }),
+    })))
+    rerenderAutomation(onChange.mock.calls[0][0])
+    expect(screen.getByRole('button', { name: 'Goal paused: Build the feature' })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(api.stopChatSlot).toHaveBeenCalledTimes(1)
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+  })
+
+  it.each(['working', 'paused'] as const)('keeps pause uncertainty when reconnect left an older %s cache snapshot', async cachedStatus => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, goalGeneration: 2,
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: 'working', evidence: [] },
+    }
+    vi.mocked(api.stopChatSlot).mockResolvedValue({ ok: true })
+    vi.mocked(api.autonudgeForSlot).mockRejectedValue(new Error('offline'))
+    const { client, onChange } = renderPopover(loop)
+    // Reconnect seeds active Redux records without advancing the per-slot cache.
+    client.setQueryData(['session-automation', 'chat-1'], {
+      ...loop, goalGeneration: 1, active: cachedStatus === 'working',
+      stoppedReason: cachedStatus === 'paused' ? 'manual' : '',
+      goal: { ...loop.goal!, status: cachedStatus },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    await screen.findByText("The pause request was received, but the goal's status could not be refreshed.")
+    expect(screen.getByRole('button', { name: 'Pause requested — status unconfirmed: Build the feature' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }))
+    await waitFor(() => expect(api.autonudgeForSlot).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh status' })).toBeEnabled())
+    expect(screen.getByRole('alert')).toHaveTextContent("The pause request was received")
+    expect(api.stopChatSlot).toHaveBeenCalledTimes(1)
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
+    expect(onChange).not.toHaveBeenCalled()
+
+    await act(async () => {
+      client.setQueryData(['session-automation', 'chat-1'], {
+        ...loop, goalGeneration: 3, active: false, stoppedReason: 'goal_complete',
+        goal: { ...loop.goal!, status: 'complete', evidence: ['Tests passed'] },
+      })
+    })
+    await screen.findByRole('button', { name: 'Goal achieved: Build the feature' })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Refresh status' })).not.toBeInTheDocument()
+  })
+
+  it.each(['paused', 'complete'] as const)('uses a background-confirmed %s revision while the active projection lags', async status => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, goalGeneration: 1,
+      goal: { objective: 'Build the feature', criteria: [], progress: '', status: 'working', evidence: [] },
+    }
+    vi.mocked(api.stopChatSlot).mockResolvedValue({ ok: true })
+    vi.mocked(api.autonudgeForSlot).mockRejectedValue(new Error('offline'))
+    const { client, onChange } = renderPopover(loop)
+    client.setQueryData(['session-automation', 'chat-1'], loop)
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    await screen.findByText("The pause request was received, but the goal's status could not be refreshed.")
+    const confirmed: LegacyGoalLoop = {
+      ...loop, active: false, stoppedReason: status === 'paused' ? 'manual' : 'goal_complete',
+      goalGeneration: 2, goal: { ...loop.goal!, status, evidence: status === 'complete' ? ['Tests passed'] : [] },
+    }
+    // ChatPage's active Redux projection still supplies the original prop.
+    // A background per-slot GET advances only the existing query cache.
+    await act(async () => { client.setQueryData(['session-automation', 'chat-1'], confirmed) })
+    const label = status === 'paused' ? 'Goal paused' : 'Goal achieved'
+    await screen.findByRole('button', { name: `${label}: Build the feature` })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^(Pause|Refresh status)$/ })).not.toBeInTheDocument()
+    expect(onChange).not.toHaveBeenCalled()
+    if (status === 'paused') {
+      vi.mocked(api.autonudgeResume).mockResolvedValue({ loop: null })
+      fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+      await waitFor(() => expect(api.autonudgeResume).toHaveBeenCalledWith(loop.id, 2))
+    } else {
+      expect(screen.getByText('Tests passed')).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Resume' })).not.toBeInTheDocument()
+    }
+  })
+
+  it.each(['resume', 'pause', 'complete', 'ended', 'replacement', 'removed', 'session', 'binding', 'cache'] as const)(
+    'a late pause refresh failure cannot mask newer %s truth', async change => {
+      const loop: LegacyGoalLoop = {
+        ...activeLegacyLoop, goalGeneration: 1,
+        goal: { objective: 'Build the feature', criteria: [], progress: '', status: 'working', evidence: [] },
+      }
+      vi.mocked(api.stopChatSlot).mockResolvedValue({ ok: true })
+      let rejectRead!: (error: Error) => void
+      const pending = new Promise<never>((_resolve, reject) => { rejectRead = reject })
+      vi.mocked(api.autonudgeForSlot).mockReturnValue(pending)
+      const { client, rerenderAutomation, onChange } = renderPopover(loop)
+      client.setQueryData(['session-automation', 'chat-1'], loop)
+      const invalidate = vi.spyOn(client, 'invalidateQueries')
+      fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+      await waitFor(() => expect(api.autonudgeForSlot).toHaveBeenCalled())
+      const newer: LegacyGoalLoop = {
+        ...loop, goalGeneration: 3,
+        active: change === 'resume' || change === 'cache',
+        stoppedReason: change === 'pause' ? 'manual' : '',
+        goal: { ...loop.goal!, status: change === 'complete' || change === 'ended' ? change : change === 'pause' ? 'paused' : 'working' },
+      }
+      if (change === 'replacement') newer.id = 'new-goal'
+      if (change === 'binding') newer.slotKey = 'slack:new-binding'
+      if (change === 'session') rerenderAutomation(loop, 'chat-2')
+      else if (change === 'cache') {
+        await act(async () => { client.setQueryData(['session-automation', 'chat-1'], newer) })
+      } else {
+        client.setQueryData(['session-automation', 'chat-1'], change === 'removed' ? null : newer)
+        rerenderAutomation(change === 'removed' ? null : newer)
+      }
+      await act(async () => { rejectRead(new Error('offline')); await pending.catch(() => {}) })
+      await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ['session-automation', 'chat-1'] }))
+      expect(screen.queryByText("The pause request was received, but the goal's status could not be refreshed.")).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: /^Pause requested/ })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Refresh status' })).not.toBeInTheDocument()
+      expect(onChange).not.toHaveBeenCalled()
+    },
+  )
+
+  it('discloses an unsaved pause and retries saving without resuming work', async () => {
+    const loop: LegacyGoalLoop = {
+      ...activeLegacyLoop, active: false, stoppedReason: 'goal_pause_unsaved',
+      goal: {
+        objective: 'Build the feature', criteria: ['Tests pass'], progress: '',
+        status: 'paused', evidence: [],
+      },
+    }
+    vi.mocked(api.stopChatSlot).mockResolvedValue({ ok: true })
+    vi.mocked(api.autonudgeForSlot).mockResolvedValue({ enabled: true, loop: null })
+    renderPopover(loop)
+    expect(screen.getByText(/Work is paused now.*pause may be lost and work may resume automatically/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Resume' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry saving pause' }))
+    await waitFor(() => expect(api.stopChatSlot).toHaveBeenCalledWith('chat-1'))
+    expect(api.autonudgeResume).not.toHaveBeenCalled()
   })
 
   it('creates a bounded review monitor with the documented defaults', async () => {

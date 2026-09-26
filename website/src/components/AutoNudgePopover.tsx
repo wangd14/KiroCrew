@@ -35,6 +35,8 @@ interface Props {
   trigger?: ReactNode
   /** Structured body supplied by that shell; omitted to render the legacy editor. */
   content?: ReactNode
+  /** Recognition setting shared with the typed-goal details. */
+  footer?: ReactNode
 }
 
 /**
@@ -58,7 +60,7 @@ interface SlotWatch {
   next_run_ts: number | null
 }
 
-export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, onChange, onSetUpBoundedMonitor, writeDisabled = false, interrupted = false, trigger, content }: Props) {
+export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, onChange, onSetUpBoundedMonitor, writeDisabled = false, interrupted = false, trigger, content, footer }: Props) {
   // `||` (not `??`) is deliberate on the loop tier: it preserves the fallback
   // so a loop with idle_secs/max_cycles of 0 or an empty message still shows
   // the 60 / 0 / default template rather than a bare 0 / "".
@@ -763,6 +765,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
             </button>
           )}
         </div>
+        {footer}
       </PopoverContent>}
     </Popover>
   )
