@@ -2938,7 +2938,7 @@ The extraction is gated by a **golden-transcript** harness (`test/test_slack_gol
 
 ## Slack settings API
 
-Three dashboard-only endpoints back the `/settings/channels/slack` panel (legacy `?tab=channels&channel=slack` and `?tab=slack` links redirect there). They are
+Four dashboard-only endpoints back the `/settings/channels/slack` panel (legacy `?tab=channels&channel=slack` and `?tab=slack` links redirect there). They are
 registered in the dashboard route block (NOT `_register_mcp_routes`, which is
 also mounted on the token-less API-only server) so they always sit behind
 dashboard token auth.
@@ -2955,12 +2955,32 @@ dashboard token auth.
   rejection returns 400 and writes nothing, network failure saves with
   `verify_warning`. `<field>_clear` must be a strict boolean. Secrets land in
   `config_dir/.env` via atomic 0600 `mkstemp` + `os.replace`, and
-  `os.environ` is synced afterward. Response `restart_required` is true for
-  actual env changes and for `command`, the one Slack config field a running
-  gateway cannot apply (the slash command is registered with the app manifest);
-  every other field applies live, including `allowed_enterprise_ids`, which is
-  re-read through the validated `enterprise.reload_allowed_team_ids`.
-  An empty `command` resets the slash command to the default.
+  `os.environ` is synced afterward. Response `reconnect_required` is true for
+  actual env changes (token/owner writes), which the panel applies through the
+  reconnect route below; `restart_required` is true only for `command`, the one
+  Slack config field a running gateway cannot apply (the slash command is
+  registered with the app manifest); every other field applies live, including
+  `allowed_enterprise_ids`, which is re-read through the validated
+  `enterprise.reload_allowed_team_ids`. An empty `command` resets the slash
+  command to the default.
+- `POST /api/slack/reconnect` — same direct-local gate as the PUT (remote gets
+  403). Re-runs the Socket Mode handshake in place through
+  `GatewayOrchestrator.reconnect_slack`: re-reads the credential store first
+  (a store that cannot be read answers 500 and leaves the live socket
+  untouched), closes the old socket client, reassigns the boot-hoisted
+  `_app_token` / `_bot_token` / `_owner_id` and RECOMPUTES `_slack_enabled`
+  from the tokens now on disk (`init_socket_mode` early-returns on a stale
+  False and its own failure paths set it False, so without this a retry after
+  any earlier failure is a silent no-op), rebuilds the Web API client, then
+  awaits `init_socket_mode` + `_connect_slack` on the gateway loop. The
+  dashboard's Slack client mirror is cleared with the old socket and published
+  again only behind a connected one (a rejected workspace leaves it empty), and
+  the dashboard's `owner_id` follows the saved owner. Concurrent calls share
+  one in-flight attempt. Answers the GET's `connected` / `connect_error` pair;
+  the reconnect names its own declines
+  as `tokens_missing`, `owner_id_missing`, `enterprise_validation_failed` and
+  `denied_by_policy`, beside Slack's own codes (`invalid_auth`) and network
+  error class names. 503 on a server that owns no Slack socket (API-only).
 - `GET /api/slack/manifest` — public manifest template rendered with
   `?alias=` (default `kirocrew`, never `$USER`) plus Slack's one-click
   create deep link.

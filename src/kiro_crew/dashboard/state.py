@@ -5810,6 +5810,10 @@ class DashboardState:
         # Read by the restart handler: stops the broker this gateway owns before
         # the exec, so a successor never meets a daemon still owned by this pid.
         self._mcp_gateway_stop: Any = None  # async () -> None
+        # Slack socket owner's reconnect, wired by GatewayOrchestrator after
+        # dashboard init and read by POST /api/slack/reconnect. None on the
+        # API-only server and in tests, where the handler answers 503.
+        self._slack_reconnect: Any = None  # async () -> dict
         # Secretary subsystem removed; kept as permanent None for apps/routes.py
         # builtin-service restart lookup (getattr-based, no-op when None).
         self._secretary_restart: Any = None  # restart callback (always None — service removed)
