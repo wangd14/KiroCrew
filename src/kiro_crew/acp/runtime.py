@@ -176,6 +176,7 @@ from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.runtime_ownership import authorize_runtime_kill, outstanding_leases
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
+    AgentWorkspacePinRefused,
     BoundWorkspaceMismatch,
     _forward_ssh_auth_sock,
     agents_slice_throttling,
@@ -184,10 +185,13 @@ from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
     name_scope_unit,
+    refuse_unless_bound_workspace_is_pinned_async,
+    release_agent_workspace_fd,
     release_bound_agent_workspace,
     resolve_bound_session_workspace,
     scope_unit_name,
     scrub_agent_subprocess_env,
+    verify_agent_workspace_for_spawn_async,
     wrap_argv,
     wrap_argv_async,
     wrapped_by_crew_sandbox,
@@ -893,6 +897,7 @@ class AcpRuntime:
         agent: str = CLIENT_NAME,
         sandbox_mode: str = "auto",
         extra_env: dict[str, str] | None = None,
+        work_dir_identity: tuple[int, int] | None = None,
         mcp_gateway_overlay: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
         max_age_secs: float = _DEFAULT_MAX_AGE_SECS,
@@ -914,6 +919,11 @@ class AcpRuntime:
             from kiro_crew.config.paths import config_dir
 
             self._work_dir = config_dir() / "workspace"
+        # The (st_dev, st_ino) the SESSION recorded when it was bound to work_dir,
+        # or None; what the spawn verifies against (sandbox.verify_agent_workspace_for_spawn).
+        self._work_dir_identity: tuple[int, int] | None = (
+            (int(work_dir_identity[0]), int(work_dir_identity[1])) if work_dir_identity else None
+        )
         self._agent = agent
         # Canonical Kiro Crew agent identity (a cfg.agents key) resolved by the
         # surface that created this runtime — a DIFFERENT namespace from
@@ -2082,11 +2092,50 @@ class AcpRuntime:
         await self._to_thread_guarding_sandbox(inject_xdist_auto_cap, env)
 
         await self._discard_bound_workspace()
-        if self._harness.internal_sandbox:
-            self._spawn_work_dir, self._bound_workspace_fd = (
-                await bind_voice_safe_agent_workspace_async(self._work_dir)
-            )
+        # The working directory is re-verified HERE against the identity the
+        # SESSION recorded when it was bound (sandbox.verify_agent_workspace_for_spawn
+        # re-reads the leaf without following a link and compares (st_dev,
+        # st_ino)): a swap at that name since the binding is refused instead of
+        # entered, before the bind and the spawn, so nothing is minted; a binding
+        # that carries no identity is not examined and spawns as it always did.
+        # The refusal is governed -- this site's own error, naming the remedy.
+        # What the check verified stays HELD until the child exists: the POSIX
+        # descriptor, or on Windows the pinned handle chain (each component held
+        # without FILE_SHARE_DELETE, so the name the spawn enters cannot be
+        # renamed or re-pointed at a junction in between); released after the
+        # PID bookkeeping below, and on every failure path.
         try:
+            spawn_cwd, verified_workspace_fd = await verify_agent_workspace_for_spawn_async(
+                self._work_dir, self._work_dir_identity
+            )
+        except AgentWorkspacePinRefused as exc:
+            self._discard_sandbox_cleanup()
+            raise AcpRuntimeError(str(exc)) from exc
+        except BaseException:
+            self._discard_sandbox_cleanup()
+            raise
+        # The verified directory's own spelling is the cwd the spawn enters --
+        # assigned FIRST; the bind below replaces it only when it binds
+        # (returns a descriptor) or names a different path. Off macOS the bind
+        # is a no-op that echoes the spelling back, and echoing it over the
+        # verified real path would spawn into the unverified name (review-caught).
+        self._spawn_work_dir = spawn_cwd
+        try:
+            if self._harness.internal_sandbox:
+                bound_path, self._bound_workspace_fd = await bind_voice_safe_agent_workspace_async(
+                    self._work_dir
+                )
+                if self._bound_workspace_fd is not None or bound_path != str(self._work_dir):
+                    self._spawn_work_dir = bound_path
+                if self._bound_workspace_fd is not None:
+                    # The bind opened the name following links; the child enters
+                    # THAT descriptor. It must be the directory the check verified.
+                    try:
+                        await refuse_unless_bound_workspace_is_pinned_async(
+                            self._bound_workspace_fd, verified_workspace_fd
+                        )
+                    except AgentWorkspacePinRefused as exc:
+                        raise AcpRuntimeError(str(exc)) from exc
             self._process = await platform_compat.create_windows_cleanup_owned_process(
                 functools.partial(
                     _retrying_spawn_factory,
@@ -2124,8 +2173,18 @@ class AcpRuntime:
         except BaseException:
             await self._discard_bound_workspace()
             self._discard_sandbox_cleanup()
+            asyncio.get_running_loop().run_in_executor(
+                None, release_agent_workspace_fd, verified_workspace_fd
+            )
             raise
         self._pid = self._process.pid
+        # The verified hold (the descriptor; on Windows the handle chain that
+        # spanned the process creation) is released on a worker thread, scheduled
+        # only now -- AFTER the PID bookkeeping -- so no await and no loop-side
+        # close sits between the live child and the record of it (review-caught).
+        asyncio.get_running_loop().run_in_executor(
+            None, release_agent_workspace_fd, verified_workspace_fd
+        )
         # The same token the child carries in its environment (minted above, so
         # it could be passed in); random, not pid-derived, so it cannot
         # false-match a later spawn that the OS handed a recycled pid.

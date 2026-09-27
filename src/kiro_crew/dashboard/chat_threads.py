@@ -34,7 +34,11 @@ from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.side_readonly_spec import ReadOnlySpecError, publish_readonly_spec
-from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.dashboard.state import (
+    DashboardState,
+    _ChatSlot,
+    spawn_project_identity_repinned,
+)
 from kiro_crew.dashboard.ws import broadcast_thread_reply
 from kiro_crew.history import (
     THREAD_MID_RE,
@@ -52,6 +56,7 @@ from kiro_crew.llm_helpers import (
     stream_and_collect,
 )
 from kiro_crew.members import DM_SLOT_MODE
+from kiro_crew.sandbox import is_workspace_pin_refusal
 from kiro_crew.security import StreamRedactor, redact
 from kiro_crew.sel import sel
 
@@ -889,6 +894,16 @@ async def _run_thread_turn(
         if log is None:
             _final(_FAILED_FALLBACK, is_error=True)
             return
+        # The identity the spawn verifies the slot's project against, as the
+        # main chat (``chat_runner._run_chat``) and the side panel derive it: the
+        # slot's record for its bound directory, re-pinned in this process when
+        # it carries none. A bound directory that cannot be pinned REFUSES the
+        # turn (``WorkspacePinFailed``, surfaced below with its remedy) -- never
+        # an unexamined ``None``, which only an unbound slot carries. Derived
+        # first and the project read right after it, with no await between, so
+        # the identity is the one recorded for the spelling ``project`` names.
+        # (Review-caught: this site passed ``cwd`` with no identity.)
+        cwd_identity = await spawn_project_identity_repinned(slot)
         project: str | None = slot.project or None
         slot_agent: str | None = slot.agent or None
         kiro_agent: str | None = None
@@ -947,7 +962,13 @@ async def _run_thread_turn(
         # envelope. A retained session would stay bound to the agent and cwd of
         # the turn that created it after the slot's project or agent changed.
         provider, _is_new, _resumed = await state.sessions.get_or_create(
-            session_key, agent=agent, cwd=project
+            session_key,
+            agent=agent,
+            cwd=project,
+            # The slot's recorded identity of that directory: the spawn refuses a
+            # directory swapped at the name since the binding. Passed explicitly,
+            # as the main chat does; the manager's seam would derive it anyway.
+            cwd_identity=cwd_identity,
         )
         acquired_key = session_key
         threads = await asyncio.to_thread(log.read_threads, history_key)
@@ -1075,6 +1096,19 @@ async def _run_thread_turn(
 
             _mark_kiro_signed_out(state)
             _final(signed_out_message(backend or ""), is_error=True)
+        elif is_workspace_pin_refusal(exc):
+            # The governed refusal of the slot's bound directory -- it cannot be
+            # pinned, or a different directory (a link) now sits at the bound
+            # name -- raised before the session was acquired or by the spawn
+            # itself. Shown with its own text, which names the remedy (re-bind
+            # the project directory), as the main chat's terminal error does.
+            logger.warning(
+                "Thread turn refused: bound project directory not verified for slot=%s mid=%s: %s",
+                slot.key,
+                mid,
+                exc,
+            )
+            _final(str(exc), is_error=True)
         else:
             logger.exception("Thread turn failed: slot=%s mid=%s run_id=%s", slot.key, mid, run_id)
             _final(_FAILED_FALLBACK, is_error=True)

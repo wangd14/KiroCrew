@@ -22,6 +22,7 @@ lines; the subprocess and stdin are mocked (no kiro-cli is launched).
 """
 
 import asyncio
+import errno
 import gc
 import json
 import logging
@@ -2109,6 +2110,183 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
     # The sibling subcommand binary a multi-call CLI dispatches to is still
     # reachable beside the launch path.
     assert (Path(launch_path).parent / "kiro-cli-chat").exists()
+
+
+@pytest.mark.asyncio
+async def test_runtime_spawn_refuses_a_bound_workspace_replaced_since_the_binding(
+    tmp_path, monkeypatch
+):
+    """The runtime's spawn re-verifies the working directory against the identity
+    the session recorded when it was bound (``work_dir_identity``): the directory
+    is replaced (a sibling renamed over the name -- another inode, on every
+    host) before the deferred spawn, and the spawn refuses with the runtime's
+    own governed error before ``create_subprocess_limited`` runs: no child."""
+    import kiro_crew.acp.runtime as runtime_mod
+    from kiro_crew.acp.session_handle import AcpRuntimeError
+
+    executable = tmp_path / "kiro-cli"
+    executable.write_bytes(b"#!/bin/sh\n")
+    executable.chmod(0o755)
+    spawned: list[dict] = []
+
+    async def stop_spawn(*args, **kwargs):
+        spawned.append(kwargs)
+        raise AssertionError("the process must not be created")
+
+    async def resolve_installed(*, environ=None, home=None):
+        return str(executable)
+
+    monkeypatch.setattr(_spawn_client_mod(), "_resolve_kiro_bin_for_spawn", resolve_installed)
+    monkeypatch.setattr(runtime_mod, "wrap_argv", lambda argv, mode, **kwargs: (list(argv), None))
+    monkeypatch.setattr(runtime_mod, "assert_voice_runtime_outside_agent_workspace", MagicMock())
+    monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: list(argv))
+    monkeypatch.setattr(runtime_mod, "create_subprocess_limited", stop_spawn)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    info = os.stat(workspace)
+    runtime = AcpRuntime(work_dir=workspace, work_dir_identity=(info.st_dev, info.st_ino))
+    # The swap, between the binding and the deferred spawn: a sibling made while
+    # the bound directory still existed (another inode by construction), renamed
+    # over the name -- a bare rmdir + mkdir can hand the freed inode back.
+    other = tmp_path / ".workspace.other"
+    other.mkdir()
+    workspace.rmdir()
+    other.rename(workspace)
+    with pytest.raises(AcpRuntimeError, match="re-bind the project directory"):
+        await runtime.spawn()
+    assert spawned == [], "the spawn was attempted into the replaced directory"
+
+
+@pytest.mark.asyncio
+async def test_runtime_spawn_holds_the_windows_chain_across_the_spawn_and_releases_it_after(
+    tmp_path, monkeypatch
+):
+    """The runtime's spawn keeps the hold the identity read handed back -- on
+    Windows the pinned handle chain, open and root-first -- ACROSS the process
+    creation: when ``create_subprocess_limited`` runs, nothing of the chain has
+    been released and ``cwd`` is the bare spelling the held chain keeps naming
+    the verified directory; a spawn that fails releases the chain on a worker
+    thread, leaf-first, exactly once. Through the seams (fake descriptors, a
+    fake spawn, the internal-sandbox bind answering as a Windows host's does --
+    the spelling back, nothing bound): no real handle, no process; run under the
+    host's platform and under darwin forced, so a Windows hold never meets the
+    darwin bound-descriptor compare on any shard. Red-first on the head before
+    this: the Windows arm handed back no hold, the chain closed before the
+    check returned."""
+    import sys
+    import threading
+
+    import kiro_crew.acp.runtime as runtime_mod
+    from kiro_crew import sandbox as sandbox_module
+
+    executable = tmp_path / "kiro-cli"
+    executable.write_bytes(b"#!/bin/sh\n")
+    executable.chmod(0o755)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    info = os.stat(workspace)
+    bound = (info.st_dev, info.st_ino)
+    chain = [201, 202, 203]  # the walk's handles, root-first -- fakes, never opened
+    monkeypatch.setattr(sandbox_module, "open_pinned_directory", lambda path: (list(chain), bound))
+    closed: list[int] = []
+    released_on: list[str] = []
+    real_close = os.close
+
+    def _close(fd):
+        if fd in chain:
+            closed.append(fd)
+            released_on.append(threading.current_thread().name)
+        else:
+            real_close(fd)
+
+    monkeypatch.setattr(os, "close", _close)
+    at_spawn: list[tuple[list[int], object]] = []
+
+    async def fail_spawn(*args, **kwargs):
+        at_spawn.append((list(closed), kwargs.get("cwd")))
+        raise RuntimeError("spawn failed")
+
+    async def resolve_installed(*, environ=None, home=None):
+        return str(executable)
+
+    async def windows_bind(workspace_path):
+        # No Windows host binds: the spelling back, nothing opened.
+        return str(workspace_path), None
+
+    monkeypatch.setattr(_spawn_client_mod(), "_resolve_kiro_bin_for_spawn", resolve_installed)
+    monkeypatch.setattr(runtime_mod, "wrap_argv", lambda argv, mode, **kwargs: (list(argv), None))
+    monkeypatch.setattr(runtime_mod, "assert_voice_runtime_outside_agent_workspace", MagicMock())
+    monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: list(argv))
+    monkeypatch.setattr(runtime_mod, "create_subprocess_limited", fail_spawn)
+    monkeypatch.setattr(runtime_mod, "bind_voice_safe_agent_workspace_async", windows_bind)
+
+    platforms = (None, "darwin") if os.name == "posix" else (None,)
+    for forced in platforms:
+        closed.clear()
+        released_on.clear()
+        at_spawn.clear()
+        with pytest.MonkeyPatch.context() as platform_patch:
+            if forced:
+                platform_patch.setattr(sys, "platform", forced)
+            runtime = AcpRuntime(work_dir=workspace, work_dir_identity=bound)
+            with pytest.raises(RuntimeError, match="spawn failed"):
+                await runtime.spawn()
+            # Drain the default executor so the scheduled release has run.
+            await asyncio.get_running_loop().run_in_executor(None, lambda: None)
+        assert at_spawn == [([], str(workspace))], "the chain was released before the spawn"
+        assert closed == [203, 202, 201]  # released after the failure, leaf-first, once
+        assert released_on and set(released_on) != {threading.main_thread().name}
+
+
+@pytest.mark.asyncio
+async def test_runtime_spawn_refuses_a_bound_workspace_whose_leaf_became_a_link(
+    tmp_path, monkeypatch
+):
+    """The runtime's spawn re-verifies the working directory against the identity
+    the session recorded when it was bound (``work_dir_identity``): the leaf
+    becomes a link before the deferred spawn (handed to the check through its
+    seams, so it runs on every host), and the spawn refuses with the runtime's
+    own governed error before ``create_subprocess_limited`` runs; a different
+    real directory at the name is logged and spawned as bound instead."""
+    import kiro_crew.acp.runtime as runtime_mod
+    from kiro_crew import sandbox as sandbox_module
+    from kiro_crew.acp.session_handle import AcpRuntimeError
+
+    executable = tmp_path / "kiro-cli"
+    executable.write_bytes(b"#!/bin/sh\n")
+    executable.chmod(0o755)
+    spawned: list[dict] = []
+
+    async def stop_spawn(*args, **kwargs):
+        spawned.append(kwargs)
+        raise AssertionError("the process must not be created")
+
+    async def resolve_installed(*, environ=None, home=None):
+        return str(executable)
+
+    monkeypatch.setattr(_spawn_client_mod(), "_resolve_kiro_bin_for_spawn", resolve_installed)
+    monkeypatch.setattr(runtime_mod, "wrap_argv", lambda argv, mode, **kwargs: (list(argv), None))
+    monkeypatch.setattr(runtime_mod, "assert_voice_runtime_outside_agent_workspace", MagicMock())
+    monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: list(argv))
+    monkeypatch.setattr(runtime_mod, "create_subprocess_limited", stop_spawn)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    info = os.stat(workspace)
+    runtime = AcpRuntime(work_dir=workspace, work_dir_identity=(info.st_dev, info.st_ino))
+    # The swap, between the binding and the deferred spawn: the leaf is a link
+    # now -- the kernel's answer to a no-follow open (ELOOP) and the Windows
+    # arm's refusal of a redirecting reparse point, handed to the check.
+    monkeypatch.setattr(
+        sandbox_module,
+        "open_pinned_directory",
+        lambda path: (_ for _ in ()).throw(OSError(errno.ELOOP, "link", path)),
+    )
+    with pytest.raises(AcpRuntimeError, match="now a link"):
+        await runtime.spawn()
+    assert spawned == [], "the spawn was attempted into the replaced directory"
+    assert runtime._process is None
 
 
 @pytest.mark.asyncio

@@ -2616,7 +2616,14 @@ class SessionLifecycleService:
             logger.debug("_send_abort_for_session failed for %s", key, exc_info=True)
 
     async def _eager_respawn(self, key: str) -> None:
-        """Respawn after hard kill and release its acquired turn semaphore."""
+        """Respawn after hard kill and release its acquired turn semaphore.
+
+        Names no directory: the allocation body restores the session map's
+        working directory for the resume and resolves the bound-directory
+        identity on it there, so a hard-stopped bound slot is respawned into a
+        verified directory or not at all (a refusal is logged, and the slot's
+        next turn meets the same governed refusal at its own spawn).
+        """
         try:
             await self._owner.get_or_create(key)
             self._owner.release(key)

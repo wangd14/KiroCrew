@@ -282,6 +282,7 @@ from kiro_crew.recovery.ladder import LADDER as _LADDER
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
+    AgentWorkspacePinRefused,
     BoundWorkspaceMismatch,
     _forward_ssh_auth_sock,
     agent_env_scrub_prefixes,
@@ -291,9 +292,12 @@ from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
     delegated_workspace_exposes_sealed_target,
+    refuse_unless_bound_workspace_is_pinned_async,
+    release_agent_workspace_fd,
     release_bound_agent_workspace,
     resolve_bound_session_workspace,
     scrub_agent_subprocess_env,
+    verify_agent_workspace_for_spawn_async,
     wrap_argv,
     wrap_argv_async,
     wrapped_by_crew_sandbox,
@@ -3303,6 +3307,7 @@ class AcpClient:
         sandbox_mode: str = "auto",
         session_key: str | None = None,
         channel_id: str | None = None,
+        work_dir_identity: tuple[int, int] | None = None,
         extra_env: dict[str, str] | None = None,
         acp_backend: str = "",
         audit_source: str | None = None,
@@ -3323,6 +3328,13 @@ class AcpClient:
         # after the first (off-loop) mkdir, so the per-prompt warm path pays
         # no filesystem syscall at all.
         self._work_dir_ready = False
+        # The (st_dev, st_ino) the SESSION recorded when it was bound to work_dir
+        # (slot.project_identity), or None when the binding carries no identity;
+        # what the spawn verifies the directory against (sandbox
+        # .verify_agent_workspace_for_spawn).
+        self._work_dir_identity: tuple[int, int] | None = (
+            (int(work_dir_identity[0]), int(work_dir_identity[1])) if work_dir_identity else None
+        )
         self._model = model or DEFAULT_MODEL
         self._agent = agent
         self._sandbox_mode = sandbox_mode
@@ -7847,11 +7859,50 @@ class AcpClient:
         # from platform_compat (getattr) so referencing it doesn't fail mypy's
         # [attr-defined] check on Linux where subprocess.* lacks it.
         await self._discard_bound_workspace()
-        if self.backend in ACP_BACKENDS_INTERNAL_SANDBOX:
-            self._spawn_work_dir, self._bound_workspace_fd = (
-                await bind_voice_safe_agent_workspace_async(self._work_dir)
-            )
+        # The working directory is re-verified HERE against the identity the
+        # SESSION recorded when it was bound (sandbox.verify_agent_workspace_for_spawn
+        # re-reads the leaf without following a link and compares (st_dev,
+        # st_ino)): a swap at that name since the binding is refused instead of
+        # entered, before the bind and the spawn, so nothing is minted; a binding
+        # that carries no identity is not examined and spawns as it always did.
+        # The refusal is governed -- this site's own error, naming the remedy.
+        # What the check verified stays HELD until the child exists: the POSIX
+        # descriptor, or on Windows the pinned handle chain (each component held
+        # without FILE_SHARE_DELETE, so the name the spawn enters cannot be
+        # renamed or re-pointed at a junction in between); released after the
+        # PID bookkeeping below, and on every failure path.
         try:
+            spawn_cwd, verified_workspace_fd = await verify_agent_workspace_for_spawn_async(
+                self._work_dir, self._work_dir_identity
+            )
+        except AgentWorkspacePinRefused as exc:
+            self._discard_sandbox_cleanup()
+            raise AcpError(str(exc)) from exc
+        except BaseException:
+            self._discard_sandbox_cleanup()
+            raise
+        # The verified directory's own spelling is the cwd the spawn enters --
+        # assigned FIRST; the bind below replaces it only when it binds
+        # (returns a descriptor) or names a different path. Off macOS the bind
+        # is a no-op that echoes the spelling back, and echoing it over the
+        # verified real path would spawn into the unverified name (review-caught).
+        self._spawn_work_dir = spawn_cwd
+        try:
+            if self.backend in ACP_BACKENDS_INTERNAL_SANDBOX:
+                bound_path, self._bound_workspace_fd = await bind_voice_safe_agent_workspace_async(
+                    self._work_dir
+                )
+                if self._bound_workspace_fd is not None or bound_path != str(self._work_dir):
+                    self._spawn_work_dir = bound_path
+                if self._bound_workspace_fd is not None:
+                    # The bind opened the name following links; the child enters
+                    # THAT descriptor. It must be the directory the check verified.
+                    try:
+                        await refuse_unless_bound_workspace_is_pinned_async(
+                            self._bound_workspace_fd, verified_workspace_fd
+                        )
+                    except AgentWorkspacePinRefused as exc:
+                        raise AcpError(str(exc)) from exc
             self._process = await platform_compat.create_windows_cleanup_owned_process(
                 functools.partial(
                     create_subprocess_limited,
@@ -7879,9 +7930,19 @@ class AcpClient:
         except BaseException:
             await self._discard_bound_workspace()
             self._discard_sandbox_cleanup()
+            asyncio.get_running_loop().run_in_executor(
+                None, release_agent_workspace_fd, verified_workspace_fd
+            )
             raise
         self._pid = self._process.pid
         self._process_tree_confirmed_dead = False
+        # The verified hold (the descriptor; on Windows the handle chain that
+        # spanned the process creation) is released on a worker thread, scheduled
+        # only now -- AFTER the PID bookkeeping -- so no await and no loop-side
+        # close sits between the live child and the record of it (review-caught).
+        asyncio.get_running_loop().run_in_executor(
+            None, release_agent_workspace_fd, verified_workspace_fd
+        )
         # Minted with the process it names, random rather than pid-derived: a
         # pid can be reused by the OS, and the start-time disambiguator is not
         # readable on every platform, so equality on a fresh random id is the
