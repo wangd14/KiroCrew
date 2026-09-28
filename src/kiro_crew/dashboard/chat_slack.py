@@ -425,7 +425,29 @@ async def api_chat_slot_slack_link(request: web.Request) -> web.Response:
     # while nothing ever told the open tab it had arrived. That same index is
     # what resolves an OPTIONS click on the control replayed below back to this
     # conversation -- without it the click would answer into a separate session.
-    state.link_slack(slot.key, thread_ts, target_channel)
+    if not state.link_slack(slot.key, thread_ts, target_channel):
+        # The map refused the write -- a Slack workspace switch holds the link
+        # table while it sweeps the destinations of the former workspace -- and
+        # ``link_slack`` changed nothing on refusal. Answer with that instead of
+        # ``{ok}``: a success here would redraw the slot as linked, backfill the
+        # transcript into a thread no session owns, and be contradicted by the
+        # very next restart. 503 because the condition is transient; the user
+        # retries once the switch has settled.
+        sel().log_api_access(
+            caller="dashboard",
+            operation="chat.slack_link",
+            outcome="refused",
+            source="dashboard",
+            resources=slot.key,
+            error="slack workspace switch in flight",
+        )
+        return web.json_response(
+            {
+                "error": "Slack workspace switch in flight; retry shortly",
+                "code": "slack_workspace_switch_in_flight",
+            },
+            status=503,
+        )
     # Persist before publishing: the map's writer is debounced, and everything
     # below -- the transcript backfilled into the thread, the slots push, the
     # `{ok, thread_ts}` answer -- tells the user the thread is linked. A gateway

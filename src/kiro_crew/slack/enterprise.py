@@ -440,6 +440,22 @@ def _governance_posture_permits_workspace(enterprise_id: str, team_id: str) -> b
         return False
 
 
+def _forget_validated_identity() -> None:
+    """Drop the ``auth.test`` identity cached above once the workspace is REFUSED.
+
+    The cache is written before the allowlist checks (the own-workspace entry
+    of the allowlist reads it), so a refusal must take it back: left in place,
+    :func:`validated_team_id` would name a workspace nobody admitted, and the
+    gateway's switch detection -- which compares it with the workspace the
+    persisted Slack destinations were written under -- would sweep those
+    destinations for a workspace that never connected.
+    """
+    global _validated_team_id, _validated_enterprise_id, _validated_self_bot_id
+    _validated_team_id = ""
+    _validated_enterprise_id = ""
+    _validated_self_bot_id = ""
+
+
 def validate_enterprise(
     bot_token: str,
     *,
@@ -668,6 +684,7 @@ def validate_enterprise(
                 resources=f"enterprise_id={enterprise_id} team={team} url={url}",
                 error="enterprise_id_not_allowed",
             )
+            _forget_validated_identity()
             return False
 
     # Governance posture (un-weakenable): the enterprise security policy may pin
@@ -691,6 +708,7 @@ def validate_enterprise(
             resources=f"enterprise_id={enterprise_id} team={team} url={url}",
             error="enterprise_id_not_allowed_by_governance",
         )
+        _forget_validated_identity()
         return False
 
     logger.info(
@@ -721,6 +739,23 @@ def validated_self_bot_id() -> str:
     validation takes for an allowlist with unverifiable workspace identity.
     """
     return _validated_self_bot_id
+
+
+def validated_team_id() -> str:
+    """The workspace ``team_id`` the last successful ``auth.test`` named ("" when none).
+
+    Zero-cost in-memory read. This is the workspace identity behind every Slack
+    destination the gateway has persisted since that validation -- a
+    ``SessionMap`` thread / channel binding carries no workspace of its own.
+    ``GatewayOrchestrator.reconnect_slack`` reads it before and after a
+    handshake and sweeps those bindings when the credentials it hoisted belong
+    to a different workspace, so a client for workspace B is never published
+    against destinations recorded under workspace A. Empty until the first
+    validation succeeds; cleared and re-set by each one, and cleared again
+    when a validation REFUSES the workspace (``_forget_validated_identity``),
+    so a refused workspace is never the one the switch detection compares.
+    """
+    return _validated_team_id
 
 
 def trusted_bot_admission(bot_id: str, trusted_ids: Container[str]) -> tuple[bool, str]:

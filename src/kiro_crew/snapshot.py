@@ -56,6 +56,7 @@ from kiro_crew.memory_stores import (  # noqa: F401 - facade re-exports
     memory_store_namespace_lock,
     named_store_product_file,
 )
+from kiro_crew.slack.workspace_record import SLACK_WORKSPACE_STATE_FILENAME
 from kiro_crew.snapshot_archive import (  # noqa: F401 - facade re-exports
     _CONTROL_CHARS,
     _DB_SIDECAR_GLOBS,
@@ -103,6 +104,7 @@ from kiro_crew.snapshot_components import (  # noqa: F401 - facade re-exports
     _WHOLE_TREE_COMPONENTS,
     COMPONENT_HELP,
     COMPONENT_JSON_OBJECTS,
+    COMPONENT_JSON_VALIDATORS,
     COMPONENT_TREES,
     COMPONENTS,
     CORE_FILES,
@@ -120,6 +122,7 @@ from kiro_crew.snapshot_components import (  # noqa: F401 - facade re-exports
     _is_host_local,
     _mc_dir,
     _never_ships,
+    _slack_workspace_record_defect,
     _tree_roots_replace_clears,
     _want,
     is_product_tree_database,
@@ -155,6 +158,7 @@ from kiro_crew.snapshot_restore import (  # noqa: F401 - facade re-exports
     _allocate_rollback_dir,
     _backup_and_copy,
     _backup_tree_or_refuse,
+    _bundle_record_names_workspace,
     _clear_store_directories,
     _component_payload_absent,
     _components_absent_from_bundle,
@@ -163,7 +167,9 @@ from kiro_crew.snapshot_restore import (  # noqa: F401 - facade re-exports
     _drop_derived_indexes_absent_from_bundle,
     _install_locked_document,
     _lock_down_restored,
+    _record_without_its_map,
     _refuse_corrupt_source_databases,
+    _refuse_legacy_slack_links_without_record,
     _refuse_unless_json_object,
     _refuse_unless_sound,
     _refuse_unless_valid_tree_document,
@@ -705,83 +711,101 @@ def _build_snapshot(
         # to reach it.
         mc_fd = pinned_fs.open_dir_pinned(mc, what="data home") if pinned else None
         try:
+
+            def _stage_core_file(f: str) -> None:
+                src = mc / f
+                if mc_fd is not None:
+                    # Asked through the descriptor. `is_regular_at` lstats relative to
+                    # mc_fd, so it rejects a link or a Windows junction by itself --
+                    # a reparse point is not S_ISREG -- and there is no name for a
+                    # concurrent swap to redirect.
+                    #
+                    # My own AST ratchet flagged this very line last round and I
+                    # dismissed it as one of the legitimate by-name fallback sites
+                    # without checking. It was not: this loop holds mc_fd. Review
+                    # caught what I had waved off.
+                    # A core file that simply is not there is not an omission and must
+                    # stay out of MANIFEST.json -- most components ship only a subset.
+                    # Only a name that EXISTS and is not a regular file is a skip worth
+                    # recording, so the two cases are separated rather than collapsed
+                    # into one `is_regular_at` call. Caught by the manifest test.
+                    live_st = pinned_fs.stat_at(mc_fd, f)
+                    if live_st is None:
+                        return
+                    if not _stat.S_ISREG(live_st.st_mode):
+                        _record_skip(pinned_fs.SKIP_NOT_REGULAR, str(src))
+                        return
+                else:
+                    if not src.is_file():
+                        return
+                    # Reserved for the fallback, where there is no descriptor to ask.
+                    # `is_file()` and, on a platform without O_NOFOLLOW, `os.open`
+                    # both FOLLOW a link, so neither can screen one: on the declared
+                    # by-name path a core filename pointed at a credential would have
+                    # had its bytes copied into the archive. `is_reparse_point` also
+                    # catches a Windows junction, which `islink` does not report.
+                    if pinned_fs.is_reparse_point(src):
+                        _record_skip(pinned_fs.SKIP_SYMLINK, str(src))
+                        return
+                if f.endswith(".db"):
+                    # A component file may sit under a subdirectory
+                    # (`workspace/knowledge/knowledge.db`), so the parent is created
+                    # per file rather than assumed from the component's tree roots.
+                    (stage / f).parent.mkdir(parents=True, exist_ok=True)
+                    # Through the SAME hardened copy the tree pass uses, so the two
+                    # cannot drift: descriptor-verified chain, percent-escaped URI,
+                    # `mode=ro`, and "not a database" told apart from "cannot read
+                    # this database". Without it the core path is an unhardened
+                    # SQLite read on the creation path, connecting READ-WRITE to
+                    # the live name.
+                    #
+                    # `mc_fd` screened this name a few lines up and cannot be handed
+                    # to SQLite, which takes only a path; the chain check inside the
+                    # helper is what makes the ANCESTORS non-redirectable, and the
+                    # residual final-name window is documented there.
+                    # `require_database=True` makes every non-success outcome a raise,
+                    # so there is no outcome to branch on here: a declared component
+                    # file is either copied consistently or the snapshot fails. Both
+                    # degradations it replaces -- byte-copying a corrupt database, and
+                    # omitting an unverifiable one -- let the command succeed, which
+                    # lets `--keep` prune the last good archive in favour of one that
+                    # cannot be restored.
+                    _copy_database_consistently(
+                        src,
+                        stage / f,
+                        root=mc,
+                        rel_parts=PurePosixPath(f).parts,
+                        require_database=True,
+                    )
+                elif mc_fd is not None:
+                    (stage / f).parent.mkdir(parents=True, exist_ok=True)
+                    pinned_fs.copy_file_pinned(
+                        str(src),
+                        str(stage / f),
+                        dir_fd=mc_fd,
+                        name=f,
+                        on_skip=_record_skip,
+                    )
+                else:
+                    pinned_fs.copy_file_pinned(str(src), str(stage / f), on_skip=_record_skip)
+
             for comp in selected:
                 for f in COMPONENTS[comp].files:
-                    src = mc / f
-                    if mc_fd is not None:
-                        # Asked through the descriptor. `is_regular_at` lstats relative to
-                        # mc_fd, so it rejects a link or a Windows junction by itself --
-                        # a reparse point is not S_ISREG -- and there is no name for a
-                        # concurrent swap to redirect.
-                        #
-                        # My own AST ratchet flagged this very line last round and I
-                        # dismissed it as one of the legitimate by-name fallback sites
-                        # without checking. It was not: this loop holds mc_fd. Review
-                        # caught what I had waved off.
-                        # A core file that simply is not there is not an omission and must
-                        # stay out of MANIFEST.json -- most components ship only a subset.
-                        # Only a name that EXISTS and is not a regular file is a skip worth
-                        # recording, so the two cases are separated rather than collapsed
-                        # into one `is_regular_at` call. Caught by the manifest test.
-                        live_st = pinned_fs.stat_at(mc_fd, f)
-                        if live_st is None:
-                            continue
-                        if not _stat.S_ISREG(live_st.st_mode):
-                            _record_skip(pinned_fs.SKIP_NOT_REGULAR, str(src))
-                            continue
-                    else:
-                        if not src.is_file():
-                            continue
-                        # Reserved for the fallback, where there is no descriptor to ask.
-                        # `is_file()` and, on a platform without O_NOFOLLOW, `os.open`
-                        # both FOLLOW a link, so neither can screen one: on the declared
-                        # by-name path a core filename pointed at a credential would have
-                        # had its bytes copied into the archive. `is_reparse_point` also
-                        # catches a Windows junction, which `islink` does not report.
-                        if pinned_fs.is_reparse_point(src):
-                            _record_skip(pinned_fs.SKIP_SYMLINK, str(src))
-                            continue
-                    if f.endswith(".db"):
-                        # A component file may sit under a subdirectory
-                        # (`workspace/knowledge/knowledge.db`), so the parent is created
-                        # per file rather than assumed from the component's tree roots.
-                        (stage / f).parent.mkdir(parents=True, exist_ok=True)
-                        # Through the SAME hardened copy the tree pass uses, so the two
-                        # cannot drift: descriptor-verified chain, percent-escaped URI,
-                        # `mode=ro`, and "not a database" told apart from "cannot read
-                        # this database". Without it the core path is an unhardened
-                        # SQLite read on the creation path, connecting READ-WRITE to
-                        # the live name.
-                        #
-                        # `mc_fd` screened this name a few lines up and cannot be handed
-                        # to SQLite, which takes only a path; the chain check inside the
-                        # helper is what makes the ANCESTORS non-redirectable, and the
-                        # residual final-name window is documented there.
-                        # `require_database=True` makes every non-success outcome a raise,
-                        # so there is no outcome to branch on here: a declared component
-                        # file is either copied consistently or the snapshot fails. Both
-                        # degradations it replaces -- byte-copying a corrupt database, and
-                        # omitting an unverifiable one -- let the command succeed, which
-                        # lets `--keep` prune the last good archive in favour of one that
-                        # cannot be restored.
-                        _copy_database_consistently(
-                            src,
-                            stage / f,
-                            root=mc,
-                            rel_parts=PurePosixPath(f).parts,
-                            require_database=True,
-                        )
-                    elif mc_fd is not None:
-                        (stage / f).parent.mkdir(parents=True, exist_ok=True)
-                        pinned_fs.copy_file_pinned(
-                            str(src),
-                            str(stage / f),
-                            dir_fd=mc_fd,
-                            name=f,
-                            on_skip=_record_skip,
-                        )
-                    else:
-                        pinned_fs.copy_file_pinned(str(src), str(stage / f), on_skip=_record_skip)
+                    _stage_core_file(f)
+            # The Slack workspace record is staged BEFORE the session map (see
+            # `snapshot_components`), which pairs a record naming a workspace only
+            # with links written under it. One interleaving slips that pairing: a home
+            # with links and NO record whose gateway writes its first record between
+            # the two copies -- the record is skipped as absent, the map is copied, and
+            # the bundle carries links with no workspace named for them. A second
+            # look at the record after the map closes it: a record that exists now
+            # and was absent then is the FIRST record, which names the workspace the
+            # kept links were written under (the first-record branch sweeps nothing),
+            # so copying it now pairs correctly; a record present at the first copy
+            # was already staged and is left as it was read then.
+            if "config" in selected and (stage / "session_map.json").is_file():
+                if not (stage / SLACK_WORKSPACE_STATE_FILENAME).exists():
+                    _stage_core_file(SLACK_WORKSPACE_STATE_FILENAME)
         finally:
             if mc_fd is not None:
                 os.close(mc_fd)
@@ -1389,8 +1413,27 @@ def _do_merge(
             print("  ⚠️  crons: merge skipped (see warning above) — no jobs imported")
 
     if _want(components, "config"):
+        # The Slack workspace record installs ONLY together with the session map
+        # it describes. Merge copies each core file where the destination lacks
+        # it, so a home that has a live map and no record (every install that
+        # predates the record, until its first recording boot) would otherwise
+        # take the bundle's record alone -- a workspace identity for links that
+        # were never written under it -- and the next connected handshake would
+        # read that identity as the former one, see a switch, and sweep every
+        # live Slack link, with the marker's undo copy gone once the switch
+        # adopts. The converse (map without record) is refused before mutation
+        # by ``_refuse_legacy_slack_links_without_record``; this is the other
+        # half. The live map keeps its own state: no record, first-record
+        # branch on the next handshake, links kept.
+        map_installs = (snap / "session_map.json").is_file() and not (
+            mc / "session_map.json"
+        ).is_file()
         for f in CORE_FILES["config"]:
             s, d = snap / f, mc / f
+            if f == "slack_workspace.json" and not map_installs:
+                if s.is_file() and not d.is_file():
+                    print(f"  {f}: skipped (its session map is not being restored)")
+                continue
             if s.is_file() and not d.is_file():
                 shutil.copy2(str(s), str(d))
                 print(f"  {f}: restored (was missing)")
@@ -1866,6 +1909,7 @@ def restore_main(argv: list[str] | None = None, *, parsed: argparse.Namespace | 
                 snap,
                 components,
                 mc_for_merge=None if mode == "replace" else mc,
+                live_home=mc,
             )
         except SourceComponentUnsound as e:
             _audit(

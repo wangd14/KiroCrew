@@ -15498,7 +15498,13 @@
         "reconnect_enterprise_validation_failed": "此 Slack 工作区不在允许的企业组织列表中。请在下方更新列表并保存，然后点击“重新连接”。",
         "reconnect_denied_by_policy": "此机器上的频道策略不允许连接 Slack。",
         "reconnect_failed_reason": "重新连接失败：{{reason}}",
-        "saved_reconnect_and_restart": "已保存。点击“重新连接”即可应用令牌；斜杠命令仍需重启网关。"
+        "saved_reconnect_and_restart": "已保存。点击“重新连接”即可应用令牌；斜杠命令仍需重启网关。",
+        "reconnect_previous_client_close_failed": "无法关闭之前的 Slack 连接，因此 Slack 已被置为禁用：它不授权任何人，也无法回复。请重启网关以恢复；再次点击“重新连接”也可能成功。",
+        "reconnect_workspace_identity_unverified": "Slack 未能确认这些令牌属于哪个工作区，因此未建立连接，已保存的 Slack 会话保持不变。请再次点击“重新连接”。",
+        "reconnect_workspace_identity_unrecorded": "{{productName}} 未能保存这些令牌所属的 Slack 工作区，因此未建立连接。请确认 {{productName}} 数据文件夹可写，然后再次点击“重新连接”。",
+        "reconnect_workspace_switch_too_large": "这些令牌属于另一个 Slack 工作区，而此安装中已保存的 Slack 对话数量超过了 {{productName}} 在一次切换中能安全搁置的上限，因此未做任何更改。请在对应聊天中断开不再需要的 Slack 对话，然后再次点击“重新连接”。",
+        "reconnect_workspace_switch_unrecordable": "这些令牌属于另一个 Slack 工作区，而其中一个已保存的 Slack 对话的记录 {{productName}} 无法安全搁置，因此未做任何更改。请在对应聊天中断开该对话，然后再次点击“重新连接”。",
+        "reconnect_workspace_record_unreadable": "{{productName}} 发现记录“已保存的对话属于哪个 Slack 工作区”的文件已损坏，因此未建立连接。请修复或删除 {{productName}} 数据文件夹中的 slack_workspace.json，然后再次点击“重新连接”。"
       },
       "sttSettings": {
         "language_auto": "自动检测语言",

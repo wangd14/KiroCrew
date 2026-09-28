@@ -266,6 +266,85 @@ describe('SlackPanel reconnect', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(/owner Slack member ID is missing/)
   })
 
+  it('explains an aborted reconnect as unchanged, with the retry and the fallback', async () => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: false, connect_error: 'previous_client_close_failed' })
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    const notice = await screen.findByRole('alert')
+    expect(notice).toHaveTextContent(/^Reconnect failed: The previous Slack connection could not be closed, so Slack was left disabled: it authorizes nobody and cannot reply\./)
+    expect(notice).toHaveTextContent(/Restart the gateway to recover; clicking Reconnect again may also succeed\./)
+    expect(screen.queryByText('Connected to Slack.')).not.toBeInTheDocument()
+  })
+
+  it('explains a refused reconnect whose workspace Slack did not confirm, as kept and retryable', async () => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: false, connect_error: 'workspace_identity_unverified' })
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    const notice = await screen.findByRole('alert')
+    expect(notice).toHaveTextContent(/^Reconnect failed: Slack did not confirm which workspace these tokens belong to/)
+    expect(notice).toHaveTextContent(/nothing was connected and the saved Slack conversations were kept\. Click Reconnect again\./)
+    // The raw code never reaches the user.
+    expect(notice).not.toHaveTextContent('workspace_identity_unverified')
+  })
+
+  it('explains a refused reconnect whose workspace record could not be written, with the remedy', async () => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: false, connect_error: 'workspace_identity_unrecorded' })
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    const notice = await screen.findByRole('alert')
+    expect(notice).toHaveTextContent(/^Reconnect failed: Kiro Crew could not save which Slack workspace these tokens belong to, so nothing was connected\./)
+    expect(notice).toHaveTextContent(/Check that the Kiro Crew data folder is writable, then click Reconnect again\./)
+    expect(notice).not.toHaveTextContent('workspace_identity_unrecorded')
+  })
+
+  it('explains a refused reconnect whose workspace record is damaged, naming the file and the remedy', async () => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: false, connect_error: 'workspace_record_unreadable' })
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    const notice = await screen.findByRole('alert')
+    expect(notice).toHaveTextContent(/^Reconnect failed: Kiro Crew found a damaged record of which Slack workspace the saved conversations belong to, so nothing was connected\./)
+    expect(notice).toHaveTextContent(/Repair or remove slack_workspace\.json in the Kiro Crew data folder, then click Reconnect again\./)
+    expect(notice).not.toHaveTextContent('workspace_record_unreadable')
+  })
+
+  it('explains a refused switch that has too many saved conversations to set aside, with the remedy', async () => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: false, connect_error: 'workspace_switch_too_large' })
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    const notice = await screen.findByRole('alert')
+    expect(notice).toHaveTextContent(/^Reconnect failed: These tokens belong to a different Slack workspace, and this install has more saved Slack conversations than Kiro Crew can safely set aside in one switch, so nothing was changed\./)
+    expect(notice).toHaveTextContent(/Disconnect Slack conversations you no longer need from their chats, then click Reconnect again\./)
+    expect(notice).not.toHaveTextContent('workspace_switch_too_large')
+  })
+
+  it('explains a refused switch blocked by one saved conversation it cannot set aside, with the remedy', async () => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: false, connect_error: 'workspace_switch_unrecordable' })
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    const notice = await screen.findByRole('alert')
+    expect(notice).toHaveTextContent(/^Reconnect failed: These tokens belong to a different Slack workspace, and one of the saved Slack conversations has a record Kiro Crew could not set aside safely, so nothing was changed\./)
+    expect(notice).toHaveTextContent(/Disconnect that conversation from its chat, then click Reconnect again\./)
+    expect(notice).not.toHaveTextContent('workspace_switch_unrecordable')
+  })
+
   it("shows the gateway's own refusal when it answered the request", async () => {
     seed()
     vi.spyOn(api, 'reconnectSlack').mockRejectedValue(
@@ -293,7 +372,84 @@ describe('SlackPanel reconnect', () => {
     expect(notice).not.toHaveTextContent('Failed to fetch')
   })
 
-  it('treats a 5xx the same as no answer: the proxy body is not shown', async () => {
+  it('shows one problem at a time: the recorded connect error steps aside for a transport failure', async () => {
+    // The gateway recorded invalid_auth at boot; then a click never reaches it.
+    seed({ connect_error: 'invalid_auth' })
+    vi.spyOn(api, 'reconnectSlack')
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValueOnce({ connected: false, connect_error: 'invalid_auth' })
+    await hydrated()
+    expect(screen.getByRole('alert')).toHaveTextContent(/invalid_auth/)
+
+    fireEvent.click(reconnectBtn())
+
+    await screen.findByText('Reconnect failed. Is the gateway running?')
+    const alerts = screen.getAllByRole('alert')
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).not.toHaveTextContent(/invalid_auth/)
+    // Not closable -- like the recorded reading and the save's own error, it
+    // clears when the next click gets an answer, so the two notices behave
+    // as one kind of warning.
+    expect(within(alerts[0]).queryByRole('button', { name: /dismiss/i })).not.toBeInTheDocument()
+
+    fireEvent.click(reconnectBtn())
+
+    const answered = await screen.findByRole('alert')
+    expect(answered).toHaveTextContent(/^Reconnect failed: Slack rejected the stored tokens \(invalid_auth\)/)
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+  })
+
+  it('takes the previous failure off screen while a retry is in flight', async () => {
+    // A red "failed" beside "Reconnecting…" reads as the retry having failed.
+    seed({ connect_error: 'invalid_auth' })
+    let settle: (v: ReconnectResult) => void = () => {}
+    vi.spyOn(api, 'reconnectSlack').mockReturnValue(new Promise<ReconnectResult>(r => { settle = r }))
+    await hydrated()
+    expect(screen.getByRole('alert')).toHaveTextContent(/invalid_auth/)
+
+    fireEvent.click(reconnectBtn())
+
+    await screen.findByRole('button', { name: 'Reconnecting…' })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+
+    await act(async () => { settle({ connected: false, connect_error: 'invalid_auth' }) })
+    expect(await screen.findByRole('alert')).toHaveTextContent(/^Reconnect failed:/)
+  })
+
+  it("shows the gateway's own 500 -- the credential store could not be read -- not a question it already answered", async () => {
+    // The gateway answered: its body is its own {error, code} shape. Asking
+    // whether it is running would hide the remedy (a readable data folder).
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockRejectedValue(
+      new ApiError(500, 'could not read the saved Slack credentials', '{"error":"could not read the saved Slack credentials","code":"credential_store_unreadable"}'),
+    )
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    const notice = await screen.findByRole('alert')
+    expect(notice).toHaveTextContent('could not read the saved Slack credentials')
+    expect(notice).not.toHaveTextContent(/Is the gateway running/)
+    expect(notice).not.toHaveTextContent('credential_store_unreadable')
+  })
+
+  it("shows the gateway's own 503 -- no Slack socket owner -- not a question it already answered", async () => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockRejectedValue(
+      new ApiError(503, 'Slack reconnect unavailable', '{"error":"Slack reconnect unavailable","code":"slack_reconnect_unavailable"}'),
+    )
+    await hydrated()
+
+    fireEvent.click(reconnectBtn())
+
+    const notice = await screen.findByRole('alert')
+    expect(notice).toHaveTextContent('Slack reconnect unavailable')
+    expect(notice).not.toHaveTextContent(/Is the gateway running/)
+  })
+
+  it('treats an unstructured 5xx as no answer: a proxy body is not the gateway speaking', async () => {
+    // Same status as the gateway's own 500 above; the body's shape is what
+    // tells a proxy that could not reach the gateway from the gateway itself.
     seed()
     vi.spyOn(api, 'reconnectSlack').mockRejectedValue(
       new ApiError(500, 'Error occurred while trying to proxy: localhost:3000/api/slack/reconnect', 'Error occurred while trying to proxy'),
@@ -353,6 +509,26 @@ describe('SlackPanel reconnect', () => {
     expect(await screen.findByText('Connected to Slack.')).toBeInTheDocument()
     expect(screen.queryByTestId('slack-reconnect-after-save')).not.toBeInTheDocument()
     expect(screen.getByTestId('slack-reconnect')).toBeInTheDocument()
+  })
+
+  it('keeps the save-row Reconnect across a later config-only save', async () => {
+    // Credentials saved (reconnect pending), then only the slash command is
+    // changed: the pending reminder must survive, the tokens are still not live.
+    const { save } = seed({}, { save: { ok: true, restart_required: false, reconnect_required: true, verify_warning: '' } })
+    await hydrated()
+
+    fireEvent.click(saveBtn())
+    await screen.findByTestId('slack-reconnect-after-save', undefined, { timeout: 5_000 })
+
+    save.mockResolvedValue({ ok: true, restart_required: true, reconnect_required: false, verify_warning: '' })
+    fireEvent.click(saveBtn())
+
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2))
+    // The confirmation still names both pending steps, and the button stays.
+    expect(
+      await screen.findByText(/^Saved\. Click Reconnect to apply the tokens; the slash command still needs a gateway restart\.$/, undefined, { timeout: 5_000 }),
+    ).toBeInTheDocument()
+    expect(screen.getByTestId('slack-reconnect-after-save')).toBeInTheDocument()
   })
 
   it('keeps the save-row Reconnect when the reconnect fails', async () => {

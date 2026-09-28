@@ -15948,7 +15948,13 @@
         "reconnect_enterprise_validation_failed": "Cet espace de travail Slack ne figure pas dans les organisations d'entreprise autorisées. Mets la liste à jour ci-dessous et enregistre, puis clique sur « Reconnecter ».",
         "reconnect_denied_by_policy": "Une politique de canaux sur cette machine n'autorise pas Slack à se connecter.",
         "reconnect_failed_reason": "La reconnexion a échoué : {{reason}}",
-        "saved_reconnect_and_restart": "Enregistré. Clique sur «Reconnecter» pour appliquer les jetons ; la commande slash nécessite toujours un redémarrage de la passerelle."
+        "saved_reconnect_and_restart": "Enregistré. Clique sur «Reconnecter» pour appliquer les jetons ; la commande slash nécessite toujours un redémarrage de la passerelle.",
+        "reconnect_previous_client_close_failed": "La connexion Slack précédente n'a pas pu être fermée, donc Slack a été laissé désactivé : il n'autorise personne et ne peut pas répondre. Redémarre la passerelle pour rétablir la situation ; un nouveau clic sur «Reconnecter» peut aussi suffire.",
+        "reconnect_workspace_identity_unverified": "Slack n'a pas confirmé à quel espace de travail ces jetons appartiennent, donc rien n'a été connecté et les conversations Slack enregistrées ont été conservées. Clique de nouveau sur «Reconnecter».",
+        "reconnect_workspace_identity_unrecorded": "{{productName}} n'a pas pu enregistrer à quel espace de travail Slack ces jetons appartiennent, donc rien n'a été connecté. Vérifie que le dossier de données de {{productName}} est accessible en écriture, puis clique de nouveau sur «Reconnecter».",
+        "reconnect_workspace_switch_too_large": "Ces jetons appartiennent à un autre espace de travail Slack, et cette installation compte plus de conversations Slack enregistrées que {{productName}} ne peut en mettre de côté sans risque en un seul changement ; rien n'a donc été modifié. Déconnecte les conversations Slack dont tu n'as plus besoin depuis leurs discussions, puis clique de nouveau sur «Reconnecter».",
+        "reconnect_workspace_switch_unrecordable": "Ces jetons appartiennent à un autre espace de travail Slack, et l'une des conversations Slack enregistrées a un enregistrement que {{productName}} n'a pas pu mettre de côté sans risque ; rien n'a donc été modifié. Déconnecte cette conversation depuis sa discussion, puis clique de nouveau sur «Reconnecter».",
+        "reconnect_workspace_record_unreadable": "{{productName}} a trouvé endommagé l'enregistrement indiquant à quel espace de travail Slack les conversations enregistrées appartiennent, donc rien n'a été connecté. Répare ou supprime slack_workspace.json dans le dossier de données de {{productName}}, puis clique de nouveau sur «Reconnecter»."
       },
       "sttSettings": {
         "language_auto": "Détecter automatiquement la langue",

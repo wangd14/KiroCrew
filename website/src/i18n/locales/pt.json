@@ -15948,7 +15948,13 @@
         "reconnect_enterprise_validation_failed": "Este workspace do Slack não está entre as organizações corporativas permitidas. Atualize a lista abaixo e salve; depois clique em \"Reconectar\".",
         "reconnect_denied_by_policy": "Uma política de canais nesta máquina não permite que o Slack se conecte.",
         "reconnect_failed_reason": "Falha ao reconectar: {{reason}}",
-        "saved_reconnect_and_restart": "Salvo. Clique em \"Reconectar\" para aplicar os tokens; o comando de barra ainda precisa de um reinício do gateway."
+        "saved_reconnect_and_restart": "Salvo. Clique em \"Reconectar\" para aplicar os tokens; o comando de barra ainda precisa de um reinício do gateway.",
+        "reconnect_previous_client_close_failed": "A conexão anterior com o Slack não pôde ser fechada, então o Slack ficou desativado: ele não autoriza ninguém e não consegue responder. Reinicie o gateway para recuperar; clicar em \"Reconectar\" de novo também pode funcionar.",
+        "reconnect_workspace_identity_unverified": "O Slack não confirmou a qual workspace estes tokens pertencem, então nada foi conectado e as conversas do Slack salvas foram mantidas. Clique em \"Reconectar\" de novo.",
+        "reconnect_workspace_identity_unrecorded": "O {{productName}} não conseguiu salvar a qual workspace do Slack estes tokens pertencem, então nada foi conectado. Verifique se a pasta de dados do {{productName}} permite gravação e clique em \"Reconectar\" de novo.",
+        "reconnect_workspace_switch_too_large": "Estes tokens pertencem a outro workspace do Slack, e esta instalação tem mais conversas do Slack salvas do que o {{productName}} consegue reservar com segurança em uma única troca, então nada foi alterado. Desconecte dos seus chats as conversas do Slack que você não precisa mais e clique em Reconectar novamente.",
+        "reconnect_workspace_switch_unrecordable": "Estes tokens pertencem a outro workspace do Slack, e uma das conversas do Slack salvas tem um registro que o {{productName}} não conseguiu reservar com segurança, então nada foi alterado. Desconecte essa conversa do seu chat e clique em Reconectar novamente.",
+        "reconnect_workspace_record_unreadable": "O {{productName}} encontrou danificado o registro de a qual workspace do Slack as conversas salvas pertencem, então nada foi conectado. Repare ou remova slack_workspace.json na pasta de dados do {{productName}} e clique em \"Reconectar\" de novo."
       },
       "sttSettings": {
         "language_auto": "Detectar o idioma automaticamente",

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -224,8 +225,26 @@ def _probe_tracked_channel_scope(channel_ids: set[str]) -> None:
 # View submission registry
 # ---------------------------------------------------------------------------
 
-# Handler signature: async def handler(payload: dict) -> None
-ViewHandler = Callable[[dict], Awaitable[None]]
+# Handler signature: async def handler(payload: dict) -> None, optionally taking a
+# keyword-only ``links_generation`` (see ``handle_view_submission``).
+ViewHandler = Callable[..., Awaitable[None]]
+
+
+def _accepts_links_generation(handler: Callable[..., Any]) -> bool:
+    """Whether *handler* declares a ``links_generation`` parameter.
+
+    A view handler that starts an agent turn from the submission (the forward-
+    to-agent modal, the review-revise modal) declares it so the turn's link
+    writes present the envelope's receipt generation; a handler that writes no
+    link keeps the plain ``(payload)`` signature and is called that way. Read
+    from the signature rather than a second registry so a handler cannot be
+    registered as generation-aware and called without it, or vice versa.
+    """
+    try:
+        return "links_generation" in inspect.signature(handler).parameters
+    except (TypeError, ValueError):
+        return False
+
 
 VIEW_REGISTRY: dict[str, ViewHandler] = {}
 
@@ -235,8 +254,12 @@ def register_view_handler(callback_id: str, handler: ViewHandler) -> None:  # ty
     VIEW_REGISTRY[callback_id] = handler
 
 
-async def handle_view_submission(payload: dict) -> None:
-    """Dispatch a view_submission event to the registered handler."""
+async def handle_view_submission(payload: dict, *, links_generation: int | None = None) -> None:
+    """Dispatch a view_submission event to the registered handler.
+
+    *links_generation* is the envelope's receipt generation (see :func:`dispatch`);
+    it reaches the handlers that declare the parameter (:func:`_accepts_links_generation`).
+    """
     view = payload.get("view", {})
     callback_id = view.get("callback_id", "")
     handler = VIEW_REGISTRY.get(callback_id)
@@ -252,7 +275,10 @@ async def handle_view_submission(payload: dict) -> None:
         logger.warning("No view handler registered for callback_id=%s", callback_id)
         return
     try:
-        await handler(payload)  # type: ignore[misc]
+        if _accepts_links_generation(handler):
+            await handler(payload, links_generation=links_generation)
+        else:
+            await handler(payload)
     except Exception:
         logger.exception("View handler failed for callback_id=%s", callback_id)
 
@@ -503,8 +529,15 @@ async def _handle_message_shortcut(payload: dict) -> None:
     )
 
 
-async def _handle_shortcut_submission(payload: dict) -> None:
-    """Process the 'Forward to Agent' modal submission."""
+async def _handle_shortcut_submission(
+    payload: dict, *, links_generation: int | None = None
+) -> None:
+    """Process the 'Forward to Agent' modal submission.
+
+    *links_generation* is the receipt generation of the submission's envelope
+    (see :func:`dispatch`); the agent turn this starts presents it when it
+    links its thread.
+    """
     user_id = payload.get("user", {}).get("id", "")
     if not is_allowed_user(user_id):
         sel().log_api_access(
@@ -648,6 +681,7 @@ async def _handle_shortcut_submission(payload: dict) -> None:
             subagent_manager=_orch.subagent_mgr,
             task_runner=_orch.task_runner,
             action_context=action_context,
+            links_generation=links_generation,
         )
     )
     _orch._handler_tasks.add(t)
@@ -667,12 +701,50 @@ async def _handle_shortcut_submission(payload: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def dispatch(payload: dict) -> None:
-    """Route a Block Kit interactive payload to the correct handler."""
+def _slack_links_stale(sessions: Any, links_generation: int | None) -> bool:
+    """Whether the Slack-link generation moved since *links_generation* was read.
+
+    An interactive callback is one Slack turn like any other: the listener reads
+    the session map's link generation at receipt and hands it down, and a link the
+    callback writes after its awaits (the resume's ``post_message`` / ``open_dm``,
+    the import's ``fetch_thread_replies``) must present it back. A workspace-
+    switching Reconnect that lands inside that window sweeps every persisted
+    Slack destination and bumps the generation; a callback that then linked the
+    channel or thread it was received in would republish a swept workspace-A
+    destination under workspace B. ``SessionMap.set_slack_link`` refuses such a
+    write on its own when handed the generation, but the callbacks also link
+    through ``dashboard_state.link_slack``, which has no generation to present,
+    so the callers gate BOTH writes on this check and skip them together --
+    half a link (dashboard yes, map no) is the two-owner state the batched save
+    exists to prevent.
+
+    ``None`` (no generation was captured -- an older caller, or a test driving
+    the handler directly) is not stale: the fence is opt-in per turn exactly as
+    it is for message turns, and a turn that never read one has nothing to
+    compare against.
+    """
+    if links_generation is None or sessions is None:
+        return False
+    read = getattr(sessions, "slack_links_generation", None)
+    if not callable(read):
+        return False
+    current = read()
+    return isinstance(current, int) and current != links_generation
+
+
+async def dispatch(payload: dict, *, links_generation: int | None = None) -> None:
+    """Route a Block Kit interactive payload to the correct handler.
+
+    *links_generation* is the session map's Slack-link generation as of the
+    envelope's receipt (``events.init_socket_mode`` reads it before its first
+    await). It reaches the two handlers that write a Slack link -- the resume
+    choice and the link-to-dashboard button -- which refuse the write when the
+    generation has moved underneath them (see :func:`_slack_links_stale`).
+    """
     # ── View submissions and closures (modals) ──
     payload_type = payload.get("type", "")
     if payload_type == "view_submission":
-        await handle_view_submission(payload)
+        await handle_view_submission(payload, links_generation=links_generation)
         return
     if payload_type == "view_closed":
         await handle_view_closed(payload)
@@ -737,14 +809,14 @@ async def dispatch(payload: dict) -> None:
 
     # ── OPTIONS Send button ──
     if action_id == OPTIONS_SUBMIT_ACTION:
-        await _handle_options_submit(payload, channel, msg_ts)
+        await _handle_options_submit(payload, channel, msg_ts, links_generation=links_generation)
         return
 
     # ── Legacy OPTIONS choice buttons ──
     if action_id.startswith(OPTIONS_ACTION_PREFIX):
         if "_done_" in action_id:
             return
-        await _handle_options(payload, action, channel, msg_ts)
+        await _handle_options(payload, action, channel, msg_ts, links_generation=links_generation)
         return
 
     # ── Cron acknowledge ──
@@ -882,7 +954,9 @@ async def dispatch(payload: dict) -> None:
                 metadata={"user_id": user_id, "reason": "no_slack_client"},
             )
             return
-        slot = await _import_thread_to_slot(_orch.slack, ds, channel, thread_ts)
+        slot = await _import_thread_to_slot(
+            _orch.slack, ds, channel, thread_ts, links_generation=links_generation
+        )
         if not slot:
             sel().log_tool_invocation(
                 session_key="",
@@ -945,10 +1019,26 @@ async def dispatch(payload: dict) -> None:
 
     # ── Session resume choice buttons ──
     if action_id.startswith("mc_resume_thread_"):
-        await _handle_resume_choice(payload, action, channel, msg_ts, user_id, mode="thread")
+        await _handle_resume_choice(
+            payload,
+            action,
+            channel,
+            msg_ts,
+            user_id,
+            mode="thread",
+            links_generation=links_generation,
+        )
         return
     if action_id.startswith("mc_resume_dm_"):
-        await _handle_resume_choice(payload, action, channel, msg_ts, user_id, mode="dm")
+        await _handle_resume_choice(
+            payload,
+            action,
+            channel,
+            msg_ts,
+            user_id,
+            mode="dm",
+            links_generation=links_generation,
+        )
         return
 
     # ── Session resume/end/new buttons ──
@@ -1432,8 +1522,14 @@ async def _route_action_to_session(
     context_tag: str,
     action_id_value: str,
     blocks: list[dict],
+    *,
+    links_generation: int | None = None,
 ) -> None:
-    """Shared logic for routing an action:: interaction to the agent session."""
+    """Shared logic for routing an action:: interaction to the agent session.
+
+    *links_generation* is the receipt generation of the interaction's envelope
+    (see :func:`dispatch`), presented by the agent turn this starts.
+    """
     assert _orch and _orch.slack  # caller already checked  # noqa: S101
 
     # Redact label before any Slack surface
@@ -1493,14 +1589,28 @@ async def _route_action_to_session(
             subagent_manager=_orch.subagent_mgr,
             task_runner=_orch.task_runner,
             action_context=action_context,
+            links_generation=links_generation,
         )
     )
     _orch._handler_tasks.add(t)
     t.add_done_callback(_orch._handler_tasks.discard)
 
 
-async def _import_thread_to_slot(slack: Any, ds: Any, channel: str, thread_ts: str) -> Any:
-    """Fetch a Slack thread, redact messages, and import into a new dashboard slot."""
+async def _import_thread_to_slot(
+    slack: Any,
+    ds: Any,
+    channel: str,
+    thread_ts: str,
+    *,
+    links_generation: int | None = None,
+) -> Any:
+    """Fetch a Slack thread, redact messages, and import into a new dashboard slot.
+
+    *links_generation* is the Slack-link generation read when the triggering
+    turn was received. The link this import writes is refused -- ``None`` is
+    returned and no slot is created -- when the generation moved during the
+    ``fetch_thread_replies`` await (see :func:`_slack_links_stale`).
+    """
     from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 
     # Idempotency: return existing slot if already linked
@@ -1523,6 +1633,17 @@ async def _import_thread_to_slot(slack: Any, ds: Any, channel: str, thread_ts: s
     truncated = len(msgs) > 50
     if truncated:
         msgs = msgs[-50:]
+    # Decided AFTER the fetch (the await a workspace switch can land inside) and
+    # BEFORE the slot exists, so a refused import leaves nothing behind: no slot,
+    # no dashboard link, no map row naming a channel of the former workspace.
+    if _slack_links_stale(getattr(ds, "sessions", None), links_generation):
+        logger.warning(
+            "slack: refused to link thread %s in %s to a dashboard slot: the Slack "
+            "workspace changed while the thread was being fetched",
+            thread_ts,
+            channel,
+        )
+        return None
     slot = ds.get_or_create_slot()
     slot.title = f"Slack thread {thread_ts[:10]}" + (" (truncated)" if truncated else "")
     bot_id = getattr(ds, "_self_bot_id", None) or ""
@@ -1533,10 +1654,40 @@ async def _import_thread_to_slot(slack: Any, ds: Any, channel: str, thread_ts: s
         text_content, _ = redact_exfiltration_urls(text_content)
         text_content, _ = redact_credentials(text_content)
         slot.append(role, text_content, f"msg msg-{'a' if is_bot else 'u'}")
-    ds.link_slack(slot.key, thread_ts, channel)
+    if not ds.link_slack(slot.key, thread_ts, channel):
+        # The map refused the link (a workspace switch holds the link table),
+        # so the slot minted above would be an unlinked copy of a thread that
+        # belongs to the workspace being swept: drop it and report no import.
+        # ``get_or_create_slot`` already published the slot -- the active-slot
+        # set and a slots push -- so the retraction republishes both, or the
+        # open tabs keep drawing a tab the backend does not hold.
+        ds._slots.pop(slot.key, None)
+        _republish_slots(ds)
+        logger.warning(
+            "slack: refused to link thread %s in %s to a dashboard slot: a Slack "
+            "workspace switch is in flight",
+            thread_ts,
+            channel,
+        )
+        return None
     await save_slot_off_loop(ds, slot)
     ds.push_slots_update()
     return slot
+
+
+def _republish_slots(ds: Any) -> None:
+    """Re-sync the active-slot set and push the slots after a slot was retracted.
+
+    The mirror of what ``get_or_create_slot`` did when it minted the slot;
+    best-effort on the sync, exactly as there, since a sync failure must not
+    turn a refused import into a crash."""
+    try:
+        from kiro_crew.dashboard.chat_utils import _sync_dashboard_slots
+
+        _sync_dashboard_slots(ds)
+    except Exception:
+        logger.warning("slack: active-slot sync failed after a refused import", exc_info=True)
+    ds.push_slots_update()
 
 
 def _options_block_id(payload: dict, action: dict | None = None) -> str | None:
@@ -1638,8 +1789,14 @@ async def _refuse_stale_options(channel: str, msg_ts: str, payload: dict) -> Non
             )
 
 
-async def _handle_options_submit(payload: dict, channel: str, msg_ts: str) -> None:
-    """User clicked Send on multi-select OPTIONS checkboxes."""
+async def _handle_options_submit(
+    payload: dict, channel: str, msg_ts: str, *, links_generation: int | None = None
+) -> None:
+    """User clicked Send on multi-select OPTIONS checkboxes.
+
+    *links_generation*: the envelope's receipt generation (see :func:`dispatch`),
+    presented by the agent turn this starts.
+    """
     if not (_orch and _orch.slack):
         return
 
@@ -1887,6 +2044,7 @@ async def _handle_options_submit(payload: dict, channel: str, msg_ts: str) -> No
             target_slot_name=_pinned_slot_name,
             route_pinned=_route_pinned,
             asker_key=_asker_key,
+            links_generation=links_generation,
         )
     )
     _orch._handler_tasks.add(t)
@@ -1902,8 +2060,19 @@ async def _handle_options_submit(payload: dict, channel: str, msg_ts: str) -> No
     )
 
 
-async def _handle_options(payload: dict, action: dict, channel: str, msg_ts: str) -> None:
-    """User picked an OPTIONS choice — delete footer, post styled selection."""
+async def _handle_options(
+    payload: dict,
+    action: dict,
+    channel: str,
+    msg_ts: str,
+    *,
+    links_generation: int | None = None,
+) -> None:
+    """User picked an OPTIONS choice — delete footer, post styled selection.
+
+    *links_generation*: the envelope's receipt generation (see :func:`dispatch`),
+    forwarded to every agent turn this starts.
+    """
     choice = action.get("value", "")
     # Overflow menus nest the value under selected_option
     if not choice:
@@ -1936,6 +2105,7 @@ async def _handle_options(payload: dict, action: dict, channel: str, msg_ts: str
             "Action button clicked",
             action_id_value,
             blocks,
+            links_generation=links_generation,
         )
         return
 
@@ -1972,6 +2142,7 @@ async def _handle_options(payload: dict, action: dict, channel: str, msg_ts: str
             "Action element selected",
             action_id_value,
             blocks,
+            links_generation=links_generation,
         )
         return
 
@@ -2137,6 +2308,7 @@ async def _handle_options(payload: dict, action: dict, channel: str, msg_ts: str
             target_slot_name=_pinned_slot_name,
             route_pinned=_route_pinned,
             asker_key=_asker_key,
+            links_generation=links_generation,
         )
     )
     _orch._handler_tasks.add(t)
@@ -2861,8 +3033,15 @@ async def _handle_resume_choice(
     msg_ts: str,
     user_id: str,
     mode: str,
+    *,
+    links_generation: int | None = None,
 ) -> None:
-    """Dispatch session resume to thread or DM based on user choice."""
+    """Dispatch session resume to thread or DM based on user choice.
+
+    *links_generation* is the Slack-link generation read at the envelope's
+    receipt; the link written below presents it and is skipped -- map AND
+    dashboard -- when it has moved (see :func:`_slack_links_stale`).
+    """
     if not is_owner(user_id):
         logger.warning("resume_choice rejected: non-owner %s", user_id)
         sel().log_api_access(
@@ -2969,7 +3148,48 @@ async def _handle_resume_choice(
             return
 
         # Link session
-        _orch.sessions.set_slack_link(session_key, link_ts, link_channel)
+        #
+        # The resume posted its header through several awaits (the resume lock,
+        # the governance gate, ``post_message`` / ``open_dm``). A workspace-
+        # switching Reconnect inside that window swept every persisted Slack
+        # destination; linking now would republish this one under the new
+        # workspace. The map refuses on its own when handed the generation, but
+        # the dashboard link has no fence of its own, so both are skipped
+        # together on the same decision.
+        if _slack_links_stale(_orch.sessions, links_generation):
+            logger.warning(
+                "slack: session %s resumed but not linked: the Slack workspace changed "
+                "while the resume was in flight",
+                session_key,
+            )
+            sel().log_api_access(
+                caller=user_id,
+                operation="slack.session_resume",
+                outcome="refused",
+                source="slack",
+                resources=session_key,
+                error="slack workspace changed during resume",
+            )
+            return
+        if not _orch.sessions.set_slack_link(
+            session_key, link_ts, link_channel, generation=links_generation
+        ):
+            # Refused by the map itself (the generation moved after the check
+            # above, or the link table is held by a workspace switch): nothing
+            # was persisted, so nothing is linked or announced.
+            logger.warning(
+                "slack: session %s resumed but not linked: the link write was refused",
+                session_key,
+            )
+            sel().log_api_access(
+                caller=user_id,
+                operation="slack.session_resume",
+                outcome="refused",
+                source="slack",
+                resources=session_key,
+                error="slack link write refused",
+            )
+            return
         sel().log_api_access(
             caller=user_id,
             operation="slack.session_resume",
@@ -2979,7 +3199,19 @@ async def _handle_resume_choice(
         )
         if _orch.dashboard_state:
             slot_name = session_key.split(":", 1)[-1] if ":" in session_key else session_key
-            _orch.dashboard_state.link_slack(slot_name, link_ts, link_channel)
+            # Only a session with an OPEN tab has a dashboard copy to redraw;
+            # a resume without one is the ordinary case, not a refusal.
+            if slot_name in _orch.dashboard_state._slots and not _orch.dashboard_state.link_slack(
+                slot_name, link_ts, link_channel
+            ):
+                # The map is authoritative and was written above; the
+                # dashboard's own copy follows the map on its next rebuild, so
+                # a refused redraw is noted, not fatal.
+                logger.warning(
+                    "slack: session %s linked in the map but the dashboard slot "
+                    "redraw was refused",
+                    session_key,
+                )
 
         # Post last 5 messages as context
         try:
@@ -3191,6 +3423,11 @@ async def _handle_inline_stop(
             resources=session_key,
         )
         return
+    # The orchestrator for THIS click, pinned once: the stop callbacks below run
+    # later, from the session manager, and must not re-read the module global
+    # (mypy also cannot carry the guard's narrowing into them).
+    orch = _orch
+    sessions = _orch.sessions
 
     sel().log_api_access(
         caller=user_id,
@@ -3201,32 +3438,32 @@ async def _handle_inline_stop(
     )
 
     # Immediate feedback — update the working message to show stopping
-    if _orch.slack and channel and msg_ts:
+    if orch.slack and channel and msg_ts:
         try:
-            await _orch.slack.update_message(channel, msg_ts, text="⏹ _Stopping…_")
+            await orch.slack.update_message(channel, msg_ts, text="⏹ _Stopping…_")
         except Exception:
             pass
 
     async def _on_soft() -> None:
-        if _orch.slack and channel and msg_ts:
+        if orch.slack and channel and msg_ts:
             try:
-                await _orch.slack.update_message(channel, msg_ts, text="⏹ Execution stopped.")
+                await orch.slack.update_message(channel, msg_ts, text="⏹ Execution stopped.")
             except Exception:
                 pass
 
     async def _on_hard() -> None:
-        if _orch.slack and channel and msg_ts:
+        if orch.slack and channel and msg_ts:
             try:
-                await _orch.slack.update_message(
+                await orch.slack.update_message(
                     channel, msg_ts, text="⛔ Execution stopped — session reset."
                 )
             except Exception:
                 pass
 
-    outcome = await _orch.sessions.stop_turn(session_key, on_soft=_on_soft, on_hard=_on_hard)
-    if outcome == "idle" and _orch.slack and channel and msg_ts:
+    outcome = await sessions.stop_turn(session_key, on_soft=_on_soft, on_hard=_on_hard)
+    if outcome == "idle" and orch.slack and channel and msg_ts:
         try:
-            await _orch.slack.update_message(channel, msg_ts, text="⏹ Nothing running.")
+            await orch.slack.update_message(channel, msg_ts, text="⏹ Nothing running.")
         except Exception:
             pass
     sel().log_tool_invocation(
@@ -3652,10 +3889,18 @@ async def _handle_review_revise(payload: dict, action: dict) -> None:
     )
 
 
-async def _handle_review_revise_submit(payload: dict) -> None:
-    """Take revision feedback, send to LLM with draft context, post new ephemeral draft."""
+async def _handle_review_revise_submit(
+    payload: dict, *, links_generation: int | None = None
+) -> None:
+    """Take revision feedback, send to LLM with draft context, post new ephemeral draft.
+
+    *links_generation*: the submission envelope's receipt generation (see
+    :func:`dispatch`), presented by the agent turn this starts.
+    """
     if not _orch or not _orch.slack:
         return
+    # Pinned for the fire-and-forget task below (see ``_handle_inline_stop``).
+    orch = _orch
     # Inbound channels-governance gate (same rationale as the edit-submit handler):
     # a hot-reload deny after the modal opened must stop a revise from driving a
     # new LLM turn + posting on the denied Slack channel.
@@ -3716,21 +3961,22 @@ async def _handle_review_revise_submit(payload: dict) -> None:
     async def _do_revise() -> None:
         try:
             await handle_message(
-                _orch.slack,  # type: ignore[arg-type]
-                _orch.sessions,  # type: ignore[arg-type]
+                orch.slack,  # type: ignore[arg-type]
+                orch.sessions,  # type: ignore[arg-type]
                 channel,
                 revision_prompt,
                 thread_ts,
                 thread_ts,  # msg_ts = thread_ts for revision
                 caller,
                 approval_mode=APPROVAL_INTERACTIVE,
-                context_builder=_orch.ctx_builder,
-                cron_service=_orch.cron_svc,
-                conversation_log=_orch.conv_log,
-                consolidator=_orch.consolidator,
-                subagent_manager=_orch.subagent_mgr,
-                task_runner=_orch.task_runner,
+                context_builder=orch.ctx_builder,
+                cron_service=orch.cron_svc,
+                conversation_log=orch.conv_log,
+                consolidator=orch.consolidator,
+                subagent_manager=orch.subagent_mgr,
+                task_runner=orch.task_runner,
                 channel_activation=ACTIVATION_REVIEW,
+                links_generation=links_generation,
             )
             logger.info("Review revision requested by %s in %s", caller, channel)
         except Exception:

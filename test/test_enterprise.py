@@ -154,6 +154,14 @@ def test_allowlist_rejects_unlisted_enterprise(tmp_path):
     _write_allowlist(tmp_path, ["E_GOOD"])
     with _install_fake_slack_sdk(resp):
         assert enterprise.validate_enterprise("xoxb-token") is False
+    # A REFUSED workspace leaves no cached identity behind: the gateway's
+    # switch detection compares ``validated_team_id()`` with the workspace the
+    # persisted Slack destinations were written under, and a refused
+    # workspace left here would have it sweep them for a workspace that never
+    # connected.
+    assert enterprise.validated_team_id() == ""
+    assert enterprise._validated_enterprise_id == ""
+    assert enterprise._validated_self_bot_id == ""
 
 
 def test_auth_test_failure_reader_exception_fails_closed_not_crash(tmp_path):
@@ -557,6 +565,7 @@ def test_governance_posture_blocks_workspace_outside_policy(tmp_path):
         _write_allowlist(tmp_path, [])
         with _install_fake_slack_sdk(resp):
             assert enterprise.validate_enterprise("xoxb-token") is False
+        assert enterprise.validated_team_id() == ""  # the refusal takes the cache back too
     finally:
         ctx_mod.reset_context()
 

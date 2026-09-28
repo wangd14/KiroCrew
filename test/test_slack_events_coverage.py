@@ -806,7 +806,10 @@ class TestInitSocketMode:
         gateway_src = (Path(ev.__file__).resolve().parent / "gateway.py").read_text(
             encoding="utf-8"
         )
-        assert "await init_socket_mode(self, seen)" in gateway_src
+        assert (
+            "await init_socket_mode(self, seen, web_api_client=self._slack_boot_client)"
+            in gateway_src
+        )
         assert not re.search(r"to_thread\(\s*init_socket_mode", gateway_src)
 
 
@@ -848,7 +851,9 @@ class TestOnEventDispatch:
         ) as dispatch:
             await on_event(_client(), _req("interactive", {"action": "x"}))
             await _drain(orch)
-        dispatch.assert_awaited_once_with({"action": "x"})
+        # The receipt generation rides along; this double's session map reports
+        # no integer generation, so the listener hands ``None`` down (unfenced).
+        dispatch.assert_awaited_once_with({"action": "x"}, links_generation=None)
 
     @pytest.mark.asyncio
     async def test_update_pause_refuses_before_interaction_ack(self):
@@ -2897,3 +2902,49 @@ class TestHandleSlashRespondBlocks:
         finally:
             ev.SLASH_REGISTRY.pop("zzcovnourl", None)
         assert posted == []
+
+
+class TestEnvelopeOwnerBinding:
+    """The authorization subject is bound per envelope beside the client
+    (``slack.affinity``): a Reconnect that rebinds the handler module's owner
+    to another workspace's does not reach a turn the former socket received."""
+
+    @pytest.mark.asyncio
+    async def test_an_envelope_is_authorized_against_the_owner_its_socket_was_built_with(self):
+        from kiro_crew.slack import affinity, handler
+
+        seen: dict[str, object] = {}
+
+        async def _fake_dispatch(payload, *, links_generation=None):
+            # Runs in the task the listener spawns for an interactive envelope:
+            # the binding is inherited by the task, and by tasks IT spawns.
+            seen["owner"] = affinity.bound_owner().owner_id
+            seen["former_is_owner"] = handler.is_owner("U0FORMER")
+            seen["new_is_owner"] = handler.is_owner("U0NEWOWNER")
+
+            async def _spawned() -> None:
+                seen["spawned_owner"] = affinity.bound_owner().owner_id
+
+            await asyncio.create_task(_spawned())
+
+        orch = _socket_orch()
+        orch._owner_id = "U0FORMER"
+        on_event = await _install_on_event(orch, ev.SeenCache())
+        handler.set_owner_id("U0NEWOWNER")  # the Reconnect lands before dispatch
+        try:
+            with patch("kiro_crew.slack.events.dispatch_interactive", _fake_dispatch):
+                await on_event(_client(), _req("interactive", {"action": "x"}))
+                await _drain(orch)
+        finally:
+            handler.set_owner_id("")
+        assert seen == {
+            "owner": "U0FORMER",
+            "former_is_owner": True,
+            "new_is_owner": False,
+            "spawned_owner": "U0FORMER",
+        }
+        assert affinity.bound_owner() is affinity.UNBOUND
+        # The authority the listener binds is the one the orchestrator holds,
+        # so the gateway's revoke reaches every envelope this socket delivers.
+        assert isinstance(orch._slack_socket_authority, affinity.SocketAuthority)
+        assert orch._slack_socket_authority.owner_id == "U0FORMER"

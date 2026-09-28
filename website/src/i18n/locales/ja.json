@@ -15498,7 +15498,13 @@
         "reconnect_enterprise_validation_failed": "この Slack ワークスペースは許可されたエンタープライズ組織に含まれていません。下でリストを更新して保存し、「再接続」をクリックしてください。",
         "reconnect_denied_by_policy": "このマシンのチャンネルポリシーにより、Slack への接続は許可されていません。",
         "reconnect_failed_reason": "再接続に失敗しました: {{reason}}",
-        "saved_reconnect_and_restart": "保存されました。「再接続」をクリックするとトークンが適用されます。スラッシュコマンドにはゲートウェイの再起動が引き続き必要です。"
+        "saved_reconnect_and_restart": "保存されました。「再接続」をクリックするとトークンが適用されます。スラッシュコマンドにはゲートウェイの再起動が引き続き必要です。",
+        "reconnect_previous_client_close_failed": "以前の Slack 接続を閉じられなかったため、Slack は無効のままです。誰も認可されず、返信もできません。復旧するにはゲートウェイを再起動してください。「再接続」をもう一度クリックしても成功する場合があります。",
+        "reconnect_workspace_identity_unverified": "Slack がこれらのトークンの所属ワークスペースを確認できなかったため、接続は行われず、保存済みの Slack の会話はそのまま残っています。「再接続」をもう一度クリックしてください。",
+        "reconnect_workspace_identity_unrecorded": "{{productName}} がこれらのトークンの所属する Slack ワークスペースを保存できなかったため、接続は行われませんでした。{{productName}} のデータフォルダーに書き込めることを確認してから、「再接続」をもう一度クリックしてください。",
+        "reconnect_workspace_switch_too_large": "これらのトークンは別の Slack ワークスペースのもので、このインストールには {{productName}} が一度の切り替えで安全に退避できる数を超える保存済み Slack 会話があるため、何も変更されませんでした。不要になった Slack 会話をそれぞれのチャットから切断してから、もう一度「再接続」をクリックしてください。",
+        "reconnect_workspace_switch_unrecordable": "これらのトークンは別の Slack ワークスペースのもので、保存済みの Slack 会話のひとつに {{productName}} が安全に退避できない記録があるため、何も変更されませんでした。その会話をチャットから切断してから、もう一度「再接続」をクリックしてください。",
+        "reconnect_workspace_record_unreadable": "保存済みの会話がどの Slack ワークスペースに属するかの記録が壊れていたため、{{productName}} は接続を行いませんでした。{{productName}} のデータフォルダーにある slack_workspace.json を修復または削除してから、「再接続」をもう一度クリックしてください。"
       },
       "sttSettings": {
         "language_auto": "言語を自動検出",

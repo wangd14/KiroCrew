@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useImeGuard } from '../../hooks/useImeGuard'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ExternalLink, Check, AlertTriangle, Plus, X, Lock, RefreshCw } from 'lucide-react'
+import { ExternalLink, Check, AlertTriangle, Plus, X, Lock, RefreshCw, Loader2 } from 'lucide-react'
 import { SlackIcon } from '../../components/SlackIcon'
 import { SettingsSection, SettingsCard, SettingsInput, SettingsToggle } from '../../components/settings'
 import { SecretField } from '../../components/SecretField'
@@ -78,8 +78,38 @@ function describeConnectError(code: string): string {
       return i18nT('pages.settings.slackPanel.reconnect_enterprise_validation_failed')
     case 'denied_by_policy':
       return i18nT('pages.settings.slackPanel.reconnect_denied_by_policy')
+    case 'previous_client_close_failed':
+      return i18nT('pages.settings.slackPanel.reconnect_previous_client_close_failed')
+    case 'workspace_identity_unverified':
+      return i18nT('pages.settings.slackPanel.reconnect_workspace_identity_unverified')
+    case 'workspace_identity_unrecorded':
+      return i18nT('pages.settings.slackPanel.reconnect_workspace_identity_unrecorded')
+    case 'workspace_record_unreadable':
+      return i18nT('pages.settings.slackPanel.reconnect_workspace_record_unreadable')
+    case 'workspace_switch_too_large':
+      return i18nT('pages.settings.slackPanel.reconnect_workspace_switch_too_large')
+    case 'workspace_switch_unrecordable':
+      return i18nT('pages.settings.slackPanel.reconnect_workspace_switch_unrecordable')
     default:
       return i18nT('pages.settings.slackPanel.slack_connection_failed_at_startup', { error: code })
+  }
+}
+
+/**
+ * Did the gateway itself answer this failed request? Its refusals -- 403 from a
+ * remote session, 500 when the credential store could not be read, 503 with no
+ * Slack socket owner -- are JSON with an `error` (and a `code`), already
+ * unwrapped into `message`. A proxy that could not reach the gateway, or a
+ * gateway that fell over mid-request, answers with text or HTML instead; the
+ * status alone cannot tell the two 5xx apart, the body's shape can.
+ */
+function gatewayAnswered(e: unknown): e is ApiError {
+  if (!(e instanceof ApiError) || !e.message) return false
+  try {
+    const parsed: unknown = JSON.parse(e.body)
+    return typeof parsed === 'object' && parsed !== null && typeof (parsed as { error?: unknown }).error === 'string'
+  } catch {
+    return false
   }
 }
 
@@ -288,7 +318,10 @@ export function SlackPanel() {
     onSuccess: (res, vars) => {
       setSaved(true)
       setRestartHint(!!res.restart_required)
-      setReconnectHint(!!res.reconnect_required)
+      // Accumulates: a later save that touched only config fields must not
+      // hide the reminder that credentials saved earlier are still not in
+      // effect. Only a successful Reconnect clears it (reconnectMut).
+      setReconnectHint(prev => prev || !!res.reconnect_required)
       // The header's reconnect reading described the OLD credentials.
       if (res.reconnect_required) setReconnectResult(null)
       setVerifyWarning(res.verify_warning || '')
@@ -303,12 +336,12 @@ export function SlackPanel() {
   const reconnectMut = useMutation({
     mutationFn: () => api.reconnectSlack(),
     onError: (e: unknown) => {
-      // A refusal the gateway itself answered (403 from a remote session, 503
-      // with no Slack socket owner) carries its own reason, already unwrapped
-      // by the API client. Anything else -- the request never got an answer,
-      // a proxy or the gateway fell over -- is one plain question.
-      const own = e instanceof ApiError && e.status < 500 && e.message
-      setReconnectError(own ? e.message : i18nT('pages.settings.slackPanel.reconnect_failed_is_the_gateway_running'))
+      // A refusal the gateway itself answered carries its own reason and its
+      // own remedy (a writable data folder, a gateway that owns a Slack
+      // socket); asking whether a gateway that just answered is running would
+      // hide both. Only a request that never got the gateway's answer -- a
+      // proxy or the gateway fell over -- is the one plain question.
+      setReconnectError(gatewayAnswered(e) ? e.message : i18nT('pages.settings.slackPanel.reconnect_failed_is_the_gateway_running'))
     },
     onSuccess: (res) => {
       setReconnectResult(res)
@@ -357,11 +390,19 @@ export function SlackPanel() {
   // A failed click is labelled as the click's outcome: the reason is often the
   // very text that was on screen before (the same tokens, still rejected), and
   // without the prefix nothing shows that the attempt ran at all.
-  const startupError = reconnectResult
-    ? (reconnectResult.connected
-      ? ''
-      : i18nT('pages.settings.slackPanel.reconnect_failed_reason', { reason: describeConnectError(reconnectResult.connect_error) }))
-    : connectError(data)
+  // One problem at a time: while a request-level failure is on screen (the
+  // gateway never answered), the connect error the gateway recorded earlier
+  // is not the thing to fix first, and two notices stacked read as two
+  // problems. It comes back when the next click gets an answer. And while a
+  // click is in flight the previous failure steps aside too: "Reconnecting…"
+  // beside a red "failed" reads as the retry already having failed.
+  const startupError = reconnectError || reconnectMut.isPending
+    ? ''
+    : reconnectResult
+      ? (reconnectResult.connected
+        ? ''
+        : i18nT('pages.settings.slackPanel.reconnect_failed_reason', { reason: describeConnectError(reconnectResult.connect_error) }))
+      : connectError(data)
   const hint = reconnectResult ? '' : connectionHint(data)
   const reconnected = !!reconnectResult?.connected
   // One button, rendered twice: beside the status pill, and beside the save
@@ -374,8 +415,16 @@ export function SlackPanel() {
       aria-busy={reconnectMut.isPending || undefined}
       title={i18nT('pages.settings.slackPanel.reconnect_desc')}
       data-testid={testId}
+      // Never wraps: beside a long save confirmation the label would otherwise
+      // break into a column; the confirmation text is what wraps.
+      className="whitespace-nowrap flex-none"
     >
-      <RefreshCw size={13} className={reconnectMut.isPending ? 'animate-spin' : undefined} />
+      {/* The two-arrow refresh glyph reads as "try again" at 13px, which is
+          what this control does. (A plug was tried and read as a padlock --
+          a locked, switched-off control -- to a cold reader.) SecretField's
+          restore control beside the token fields uses a single reverse arrow
+          with no label; this one is labelled, so the two do not collide. */}
+      {reconnectMut.isPending ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
       {reconnectMut.isPending ? i18nT('pages.settings.slackPanel.reconnecting') : i18nT('pages.settings.slackPanel.reconnect')}
     </Btn>
   )
@@ -409,8 +458,12 @@ export function SlackPanel() {
               persisted) and the unsaved `draft` (owner id, enterprise allow-list,
               command, session folder) live in this panel's local state —
               navigating to the chat would discard them. */}
+          {/* Neither notice is dismissible, like the save's own error below:
+              both clear when the next Reconnect click gets an answer, and one
+              closable notice next to one that is not reads as two kinds of
+              warning. */}
           <ErrorNotice message={startupError} className="mt-2" />
-          <ErrorNotice message={reconnectError} className="mt-2" onDismiss={() => setReconnectError('')} />
+          <ErrorNotice message={reconnectError} className="mt-2" />
           {hint && (
             <p className="text-[12px] text-warn mt-1 flex items-center gap-1.5">
               <AlertTriangle size={12} className="flex-none" />
@@ -587,12 +640,13 @@ export function SlackPanel() {
 
       {/* ── Save (hidden on read-only remote sessions) ── */}
       {!ro && <div className="flex items-center gap-3 mt-1 mb-4">
-        <Btn primary onClick={handleSave} disabled={saveMut.isPending}>
+        {/* The row's buttons never wrap; the confirmation text beside them does. */}
+        <Btn primary onClick={handleSave} disabled={saveMut.isPending} className="whitespace-nowrap flex-none">
           {saveMut.isPending ? i18nT('pages.settings.slackPanel.saving') : i18nT('pages.settings.slackPanel.save_slack_settings')}
         </Btn>
         {saved && (
-          <span className="inline-flex items-center gap-1.5 text-[12px] text-ok">
-            <Check size={14} /> {savedText(tokensVerified, reconnectHint, restartHint)}
+          <span className="inline-flex items-start gap-1.5 text-[12px] text-ok min-w-0">
+            <Check size={14} className="flex-none mt-px" /> <span>{savedText(tokensVerified, reconnectHint, restartHint)}</span>
           </span>
         )}
         {/* Stays after the confirmation fades, until a reconnect succeeds: the

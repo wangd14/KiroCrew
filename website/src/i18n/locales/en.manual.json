@@ -6599,7 +6599,13 @@
         "reconnect_enterprise_validation_failed": "This Slack workspace is not in the allowed enterprise orgs. Update the list below and save, then click Reconnect.",
         "reconnect_denied_by_policy": "A channels policy on this machine does not allow Slack to connect.",
         "reconnect_failed_reason": "Reconnect failed: {{reason}}",
-        "saved_reconnect_and_restart": "Saved. Click Reconnect to apply the tokens; the slash command still needs a gateway restart."
+        "saved_reconnect_and_restart": "Saved. Click Reconnect to apply the tokens; the slash command still needs a gateway restart.",
+        "reconnect_previous_client_close_failed": "The previous Slack connection could not be closed, so Slack was left disabled: it authorizes nobody and cannot reply. Restart the gateway to recover; clicking Reconnect again may also succeed.",
+        "reconnect_workspace_identity_unverified": "Slack did not confirm which workspace these tokens belong to, so nothing was connected and the saved Slack conversations were kept. Click Reconnect again.",
+        "reconnect_workspace_identity_unrecorded": "{{productName}} could not save which Slack workspace these tokens belong to, so nothing was connected. Check that the {{productName}} data folder is writable, then click Reconnect again.",
+        "reconnect_workspace_switch_too_large": "These tokens belong to a different Slack workspace, and this install has more saved Slack conversations than {{productName}} can safely set aside in one switch, so nothing was changed. Disconnect Slack conversations you no longer need from their chats, then click Reconnect again.",
+        "reconnect_workspace_switch_unrecordable": "These tokens belong to a different Slack workspace, and one of the saved Slack conversations has a record {{productName}} could not set aside safely, so nothing was changed. Disconnect that conversation from its chat, then click Reconnect again.",
+        "reconnect_workspace_record_unreadable": "{{productName}} found a damaged record of which Slack workspace the saved conversations belong to, so nothing was connected. Repair or remove slack_workspace.json in the {{productName}} data folder, then click Reconnect again."
       },
       "botChannelPanel": {
         "bot_token": "{{channel}} bot token",
