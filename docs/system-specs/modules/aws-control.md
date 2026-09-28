@@ -461,6 +461,122 @@ an archive-level comparison reports "changed" every night. Reading it from the p
 rather than by a second walk of the source also means it cannot disagree with what would
 actually be sent, and that a redaction switch changes the fingerprint.
 
+**Every read of the archive comes from ONE descriptor, and so does the upload.** The
+archive is staged under `storage.staging_root()` -- the `aws-control-staging` leaf the
+sandbox masks -- and NOT in the shared temp root, which excludes other USERS and not the
+same-UID agent this module's sandbox notes describe planting links in. Each step that
+re-resolved the archive's NAME was a step at which a substituted file could be measured
+or sent instead. `storage.pinned_staging` cuts its directory inside that masked root and
+holds it open, `backup._create_pinned_archive_fd` creates the archive relative
+to that descriptor with `O_EXCL | O_NOFOLLOW` (an entry already at the name fails the
+create rather than becoming what the tar writes through), and the entry-set digest, the
+recorded size, the body digest and `storage.put_file`'s body all come from that one
+descriptor.
+
+The location and the pin answer different threats, and neither covers the other. The pin
+fixes which inode a name reaches, so it defeats a rename, an unlink and a planted link;
+it cannot defeat a WRITE, because a sibling agent that rewrites the staged archive
+changes the very inode the descriptor holds. Every digest and the upload would then read
+the substituted bytes and agree with each other, and the run would record a successful
+backup of a file it never built -- with retention free to prune the valid predecessor,
+and no measurement left that could notice. The masked root removes the writer instead of
+detecting the write: inside another agent's namespace that leaf is an empty bound
+directory, so the archive has no name there to open. `storage.STAGING_DIR_LEAF` being a
+member of `sandbox._CREW_HIDDEN_LEAVES` is what makes that true, and it is pinned as such
+rather than assumed, because no in-process test can observe a mount namespace.
+
+**That argument is Linux-only, and every other platform fails closed.** The mount
+namespace and the mask exist only on Linux; macOS, the BSDs and Windows have no such
+mask, and `staging_root` there falls back to `restrict_dir_to_owner`, which excludes
+other USERS and not the same-UID agent process this module's threat model assumes. Nor
+can a name-passed body be held for the whole transfer on those platforms: the span from
+the file existing to the upload finishing holds the tar write, the entry-set digest and
+two network round trips, and a same-user process that rewrites the inode anywhere in it
+is invisible to every later check, because they all read the one descriptor and so agree
+with whatever it now holds. A named deny-write handle would cover only the instant it is
+taken, not that span. So the sessions archive is produced into a nameless Linux
+`O_TMPFILE` inode where it can be (no name, no `/proc` alias to reopen, for the
+descriptor's whole life), and on every other platform `backup._create_pinned_archive_fd`
+fails closed rather than stage a body only point-in-time safe. That refusal is surfaced
+up front by `kind_unavailable_reason(KIND_SESSIONS)`, so the kind reports itself
+unavailable rather than raising mid-build. Restoring those platforms with a
+producer-owned, write-sealed body is out of scope here and tracked as a follow-up.
+
+The SNAPSHOT path cannot be covered that way, and it refuses instead. Its payload is
+created and closed by name by `snapshot_main` and `snapshot.prepare_redacted_copy` before
+this module can open it, so the unguarded span is a whole snapshot build plus a redaction
+copy rather than an instant, and nothing available afterwards can see into it: a
+same-user replacement is a regular file with one name and the right owner, which is all
+`backup._open_pinned_archive_fd` can check, and the fingerprint and the upload then read
+that descriptor and agree with each other. So
+`backup._refuse_snapshot_without_a_producer_held_payload` stops the run BEFORE the build,
+gated on `storage.body_bytes_can_be_held_from_creation()` -- named for the property, not
+the platform, so a platform that gains an equivalent mask changes one line rather than
+every caller. Refusing is the conservative direction: an operator with no backup knows
+they have none, while one with a substituted backup believes they are covered and finds
+out at restore, off-host, with nothing to compare against.
+
+The refusal alone would be a poor answer, because it arrives INSIDE the run: the route
+would create a record, the worker would raise, and the owner would read a failed backup
+where the truthful answer is a feature this host does not offer. So the same condition is
+readable before any of that, through `backup.kind_unavailable_reason(KIND_SNAPSHOT)`,
+which the route already asks and turns into a 501 carrying the refusal's own words. Both
+kinds answer there, each for its own capability -- the sessions kind for descriptor-pinned
+traversal, the snapshot kind for holding its payload from creation -- so neither speaks for
+the other, and the snapshot refusal's prose makes no claim about whether the sessions kind
+runs here. It usually does not: a platform reaching this refusal has no mask, and the same
+platform typically lacks `openat`, so both kinds are refused for separate stated reasons.
+Restoring the snapshot capability is tracked as producer-owned deny-write handles for both
+snapshot producers.
+
+The sessions ARCHIVE is held only where the hold lasts the WHOLE transfer, and where it
+cannot be it is refused before the run rather than mid-build. The property required is
+transfer-lifetime, not point-in-time: the upload streams for minutes, so a same-user
+process that spawns after any check could rewrite a body that still has a name. Only a
+confined Linux host with `O_TMPFILE` provides it -- `backup._create_pinned_archive_fd`
+produces the archive into a nameless inode with no directory entry, and the sandbox mask
+makes its `/proc/<pid>/fd` alias unreachable, so no same-user process can rewrite the
+bytes however long the transfer runs. Every OTHER platform fails closed, per the ruling:
+Windows, macOS, the BSDs, an unconfined Linux host, and a confined one whose staging
+filesystem does not honour `O_TMPFILE` all lack a transfer-lifetime hold (a named
+deny-write handle is only point-in-time safe against an agent that reopens the name
+mid-stream), so the sessions kind reports itself unavailable through
+`backup.kind_unavailable_reason(KIND_SESSIONS)` and `run_sessions_backup` refuses up front.
+This is the scoped fail-closed, keyed to the missing capability rather than a broad
+refusal of every unmasked-POSIX upload. `storage.can_hold_upload_body_from_creation()` is
+the predicate both read; restoring the other platforms with a producer-owned sealed body
+is tracked as a follow-up.
+
+The snapshot path takes the same hold through
+`backup._open_pinned_archive_fd`, which is an `O_NOFOLLOW` open plus an `fstat`
+requiring a singly-named regular file this process owns, because `snapshot_main` and
+`snapshot.prepare_redacted_copy` create their own files. `backup._read_at` is what
+lets two readers share the descriptor: `os.dup` would share the file OFFSET and leave
+the upload positioned at the end, so the archive is read by explicit offset instead --
+`os.pread` where the platform has it, and otherwise a seek that restores the caller's
+position in a `finally`, since Windows provides no `pread`.
+
+`storage.put_file` carries the other half. It takes `body_fd` from a caller that has
+already opened and checked its payload, and otherwise opens `local_path` itself
+(`storage._verified_body_fd`) -- which is what protects the callers with no fingerprint
+of their own, the label sidecar and the library push. The body reaches the AWS CLI as
+`--body /dev/stdin` with that descriptor passed as the child's stdin
+(`engine.run_aws`'s `stdin_fd`), so the child resolves no path at all. Three checks
+stand on the descriptor rather than on the name, each stopping a different
+substitution: `O_NOFOLLOW` a symlink, `st_nlink == 1` a hard link (which defeats the
+other two by construction, being a genuine regular file under the expected name), and
+`S_ISREG` a FIFO -- whose own open would otherwise BLOCK until a writer appeared and
+then upload whatever it sent. A HANDED-OVER descriptor is checked for its kind only:
+holding a descriptor is what fixes its inode, so a link count there would describe how
+many names the inode happens to carry now, which a same-UID process can change without
+touching a byte -- and refusing on it would let anyone who can write the staging
+directory cancel a scheduled backup by unlinking a name nothing reads any more.
+Windows has no `/dev/stdin`, so it passes the name and relies on the pinned directory
+handle, which blocks a rename or delete of the directory and of every directory above
+it; the file's identity is re-verified against the held descriptor afterwards, which
+DETECTS rather than prevents and exists so a substitution is not recorded as a
+successful upload of our bytes.
+
 Two normalizations are part of the digest's definition, each measured against the real
 engine rather than assumed. `_VOLATILE_MANIFEST_FIELDS` drops `created_at` from
 `MANIFEST.json`, the one field `snapshot.py` rewrites on a rebuild of an unchanged tree;

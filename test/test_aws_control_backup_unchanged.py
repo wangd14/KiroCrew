@@ -38,6 +38,25 @@ from kiro_crew.apps.builtins.aws_control.backend import backup
 ACCOUNT = "111122223333"
 
 
+def _stage_on_o_tmpfile_fs(tmp_path, monkeypatch):
+    """Point ``storage.staging_root`` at an O_TMPFILE-capable directory.
+
+    A sessions backup that mocks the mask present expects the archive to be produced
+    into a nameless O_TMPFILE inode; pytest's basetemp is a tmpfs/overlay on some CI
+    runners where O_TMPFILE answers EOPNOTSUPP and the create correctly fails closed.
+    Stage on a filesystem that honours it (as the real data home does), or skip where
+    the host cannot do it anywhere -- the fail-closed behaviour is pinned elsewhere.
+    """
+    from conftest import o_tmpfile_capable_base
+
+    base = o_tmpfile_capable_base(tmp_path)
+    if base is None:
+        pytest.skip("no O_TMPFILE-capable filesystem here; fail-closed has its own tests")
+    root = Path(base) / "kc-aws-staging"
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(backup.storage, "staging_root", lambda: root)
+
+
 def _pack(path: Path, entries: dict[str, bytes], *, dirs: tuple[str, ...] = ()) -> Path:
     """Write a ``tar.gz`` holding exactly *entries* (and any empty *dirs*)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -907,6 +926,21 @@ def _fake_snapshot(body: bytes):
 
 
 class TestRunSnapshotBackupSkip:
+
+    @pytest.fixture(autouse=True)
+    def _snapshot_payload_can_be_held(self, monkeypatch):
+        """These tests are about the snapshot LOGIC, not the platform gate.
+
+        ``run_snapshot_backup`` refuses outright where the staging leaf has no
+        sandbox mask, because the payload is produced by another module and cannot be
+        held from creation there. That refusal has its own tests. Everything in this
+        class is about what the snapshot path DOES once it runs -- retention, skips,
+        fingerprints, records -- so it asserts the capability rather than inheriting
+        whichever platform the suite happens to run on. Without this the same tests
+        would measure behaviour on POSIX and measure the refusal on Windows.
+        """
+        monkeypatch.setattr(backup.storage, "body_bytes_can_be_held_from_creation", lambda: True)
+
     @pytest.fixture(autouse=True)
     def _isolated_state(self, tmp_path, monkeypatch):
         monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
@@ -1090,6 +1124,10 @@ class TestRunSessionsBackupSkip:
         # the archive's fingerprint across runs, so it must not depend on whatever
         # live terminal store the test host happens to have.
         monkeypatch.setattr(backup, "_kiro_cli_conversation_db", lambda: (None, ""))
+        # The archive body is held from creation only on a confined host; set the
+        # mask present so these skip/change cases run rather than refuse up front.
+        monkeypatch.setattr(backup.storage, "body_bytes_can_be_held_from_creation", lambda: True)
+        _stage_on_o_tmpfile_fs(tmp_path, monkeypatch)
         self.crew = crew
         yield
 
@@ -1264,6 +1302,20 @@ class TestRetentionComposition:
     delete the recorded key, and whether a run of skips can walk the keep window
     down to it.
     """
+
+    @pytest.fixture(autouse=True)
+    def _snapshot_payload_can_be_held(self, monkeypatch):
+        """These tests are about the snapshot LOGIC, not the platform gate.
+
+        ``run_snapshot_backup`` refuses outright where the staging leaf has no
+        sandbox mask, because the payload is produced by another module and cannot be
+        held from creation there. That refusal has its own tests. Everything in this
+        class is about what the snapshot path DOES once it runs -- retention, skips,
+        fingerprints, records -- so it asserts the capability rather than inheriting
+        whichever platform the suite happens to run on. Without this the same tests
+        would measure behaviour on POSIX and measure the refusal on Windows.
+        """
+        monkeypatch.setattr(backup.storage, "body_bytes_can_be_held_from_creation", lambda: True)
 
     @pytest.fixture(autouse=True)
     def _wiring(self, tmp_path, monkeypatch):

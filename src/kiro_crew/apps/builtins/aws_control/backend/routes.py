@@ -2437,7 +2437,13 @@ async def _handle_backup_run(request: web.Request) -> web.Response:
     # like a broken backup rather than a platform that never offered the feature.
     # 501 and not 400: the request is well-formed and would be honoured on
     # another host, so it is this server that does not implement it.
-    unavailable = backup_mod.kind_unavailable_reason(kind)
+    #
+    # Off the loop: this resolves the sandbox capability, which on a first
+    # macOS request runs a synchronous ``detect_backend`` subprocess probe --
+    # blocking the event loop for the probe's duration. ``asyncio.to_thread`` is
+    # the same offload this module already uses for every other blocking call
+    # (e.g. ``publish_denied_reason`` above).
+    unavailable = await asyncio.to_thread(backup_mod.kind_unavailable_reason, kind)
     if unavailable is not None:
         return web.json_response(
             {"error": unavailable, "code": "kind_unavailable_on_platform"}, status=501

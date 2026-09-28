@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import logging
+from pathlib import Path
 from unittest import mock
 from unittest.mock import AsyncMock
 
@@ -54,6 +55,13 @@ def _isolated_backup_state(tmp_path, monkeypatch):
     the key's SHAPE rather than of this fixture.
     """
     monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+    # kind_unavailable_reason(SESSIONS) now gates on the archive body being holdable
+    # from creation (a confined-Linux + O_TMPFILE capability) as well as on pinned
+    # traversal. Every test host here is unconfined, so default that capability
+    # present -- these tests exercise pinning, grants and the redaction gap, not the
+    # held-body gate, and the tests that DO exercise it patch it themselves.
+    monkeypatch.setattr(backup.storage, "can_hold_upload_body_from_creation", lambda: True)
+    monkeypatch.setattr(backup.storage, "body_bytes_can_be_held_from_creation", lambda: True)
     backup._unpersisted_runs.clear()
     yield
     backup._unpersisted_runs.clear()
@@ -113,7 +121,10 @@ class TestTheTranscriptWindowIsItsOwn:
         to False and therefore overrides this fixture.
         """
         with mock.patch.object(backup, "_CAN_PIN_TRAVERSAL", True):
-            yield
+            with mock.patch.object(
+                backup.storage, "can_hold_upload_body_from_creation", return_value=True
+            ):
+                yield
 
     def test_authorized_and_never_run_is_due(self):
         backup.set_nightly_sessions(ACCOUNT, True)
@@ -546,6 +557,17 @@ class TestTheGrantIsRereadBeforeTheBytesLeave:
         (crew / "t.jsonl").write_bytes(b"transcript\n")
         monkeypatch.setattr(backup, "data_home", lambda: tmp_path / "crew_home")
         monkeypatch.setattr(backup, "kiro_sessions_dir", lambda: tmp_path / "absent_cli")
+        # Stage on an O_TMPFILE-capable filesystem so the archive is built and the run
+        # reaches the grant gate under test (pytest basetemp is tmpfs/overlay on some
+        # CI runners, where the create would correctly fail closed first).
+        from conftest import o_tmpfile_capable_base
+
+        base = o_tmpfile_capable_base(tmp_path)
+        if base is None:
+            pytest.skip("no O_TMPFILE-capable filesystem here; fail-closed has its own tests")
+        staging = Path(base) / "kc-aws-staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(backup.storage, "staging_root", lambda: staging)
         _authorized_env(monkeypatch)
         _walk_by_name(monkeypatch)
 
@@ -764,16 +786,24 @@ class TestAGrantedButIdleNightlyIsReported:
         # Without this the helper could be a constant refusal and every test above
         # would still pass, which would withhold the nightly everywhere.
         with mock.patch.object(backup, "_CAN_PIN_TRAVERSAL", True):
-            with mock.patch.object(backup, "_unattended_sessions_redaction_gap", return_value=None):
-                assert backup.scheduled_sessions_blocked_reason() is None
+            with mock.patch.object(
+                backup.storage, "can_hold_upload_body_from_creation", return_value=True
+            ):
+                with mock.patch.object(
+                    backup, "_unattended_sessions_redaction_gap", return_value=None
+                ):
+                    assert backup.scheduled_sessions_blocked_reason() is None
 
     def test_the_redaction_gap_is_reported_when_the_host_is_capable(self, monkeypatch):
         # Both causes reach the same reader, so a surface needs only one field.
         with mock.patch.object(backup, "_CAN_PIN_TRAVERSAL", True):
             with mock.patch.object(
-                backup, "_unattended_sessions_redaction_gap", return_value="redaction is on"
+                backup.storage, "can_hold_upload_body_from_creation", return_value=True
             ):
-                assert backup.scheduled_sessions_blocked_reason() == "redaction is on"
+                with mock.patch.object(
+                    backup, "_unattended_sessions_redaction_gap", return_value="redaction is on"
+                ):
+                    assert backup.scheduled_sessions_blocked_reason() == "redaction is on"
 
     def test_the_capability_reason_wins_over_the_redaction_gap(self):
         # Ordered deliberately: the capability is a property of the machine that no
