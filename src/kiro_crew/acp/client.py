@@ -92,7 +92,7 @@ from kiro_crew.acp._dispatch import (
     redact_text,
     tool_call_content_text,
 )
-from kiro_crew.acp._frame_record import record_frame
+from kiro_crew.acp._frame_record import DIRECTION_OUT, record_frame
 from kiro_crew.acp.liveness import (
     EVIDENCE_SAMPLING,
     VERDICT_WORKING,
@@ -9455,7 +9455,8 @@ class AcpClient:
             params = projection.request(method, params)
         req_id = self._next_req_id()
         req = JsonRpcRequest(method=method, params=params, id=req_id)
-        data = json.dumps(req.to_dict()) + "\n"
+        frame = req.to_dict()
+        data = json.dumps(frame) + "\n"
         try:
             # Under the write lock so a response frame waiting behind this
             # (caller-sized, deliberately unbounded) frame measures the
@@ -9465,6 +9466,10 @@ class AcpClient:
                 await self._process.stdin.drain()
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise AcpProcessDied(f"ACP process pipe broken: {exc}") from exc
+        # Recorded only now, after the write call returned: a frame the pipe
+        # refused must not appear in the capture as sent.
+        if self.memory_mode == "persistent":
+            await record_frame(self.backend, frame, len(data), DIRECTION_OUT)
         self._last_activity = time.monotonic()
         return req_id
 
@@ -9524,6 +9529,10 @@ class AcpClient:
             await self._write_response_bounded(data.encode(), request_id)
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise AcpProcessDied(f"ACP process pipe broken: {exc}") from exc
+        # Recorded only now, after the write call returned: a frame the pipe
+        # refused must not appear in the capture as sent.
+        if self.memory_mode == "persistent":
+            await record_frame(self.backend, msg, len(data), DIRECTION_OUT)
         self._last_activity = time.monotonic()
 
     async def _send_error(self, request_id: str | int, code: int, message: str) -> None:
@@ -9542,6 +9551,10 @@ class AcpClient:
             await self._write_response_bounded(data.encode(), request_id)
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise AcpProcessDied(f"ACP process pipe broken: {exc}") from exc
+        # Recorded only now, after the write call returned: a frame the pipe
+        # refused must not appear in the capture as sent.
+        if self.memory_mode == "persistent":
+            await record_frame(self.backend, msg, len(data), DIRECTION_OUT)
         self._last_activity = time.monotonic()
 
     async def _read_message(self, timeout: float = _READ_TIMEOUT) -> JsonRpcMessage | None:
@@ -11213,6 +11226,10 @@ class AcpClient:
                 data.encode(),
                 bound_secs=transport_framing._RESPONSE_WRITE_BOUND_SECS,
             )
+            # Recorded only now: every outcome above put the bytes in the
+            # transport (they differ in drain evidence), while a raise did not.
+            if self.memory_mode == "persistent":
+                await record_frame(self.backend, notification, len(data), DIRECTION_OUT)
             # Only a drained frame is evidence the backend moved: an unlocked
             # append or a stall must not refresh the activity clock the
             # wedged-turn probes read.

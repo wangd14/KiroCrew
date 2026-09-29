@@ -23,7 +23,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import members as members_mod
-from kiro_crew import model_registry
+from kiro_crew import model_registry, prompt_trace
 from kiro_crew.acp.client import AcpModelUnavailable
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
 from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
@@ -7347,6 +7347,19 @@ def _release_closed_execution(
         release_closed_execution()
 
 
+def _forget_prompt_trace_if_unshared(state: DashboardState, closing_key: str) -> None:
+    """Drop the closed session's prompt text unless another live tab still reads it.
+
+    Two live slots can run on one session key (a channel thread routed onto a
+    dashboard owner key, a linked tab): the ring is keyed by that session, so
+    forgetting on the first close would empty the surviving tab's view. Same
+    multiplicity test the execution release two frames up applies.
+    """
+    if any(effective_session_key(live) == closing_key for live in state._slots.values()):
+        return
+    prompt_trace.forget(closing_key)
+
+
 # Ceiling on how long a close waits for this slot's guarded history writes to
 # finish. The wait is bounded so a genuinely stuck write cannot hang the tab
 # close: on breach the close is REFUSED and rolled back, which returns promptly
@@ -7860,7 +7873,12 @@ async def _close_slot(
     # replacement's session no matter which transcript that replacement writes. Skip
     # it if the key is no longer ours.
     if _slot_still_ours(state, name, slot):
-        await state.sessions.remove(_history_key_for(name))
+        try:
+            await state.sessions.remove(_history_key_for(name))
+        finally:
+            # Like the sweep path: a provider shutdown that raises must not leave
+            # the closed tab's verbatim prompt text servable until eviction.
+            _forget_prompt_trace_if_unshared(state, closing_key)
     _release_closed_execution(state, slot, closing_key, closing_execution)
     _sync_dashboard_slots(state)
     state.push_slot_removed(name)
@@ -8232,6 +8250,10 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             logger.warning("Cleanup: session remove failed for %s", name, exc_info=True)
         else:
             _release_closed_execution(state, removed, closing_key, closing_execution)
+        finally:
+            # The tab is archived either way, so its raw prompt text must not
+            # stay readable behind a session teardown that happened to fail.
+            _forget_prompt_trace_if_unshared(state, closing_key)
         archived.append(name)
         # Collect running tasks for concurrent cancellation after the loop
         if removed.running and removed.task is not None:

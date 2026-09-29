@@ -1941,6 +1941,40 @@ The suffix selects only which paths are candidates. `messaging.raster.sniff_rast
 
 The summary carries **no message content** — only counts, types, and sizes — which is a hard requirement (issue #6022): the kiro-cli data dir is fenced precisely because it holds SSO tokens, so the diagnostics must never record block text, image bytes, or tool arguments. This lets an operator tell a stale/invalid model id apart from a structurally malformed payload the next time a turn is rejected as `Improperly formed request` (see the `_RE_MALFORMED_REQUEST` classifier), without ever exposing what the turn contained. The helper is defensive by contract: it never raises into the live prompt path (a malformed block list yields a partial/minimal summary), so a diagnostics failure can never break a turn.
 
+### Opt-in wire recording, both directions (`acp/_frame_record.py`)
+
+`KIROCREW_ACP_RECORD_FRAMES=<dir>` turns on the raw-frame recorder for a
+development run (unset in every ordinary run and in CI: `record_frame` returns
+after one environment lookup). Every agent->client frame the two transports READ
+lands in `<dir>/<backend>.jsonl` — the replay corpus's raw material
+(`test/fixtures/acp_frames/README.md`) — and every client->agent frame they
+WRITE (`session/prompt`, `session/new`, `session/cancel`, permission answers)
+lands in `<dir>/<backend>.out.jsonl`. Two files by construction: the inbound
+file must stay exactly what the backend's stdout carried, while the outbound
+file is a debugging aid ("what did we actually send this turn") the replay test
+never reads. Every stdin writer in `AcpRuntime` (`send_request`,
+`send_notification`, `send_request_for_answer`, `send_response`, `send_error`,
+`_send_and_await`) and `AcpClient` (`_send_request`, `_send_response`,
+`_send_error`, the `session/cancel` notification) records the frame AFTER its
+write call returned — outside the write lock (so the lock's scope, which the
+no-progress bound depends on, is unchanged) but before any suspension point,
+so wire order is preserved — and never on a write that raised: the capture says
+what was sent, and a `BrokenPipeError` must not leave a line claiming a frame
+the backend never received (`test_client_does_not_record_a_frame_the_pipe_refused`,
+`test_runtime_does_not_record_a_frame_the_pipe_refused`). The best-effort
+cancel writer records on every returned outcome — `drained`,
+`appended_unlocked` and `stalled` all put the bytes in the transport and differ
+only in drain evidence. The one residual is the response writers' stall path,
+which raises after the bytes were appended: that frame is then absent from the
+capture rather than falsely present, the better error for a debugging aid.
+Gated on the same restriction the reader path uses
+(`recording_allowed` / `memory_mode == "persistent"`), through the same
+lock-free queue, redaction and owner-only file handling. This is the DURABLE
+capture; the in-memory `prompt_trace` ring the Context tab reads (see
+[metrics](metrics.md)) is the same text without the file. Neither loosens the
+content-free requirement on the DEBUG diagnostics below: those still carry no
+message content in the ordinary log.
+
 ### Turn-boundary loss diagnostics (content-free)
 
 Two places in `AcpSessionHandle.prompt` could destroy or omit a turn's evidence

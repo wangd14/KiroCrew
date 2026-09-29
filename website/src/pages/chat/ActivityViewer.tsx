@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, useMemo, type ReactNode } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState, useCallback, useMemo, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Bot, ScrollText, X, Lock, CheckCircle, AlertCircle, Loader as LoaderIcon, Ban, Wrench, MessageCircleQuestionMark, Workflow, BookmarkPlus, Component, GitPullRequest, CircleDot, Square, RotateCcw, Clock, Search, Link as LinkIcon, ExternalLink } from 'lucide-react'
@@ -25,7 +25,11 @@ import SideChat from './SideChat'
 import WorkflowSidebarRow, { type WfRunRow } from './WorkflowSidebarRow'
 import { runBelongsToSlot } from '../../apps/workflows/runModel'
 
-import { ContextBreakdownTab } from '../ContextBreakdownPanel'
+// Lazy: a Developer-Mode-only tab (chart, segment rows, prompt text) that most
+// sessions never open, kept out of the App chunk the way the share modal is.
+const LazyContextBreakdownTab = lazy(() =>
+  import('../ContextBreakdownPanel').then(m => ({ default: m.ContextBreakdownTab })),
+)
 import { CrewLogTab } from './CrewLogPanel'
 import SessionSummaryTab from './SessionSummaryTab'
 import { i18nT } from '../../i18n/t'
@@ -1246,7 +1250,19 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
       {/* Sits next to Logs on purpose: both answer "what actually happened
           in THIS session" — Logs for the tool calls, this for the context
           that was injected around them. */}
-      {effectiveTab === 'context' && <ContextBreakdownTab slot={slot} subagents={subagents} />}
+      {effectiveTab === 'context' && (
+        <Suspense
+          // The chunk loads once per session; on a slow link a blank panel
+          // reads as "nothing here", so show the tab's own loading line.
+          fallback={
+            <div className="text-muted text-[11px] py-6 text-center">
+              {i18nT('pages.contextBreakdown.loading')}
+            </div>
+          }
+        >
+          <LazyContextBreakdownTab slot={slot} subagents={subagents} />
+        </Suspense>
+      )}
 
       {/* Crew log — the five folds over this session's append-only record. Sits
           beside Logs and Context for the same reason they sit together: all
