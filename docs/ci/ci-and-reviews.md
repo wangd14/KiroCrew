@@ -82,9 +82,54 @@ Three structural facts explain most of the rest:
   instead of racing it. A `needs:` edge cannot cross a workflow file, which is why
   that barrier is a job that reads the other workflow's run rather than a
   dependency GitHub resolves for us.
-- **The real merge gate is human approval plus armed auto-merge.** `PR Readiness`
-  is the one status worth watching; individual red checks are strong signals a
-  human can weigh.
+- **The real merge gate is human approval plus the merge queue.** `PR Readiness`
+  is the one required status: on a pull request head it aggregates every lane,
+  and on a merge group it is the queue's own check (next bullet). Individual red
+  checks are strong signals a human can weigh.
+- **Merge queue:** every test workflow runs on `merge_group`, the tree that
+  actually lands: `ci.yml`, `fast-gate.yml` and `build.yml` on the fleet with
+  the diff-scoped gates diffing against the group's `merge_group.base_sha`,
+  `main-ratchet-audit.yml` on the fleet judging the whole integrated tree,
+  `client-py.yml` hosted, and `internal-content-scan-gate.yml`, which already
+  did. `merge-queue-readiness.yml` -- a `merge_group`-only workflow whose
+  single job is named `PR Readiness`, the ruleset's required check -- waits for
+  those six runs on the group's commit and passes only when all six did, within
+  a 120-minute budget covering `ci.yml`'s 100-minute longest chain of job caps;
+  a failed API read is retried until that budget runs out, and only a run that
+  is still absent after the five-minute appear window or one that concluded
+  without success fails the check. It is a separate
+  file because a same-named job inside `ci.yml` behind an `if:` would still
+  create a `skipped` check run on every PR head, and a skipped required check
+  counts as satisfied. The AI review lanes do not run on a merge group: the
+  queue re-tests the PR's already-reviewed diff on the tree it lands on, it
+  does not re-review it. The two macOS legs (ci.yml's boot matrix, build.yml's
+  desktop build) are the one thing a merge group does not run: a hosted mac
+  runner has waited hours at this merge rate, and that wait inside the queue
+  would hold every group behind it. The push-to-main path is governed by the
+  repository variable `MERGE_QUEUE_ENABLED`: with it unset, a push to main runs
+  the full matrix in `ci.yml` and `build.yml`; with it set to `true` -- which
+  the admin does in the same operation as enabling the queue in the ruleset --
+  a **push to main runs the macOS legs and little else**: `ci.yml` skips
+  `changes` and `await-fast-gate` (and with them every heavy job) and boots the
+  gateway on macos-15 alone; `build.yml` skips the wheel and the Windows
+  installer and, after its seconds-long matrix resolver, builds and
+  smoke-installs the macOS desktop package alone, per commit and never evicted,
+  because the merge group proved everything else on that exact tree. Two small
+  workflows still run on that push unchanged -- `main-ratchet-audit.yml`'s
+  gates and `internal-content-scan-gate.yml` -- as they did before. Unsetting
+  the variable together with unticking the queue restores the full push
+  matrix. `fast-gate.yml` and the per-commit concurrency group follow the same
+  variable: with it set, `fast-gate.yml`'s push run exists but every job skips
+  (the merge group established those gates for the tree, and `ci.yml`'s
+  barrier skips on that path too), and all three workflows key their push
+  group on the commit SHA so the one macOS leg per landed commit is never
+  evicted by the next merge. With it unset, `fast-gate.yml` runs every gate
+  on the push and `ci.yml`'s barrier consumes that run, and the push keeps
+  today's per-ref group -- one running plus one pending, later pushes evict
+  the pending one -- so nothing on main changes until the admin sets the
+  variable. Enabling the queue is a
+  ruleset change (`protected-branches`, "Require merge queue", one PR merged
+  per group so each main commit is one PR), not a workflow change.
 - **A fork PR is aggregated like any other and can reach a passing readiness
   state**; CodeQL is the one lane it cannot run. See [Fork PRs](#fork-prs).
 
@@ -102,7 +147,8 @@ Out-of-band lanes that never gate a PR:
   bundle is replaced on disk and relaunches.
 - **The ratchet verdict `main` otherwise never gets:** `main-ratchet-audit.yml`
   re-runs only the cheap ratchet, ceiling and baseline gates on every push to
-  `main`. Two things make a push to `main` unable to answer for them in `ci.yml`:
+  `main` and on every merge group, where it is one of the runs the queue's
+  required check waits on. Two things make a push to `main` unable to answer for them in `ci.yml`:
   GitHub keeps one *pending* run per concurrency group, so on a busy `main` each
   run is evicted before its slower lanes report and a commit's checks end up
   `cancelled` rather than `failure` — which is not a red X, so `main` looks green
@@ -128,8 +174,9 @@ Out-of-band lanes that never gate a PR:
   eslint ceiling out of `ci.yml` rather than transcribing it, because a second
   copy would keep granting the old budget after a burn-down and report green on a
   tree the PR gate reds. It deliberately does not touch `ci.yml`'s concurrency or
-  add a second full run: full serialization or a merge queue is a runner-budget
-  call, and `test-durations.yml` already pays for a full suite on `main`.
+  add a second full run of its own: the merge queue is what runs the full suite
+  on the integrated tree, and `test-durations.yml` already pays for a full suite
+  on `main`.
   Contributor-facing half: [CONTRIBUTING.md](../../CONTRIBUTING.md).
 - **Maintenance:** `ship-report.yml` (a scheduled Slack summary),
   `test-durations.yml` (re-measures `.test_durations`, which no sharding lane reads
@@ -563,9 +610,11 @@ Test commands route only `ipv6_required` items to the hosted lane described abov
 This is one migration being validated, not eight already-proven shards
 or a rollout conditional on three green canaries.
 
-The CI workflow requires this repository, a push or an `opened`/`synchronize`
-same-repository PR event, and
+The CI workflow requires this repository, a push, a merge-group event or an
+`opened`/`synchronize` same-repository PR event, and
 `contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id)`.
+A `merge_group` run's actor is the person who queued the pull request, so the
+same list admits it without a new entry.
 Other PR activities (including edits, reopens and labels) stay hosted even for
 an admitted actor: that actor did not supply the code being run. The same
 restriction applies to every inline PR route and both platform resolvers.
@@ -581,7 +630,15 @@ webhook filter. The maintainer changing either fleet project's actor filter owns
 updating `CODEBUILD_ACTOR_IDS` in the same operational change and verifying that
 both projects and the routing mirror agree before declaring that change complete.
 Missing/empty membership routes to hosted; a fork PR stays
-hosted even when its actor is admitted. Every output consumer has a hosted
+hosted even when its actor is admitted. A merge group is different in kind
+from a pull request and is routed like a push: by ruleset construction it holds
+only a head that a maintainer approved at that exact commit (the queue admits
+nothing that fails the `protected-branches` rules), it cannot be amended once
+queued, and it is the very tree that lands on `main` -- where the push run
+executes it on the fleet -- minutes later. The fork fence exists for code
+nobody has approved; a merge group cannot carry any. The people who can queue
+a fork's code (maintainers, who can also push it to `main` directly) are the
+same people the fleet already trusts. Every output consumer has a hosted
 fallback. Removing the variable routes all these jobs back to hosted on new
 runs, without changing tests or AWS resources. It does not reroute an already
 queued job. The independent webhook filter remains necessary: routing is not a
@@ -683,7 +740,7 @@ Where the coverage went:
 |---|---|---|
 | `backend-test-macos` (full suite, 4 shards) | `platform-tests.yml`: called by `nightly.yml` at 06:00 UTC, plus `workflow_dispatch` against any branch | Holds the nightly **publish** jobs, never the builds — the artifacts are the evidence a fixer works from. Maintains one tracking issue (`platform-tests-macos` label) carrying the failing node ids and the pull requests merged in the last 24h |
 | The same suite, on demand | `macos-on-demand.yml`, `pull_request`, calls `platform-tests.yml` against the PR head; a Linux `decide` job runs it when the diff touches a darwin-sensitive path, **or** the PR carries the `ci:macos` label, **or** the head SHA falls in a 1-in-20 sample (`16#${HEAD_SHA:0:8} % 20`, deterministic per commit) (acts immediately -- the workflow listens for `labeled`). Over those three sits a CEILING: the path and sample switches are refused while this lane already holds `LANE_MAX_LIVE_RUNS` (4) live runs of the hosted macOS pool (a run holds one job per shard, so the ceiling is expressed in runs but felt in jobs, and it moves with the shard count), because on 2026-09-24 it held 53 of the 56 in-progress macOS jobs and one shard waited 14 hours for a runner while `build.yml` and `release.yml` queued behind it. A capped run is skipped, not queued, so the ceiling bounds demand and settles the lane at about six verdicts an hour -- a timely verdict for a few pull requests instead of a 14-hour one for all of them, with the nightly still covering every merge. The `ci:macos` label is never refused, and neither is a re-run, so a retry cannot turn a red lane into a skip | Advisory. It is a separate workflow ON PURPOSE: a macOS job inside `ci.yml` holds that workflow's completion even with `continue-on-error`, so it would still hold readiness. Readiness evaluates neither this workflow nor its check |
-| Real gateway boot on macOS | `ci.yml`'s `e2e-boot-matrix`, push-to-main leg; `nightly.yml`'s `pod-scenarios` | Blocking on main / holds nothing in the nightly |
+| Real gateway boot on macOS | `ci.yml`'s `e2e-boot-matrix`, the only job on the push-to-main path; `nightly.yml`'s `pod-scenarios` | Blocking on main / holds nothing in the nightly |
 
 `test/test_macos_platform_tests_gate.py` pins all of it, including the property that
 nothing on the required `pull_request` path may instantiate a macOS runner.
