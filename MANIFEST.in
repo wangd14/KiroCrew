@@ -33,6 +33,9 @@ recursive-include src/kiro_crew/config *
 # setup.cfg alone would still ship a wheel-only fix: `python -m build` builds the
 # wheel from the sdist, so a template missing here is missing everywhere.
 recursive-include src/kiro_crew/agent_panel_templates *.html
+# Dynamic dashboard card pages, for the same reason and with the same consequence: a
+# page absent from the sdist is absent from the wheel built out of it.
+recursive-include src/kiro_crew/dashboard_templates *.html
 recursive-include src/kiro_crew/connections *.json
 recursive-include src/kiro_crew/data *.json
 recursive-include src/kiro_crew/apps *.json

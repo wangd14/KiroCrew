@@ -1657,15 +1657,43 @@ native **Automatic cards for all sessions** control in the task panel and fleet 
 patches this setting; the config watcher applies UI, CLI and file edits alike.
 Its copy names the hourly attempt limit shared by all sessions, including failures.
 The optional producer is neither imported nor constructed during route or watcher
-registration. Both server entrypoints defer initial activation until after listening;
-default-off startup leaves it absent until the first live enable. Later toggles
-retain the same instance and budgets. Cleanup disables and awaits its worker.
+registration. Both server entrypoints defer initial activation until after listening.
+A DERIVED card -- one the product assembles from a fold it already keeps, with no model
+call and no attempt against the hourly budget -- constructs the store on first use with
+the model path still off, so a free card's availability does not depend on whether the
+cost opt-in was ever enabled. Later toggles
+retain the same instance and budgets, and disabling the model path does not discard a
+derived card. Cleanup disables and awaits its worker.
 Enabling queues eligible open sessions, and post-restore startup does the same
 when enabled. A session another session created (a team worker, `created_by`
 set) is not eligible: every attempt comes from the one shared hourly budget, so a
 fan-out would otherwise spend it on workers and starve the session a person
-follows. A worker's card read answers `unavailable` without queuing work, and its
-team-panel tile shows host state only. Live user/assistant messages, errors, turn completion and pending
+follows. A worker's MODEL card read answers `unavailable` without queuing work, and its
+team-panel tile shows host state only; that exclusion is about cost, so it does not apply
+to a derived card, which a dispatched session may carry. The privacy and remoteness
+exclusions apply to both, and a derived card re-checks them on every read rather than at
+publish alone, evicting one whose slot has since turned incognito or remote -- a stored
+card must not outlive the condition that permitted it. A derived write carries the source
+record's publish stamp and an older one cannot overwrite a newer card, so a delayed read
+cannot republish a stale board as current; a record that carries no board evicts the card
+instead of leaving the last one published. A rebuild whose normalized card and owner are both
+unchanged is stored but NOT broadcast, so a panel read served repeatedly does not have every
+dashboard client refetch bytes it already holds; the store is still written, because the stamp
+it keeps is what orders the next write.
+The derived store is in MEMORY only. The panel record it is built from persists, but nothing
+rebuilds a card at startup or on a card-route miss, so a gateway restart leaves a conductor's
+board absent from the card surface until the next member-panel read republishes it. Today the
+drawer read is that producer. Removing the drawer rendering therefore REQUIRES the read path or
+startup to rebuild a missing derived card from the stored panel record first: without it, the
+change trades a surface that always renders for one that renders only after a restart is
+followed by a visit, which is a regression rather than the migration it is meant to be.
+One field on a derived board is NOT the card's to write: the lede is published by the crew,
+and the card can clip it but cannot correct it. So a publisher that writes "nothing yet" over
+a board whose round tile reads 3 contradicts the numbers beside it, and no gate here can stop
+that. Every phrase the card itself composes names its round instead of pointing at it, and the
+shipped sample board models the same shape, but the governing fix belongs with the prompt that
+asks a conductor for its judgment, which this module does not own.
+Live user/assistant messages, errors, turn completion and pending
 questions enqueue subsequent updates, independently of an attached stream
 reader. Replay, token chunks, GET and polling do not enqueue model work. Card
 generation events are accepted only from the currently registered slot object.
