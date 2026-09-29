@@ -527,14 +527,13 @@ class UnmeasuredLine:
 #: string so a literal id is illegible, and a renamed constant raises here instead of
 #: quietly reading as a harness nobody has.
 #:
-#: Both entries rest on the same words in ``ACP_BACKENDS_COMPACT``: pi and goose each
-#: dispatch ``/compact`` before any model turn in their own source, neither could be
-#: driven where that was written (pi answers ``Authentication required``, goose
-#: ``Failed to resolve provider: GOOSE_PROVIDER``), and the set asks for the bar
-#: opencode met -- a live session whose ``usage_update.used`` was seen to fall. Until
-#: then Crew declines their ``/compact`` with ``COMPACT_ARM_UNCLASSIFIED``, which
-#: promises nothing, and this is the card saying the same thing rather than reporting
-#: a limit of the harness.
+#: The one entry rests on words in ``ACP_BACKENDS_COMPACT``: pi dispatches
+#: ``/compact`` before any model turn in its own source, it could not be driven where
+#: that was written (it answers ``Authentication required``), and the set asks for the
+#: bar opencode and goose met -- a live session whose ``usage_update.used`` was seen to
+#: fall. Until then Crew declines its ``/compact`` with ``COMPACT_ARM_UNCLASSIFIED``,
+#: which promises nothing, and this is the card saying the same thing rather than
+#: reporting a limit of the harness.
 #:
 #: USER-FACING lines only, which is not an omission: the security and operator notes
 #: are stated only when they HOLD, so an unmeasured one is already absent rather than
@@ -549,17 +548,6 @@ DECLARED_UNMEASURED: Mapping[Tuple[str, str], UnmeasuredLine] = {
             "driven capture of is the context actually shrinking, and it could not be "
             "driven where the set was written -- it answers Authentication required. "
             "Until then it is unclassified"
-        ),
-    ),
-    ("ACP_BACKEND_GOOSE", LINE_MANUAL_COMPACT): UnmeasuredLine(
-        reason=REASON_NO_DRIVEN_CAPTURE,
-        declared_by="ACP_BACKENDS_COMPACT",
-        citation=(
-            "goose 1.50.1 routes /compact through Agent::reply -> execute_command -> "
-            'handle_compact_command and its own command_starts_turn("/compact") is '
-            "false, so the source says inline. It has no driven capture either, and "
-            "could not be driven where the set was written -- it answers Failed to "
-            "resolve provider: GOOSE_PROVIDER. Until then it is unclassified"
         ),
     ),
 }

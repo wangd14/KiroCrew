@@ -2527,12 +2527,13 @@ class AcpProvider(LLMProvider):
             # over by the time anyone reaches this method. claude-agent-acp
             # compacts natively in-prompt; opencode serves ``/compact`` out of
             # its prompt handler
-            # (``test/fixtures/acp_frames/opencode/compact-live.jsonl``). Neither
-            # emits a compaction status, so the queue wait below has nothing to
-            # receive and would spend the whole ``COMPACT_WAIT_TIMEOUT_SECS``
-            # proving it. The set has exactly those two members -- pi and goose
-            # look the same in their own source and are absent for want of a
-            # driven capture, which is recorded on ``ACP_BACKENDS_COMPACT``.
+            # (``test/fixtures/acp_frames/opencode/compact-live.jsonl``), and goose
+            # does the same (``test/fixtures/acp_frames/goose/compact-live.jsonl``).
+            # None of them emits a compaction status, so the queue wait below has
+            # nothing to receive and would spend the whole
+            # ``COMPACT_WAIT_TIMEOUT_SECS`` proving it. pi looks the same in its own
+            # source and is absent for want of a driven capture, which is recorded
+            # on ``ACP_BACKENDS_COMPACT``.
             #
             # HERE rather than in ``compact()``, because this is the one method
             # BOTH routes to a compaction reach. ``compact()`` covers the
