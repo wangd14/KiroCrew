@@ -492,6 +492,44 @@ def _renumber_marker(content: str, marker: str, old: int, new: int, path: str) -
     return content
 
 
+_QUOTE_ATTRIBUTION = {
+    "user": "— quoting an earlier message from the user",
+    "assistant": "— quoting an earlier message from the assistant",
+}
+
+
+def quote_block(quote: Any) -> str | None:
+    """The blockquote a ``meta.quote`` record serializes to, or ``None``.
+
+    Mirrors the dashboard's ``quoteBlock`` (``chat-core/composer/messageQuote.ts``)
+    byte for byte: the card the client draws strips exactly this block from
+    the head of the row, so a record whose block is absent from the text has
+    nothing to point at.
+    """
+    if not isinstance(quote, dict):
+        return None
+    text, role = quote.get("text"), quote.get("role")
+    if not isinstance(text, str) or role not in _QUOTE_ATTRIBUTION:
+        return None
+    return "\n".join("> " + line for line in [*text.split("\n"), _QUOTE_ATTRIBUTION[role]])
+
+
+def prune_quote_meta(meta: Any, content: str) -> None:
+    """Drop an entry's ``meta.quote`` when an edit took its block out of *content*.
+
+    The drained row's card is drawn from the record and the record's block is
+    stripped from the text; a record whose block the edit removed or changed
+    would draw a card over text that does not open with it -- a stale card
+    beside raw ``>`` lines. The edit keeps whatever the user wrote; only the
+    card's claim is withdrawn.
+    """
+    if not isinstance(meta, dict) or "quote" not in meta:
+        return
+    block = quote_block(meta.get("quote"))
+    if block is None or not content.startswith(block):
+        meta.pop("quote", None)
+
+
 def prune_attachment_meta(meta: Any, content: str, previous: str) -> str:
     """Reconcile an entry's attachment lists with an edited *content*.
 
@@ -728,6 +766,7 @@ class SlotQueueRepository:
             item["content"] = prune_attachment_meta(
                 item.get("meta"), content, previous if isinstance(previous, str) else ""
             )
+            prune_quote_meta(item.get("meta"), item["content"])
             if directive_user_origin:
                 item["_directive_user_origin"] = True
             else:

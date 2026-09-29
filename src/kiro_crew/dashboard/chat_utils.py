@@ -3904,6 +3904,11 @@ def carries_attachments(item: dict) -> bool:
     meta = item.get("meta")
     if not isinstance(meta, dict):
         return False
+    # A whole-message quote (``meta.quote``) drains alone for the same reason:
+    # the row's card strips the quote's block from the START of the content,
+    # and a merged row would open with another entry's text instead.
+    if isinstance(meta.get("quote"), dict) and meta.get("quote"):
+        return True
     return any(isinstance(meta.get(k), list) and meta.get(k) for k in ATTACHMENT_META_KEYS)
 
 

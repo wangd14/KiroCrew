@@ -4263,7 +4263,8 @@
         "needs_earlier_history_count_one": "Select to load earlier history — {{count}} earlier message remains",
         "needs_earlier_history_count_other": "Select to load earlier history — {{count}} earlier messages remain",
         "share_message": "Share as image",
-        "copy_failed": "Copy failed"
+        "copy_failed": "Copy failed",
+        "quote_message": "Quote message"
       },
       "chatNavPanel": {
         "link": "Link"
@@ -4614,7 +4615,9 @@
         "redirecting_the_running_turn_not_yet_confirmed": "Redirecting the running turn — not yet confirmed.",
         "steering": "Steering…",
         "delivery_pending": "Delivery pending…",
-        "turn_ended_before_this_applied_runs_as_its_own_message": "Turn ended before this applied — runs as its own message."
+        "turn_ended_before_this_applied_runs_as_its_own_message": "Turn ended before this applied — runs as its own message.",
+        "quote_message": "Quote message",
+        "more_actions": "More actions"
       },
       "earlierMessagesBar": {
         "load_failed": "Couldn't load earlier messages",
@@ -4829,6 +4832,14 @@
         "rate_right": "Jev read this compaction right",
         "rate_wrong": "Jev read this compaction wrong",
         "not_scored": "(+{{count}} not scored)"
+      },
+      "quoteCard": {
+        "you": "You",
+        "assistant": "{{productName}}",
+        "quoting_author": "Quoting {{author}}",
+        "remove_quote": "Remove quote",
+        "jump_to_quoted_message": "Jump to the quoted message",
+        "message_unavailable": "Can't jump to it — the original message is no longer in this conversation."
       }
     },
     "chatPage": {

@@ -53,6 +53,7 @@ from kiro_crew.dashboard.chat_delivery import (
     queue_entry_view,
     queue_for_next_turn,
     queued_text_for_display,
+    quote_meta,
     start_queue_persist,
     steer_into_running_turn,
 )
@@ -464,6 +465,15 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         # busy-slot queue entry, the sub-agent hold -- is covered by one gate
         # rather than each remembering.
         user_meta = {k: v for k, v in user_meta.items() if k not in RESERVED_ROW_META_KEYS}
+        # The whole-message quote is bounded HERE, once, for every path below:
+        # the immediate row persists `user_meta` verbatim, so a bound applied
+        # only where the queue paths read it would leave that row unbounded.
+        # A record the bound refuses is dropped whole; the text beside it still
+        # carries the blockquote.
+        if "quote" in user_meta:
+            bounded_quote = quote_meta(user_meta)
+            user_meta.pop("quote")
+            user_meta.update(bounded_quote)
         if not user_meta:
             user_meta = None
     theme_consent = body.get("theme_consent") is True
@@ -1011,6 +1021,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             turn_actor="app" if request_app else "",
             send_id=normalize_send_id(user_meta.get("sendId")) if user_meta else None,
             attachments=attachment_meta(user_meta),
+            quote=quote_meta(user_meta).get("quote"),
             # The receipt travels whichever way the send went, including the one
             # case where the two disagree: `auto` answered steer and the steer was
             # UNAVAILABLE, so this path runs with a record saying steer. That is the
@@ -1047,6 +1058,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             _hold_meta["sendId"] = _hold_sid
         _hold_attachments = attachment_meta(user_meta)
         _hold_meta.update(_hold_attachments)
+        _hold_meta.update(quote_meta(user_meta))
         if request_app:
             # Same reason as the busy-slot queue above: this entry is drained
             # later, so only its meta can name the actor.
@@ -1076,6 +1088,8 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         if _hold_attachments:
             # Same as the busy-slot frame: the card is a cancel's restore source.
             _hold_push["meta"] = _hold_attachments
+        if _hold_meta.get("quote"):
+            _hold_push.setdefault("meta", {})["quote"] = _hold_meta["quote"]
         state.broadcast_ws("queue_push", _hold_push)
         # Same receipt contract as the busy-slot queue branch: `queue_id` binds
         # the sender's pre-send composer state to this exact entry. An entry the
