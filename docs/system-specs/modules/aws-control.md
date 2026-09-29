@@ -1884,13 +1884,14 @@ recorded ahead of the build -- transitive resolution can therefore still
 drift), and apt packages are unpinned, since bookworm point releases drop
 superseded versions and a pin would break on every security update.
 
-### Three processes, one task
+### Four processes, one task
 
 | Process | Owns | Exposure |
 |---|---|---|
-| Supervisor | process order, the crew bundle install, the container's own config, teardown | no listener; it is the task's init process |
+| Supervisor | process order, the crew bundle install, the container's own config, the restore phase, teardown | no listener; it is the task's init process |
 | Front | receiving a turn, stripping any route prefix, forwarding over loopback | the only listener, port 8080 |
 | Kiro Crew backend | sessions, conversations, transcripts, MCP, subagents, skills, memory | loopback only (`127.0.0.1`, not configurable) |
+| Backup sidecar | copying transcripts, archived segments and the two authority files to S3 | no listener; started only when a bucket is configured |
 
 Nothing serves a user interface. `config_dir` equals `data_home`: the gateway's
 `config_dir()` and `data_home()` resolve to the same directory, so
@@ -1906,9 +1907,17 @@ The startup order is a correctness requirement rather than a preference:
 2. Write the container's own configuration. It must land after the bundle, because
    a bundle may ship config and the container's posture has to win on the keys it
    sets, and before the backend, which reads the file at boot.
-3. Start the backend. `wait_until_ready` returns only when the port answers **and**
+3. Restore the two authority files from the bucket, when one is configured. This
+   must finish before the next step: the backend's periodic flush persists its
+   in-memory slot table, so a flush landing before the restore completes writes an
+   empty set over the record of which conversations existed. A restore that fails
+   for any reason other than the objects being absent refuses the boot, because
+   reading a denial as absence is that same empty flush by another route.
+4. Start the backend. `wait_until_ready` returns only when the port answers **and**
    the boot secret file exists; process-alive is not ready.
-4. Start the front process.
+5. Start the front process.
+6. Start the backup sidecar, last, because its first cycle should see a task that
+   is already serving.
 
 **The task owns its agent-spec directory, and that is what lets the backend write
 it.** `KIRO_HOME` is set to `<data home>/kiro`, so the crew's spec and Kiro Crew's own
@@ -1941,14 +1950,121 @@ crew where nothing serves it. A directory that cannot be created is a refusal to
 the alternative is the backend declining for a second reason minutes later with the
 failure attributed to the guard.
 
-There is no backup sidecar and no restore phase. Durability across task
-replacement is a capability the container does not have; the front still fetches a
-slot's transcript from S3 on demand, so `SMC_BACKUP_BUCKET`/`SMC_BACKUP_PREFIX`
-name where it reads. When durability returns it must reinstate the ordering rule
-that made it correct -- a restore must finish before the backend starts, because
-the backend's periodic flush persists its in-memory slot table and a flush landing
-before the restore completes writes an empty set over the record of which
-conversations existed.
+#### What durability covers, and what it does not
+
+Transcripts, archived segments under `sessions/archive/` and the two authority
+files. Each object is copied from ONE open descriptor with the length that
+descriptor's file had when it was opened, so a copy is coherent without a lock and
+without staging a second copy on disk. Nothing is skipped for being large: an
+object above the restore side's read ceiling is uploaded with a warning naming it,
+because the alternative is silent loss. `SMC_BACKUP_INTERVAL_SECS` sets the cadence
+and refuses only a value of zero or less, which is a busy loop rather than a faster
+cadence.
+
+Artifacts are NOT covered. That set is unbounded and the agent writes into it, so
+bounding it is an open question tracked on the issue rather than answered here.
+
+`session_index.db` is deliberately excluded: it is a search index the backend
+rebuilds, and its own module documents it as safe to be absent, stale or empty.
+
+A cycle uploads in two phases: every transcript, then the two authority files. The
+authority files are the INDEX -- a replacement reads them to decide which
+conversations exist, and the front fetches each named transcript lazily -- so an
+index newer than the bytes it names sends the front to an absent object, which it
+reads as a conversation that never had history: a live conversation served empty,
+with nothing raised. The opposite skew is harmless, because every slot an older
+index names already has bytes in the bucket. For the same reason the authority phase is
+skipped entirely when the transcript phase REFUSED anything -- a refusal is a file that
+should be in the bucket and is not yet, so a later cycle can still put it there, and the
+pair must not name it meanwhile; the pair in the bucket then stays at the last cycle that
+completed, which is older and coherent. An UNREACHABLE entry does not withhold the pair:
+it is a name no cycle will ever upload, so an index that omits it is not an index running
+ahead of its bytes, and withholding on it would freeze the pair for as long as the entry
+stays unreachable. A refused ROOT is a refusal, not an unreachable entry, because nothing
+under it was reached and a later cycle may well reach all of it. A third verdict sits between
+the two. The pair is captured BEFORE the enumeration, so it still names a conversation deleted
+during the cycle; the skew argument says an older index is harmless, but only because every
+slot it names already has bytes in the bucket, and a conversation created and deleted inside
+one interval was never uploaded by any cycle. So a transcript that vanishes between the
+listing and its open withholds the pair when the captured index NAMES it and the bucket does
+not hold it -- membership being the test, since an index that never named it cannot send a
+reader to it, and an owner deleting a conversation is ordinary use. This cannot freeze the
+index the way an unreachable entry would: the verdict is a race within one cycle rather than a
+shape on disk, so a file that is really deleted is not listed by the next cycle at all. A
+captured index that cannot be READ counts every candidate rather than none, because guessing
+"names nothing" would commit an index this cycle could not read against bytes it knows are
+absent.
+
+A cycle that put the WHOLE pair in the bucket then writes one more object, and it is
+the last thing the cycle does: a record naming the authority files published together.
+The restore reads it to tell two absences apart, which the bucket's own shape resolves only
+one way.
+An authority file the bucket does not hold is either a crew that never published one --
+nothing to overwrite, so the task must boot -- or a publication that did not finish, in
+which case booting from the file that made it lets the backend flush its own empty view
+of the other over a real conversation list. Reading every partial pair as the second is
+what turns a young bucket into one no replacement task can boot from. So: a record naming
+a file the bucket does not hold refuses the boot; a record that cannot be read or does not
+parse refuses too, since unreadable is not absent; and with NO record the generation slots
+are surveyed before the legacy keys are read at all. Writing the record LAST is what makes
+that survey sound: a slot holding a COMPLETE pair is a publication whose record simply did
+not land, because the record is written only once both files are already there. So that pair
+is adopted, and it wins over the legacy keys, which no cycle of this writer ever writes and
+which are therefore older. Refusing it instead would be unrecoverable rather than cautious:
+the restore runs in the supervisor BEFORE the backend and the sidecar start, so a refusal
+leaves no writer to publish the record it is waiting for, every replacement repeats the same
+refusal, and the bucket is repaired only by hand. Without the survey the first-ever
+generation is the hole in the other direction -- no record has ever existed, so the restore
+reads the legacy keys, the pair went to a slot instead, both names come back absent, and the
+task boots on an empty index while the real pair sits one key away.
+
+Two states the survey refuses, and each says manual repair rather than naming a cycle that
+would not run. TWO complete pairs with no record cannot be ordered: nothing in the bucket
+says which is later, and the protocol never produces it, since a second slot is written only
+once a record names the first. And a slot holding PART of a pair is a publication torn before
+anything referenced it -- refused only when the legacy keys cannot supply the missing name
+either, because a bucket whose legacy pair is whole can still boot and refusing it would
+strand a readable index. And a complete pair is adopted only once its two files AGREE with each
+other: presence of both names proves the pair complete, not that one cycle wrote it, because a
+failed pair PUT leaves the half that landed and the next cycle is still pointerless, so it
+targets the same slot and can fail on the other half. Origin cannot be established from the
+bucket without the object that failed to be written, so what is checked is the property the
+reader depends on -- every open tab must be a conversation the session map knows -- and a pair
+naming a tab its own map does not know is refused as the mismatched-binding state it is. A
+record written first would name files the crash never uploaded. It
+is also never written for a partial pair, because a record listing one file would assert
+that a complete publication contained one file.
+
+The ARCHIVE root is the one root whose refusal must not withhold the pair. A link or a
+non-directory there is a SHAPE, so every later cycle meets the identical error and a withholding
+started there never ends: the index would freeze at the moment the name appeared while live
+transcripts keep uploading past it. It buys nothing even once, because the front deliberately
+never fetches archived segments -- finding them would require listing -- so the published pair
+cannot send a reader into the subtree that went unenumerated. Such a refusal is recorded as
+unreachable instead: the cycle still fails loudly and names the entry, and the pointer is free to
+advance. The live root keeps withholding, because the pair does name the transcripts a reader
+fetches. Every error the archive walk itself meets is collected on that same permanence rule
+rather than skipped, since a directory the task's uid cannot open otherwise contributed no
+segments, no refusal and no log, and the archive lives on an ephemeral disk.
+
+One more place the two sides speak different languages. The index names a conversation by its
+SLOT KEY while its transcript file carries a ``dashboard_`` prefix plus a character substitution,
+so anything comparing a filename with an index entry maps the slot keys FORWARD through the
+function that names the file, rather than stripping the prefix off the filename a second time.
+
+Teardown drains the front first, then the backend so it flushes what it holds, then
+the sidecar, whose final cycle BEGINS after it is signalled and must complete before
+the process returns. That ordering is what makes an orderly replacement lossless:
+a cycle already in flight when the signal arrives started before the backend's
+flush, so it cannot contain what that flush wrote. That final cycle's verdict reaches
+the task's exit code, because it is the only copy of the turns in the flush.
+
+An overlapping deployment -- one that starts the replacement task before the old
+task has finished draining -- is outside that guarantee. The new task's restore
+reads authority files written before the old task's final cycle, and both sidecars
+then write the same keys, so the turns taken during the overlap window can be lost.
+The loss is bounded by that window rather than total, and the deployment driver is
+expected to serialize stop before start; where it cannot, this is the residual.
 
 ### The front layer
 
@@ -2391,3 +2507,10 @@ with no scheduler and no further launch, which is the case the launcher's own sw
 cannot reach. Zero, and an absent variable, mean unbounded. A stop on that deadline
 is ORDERLY -- the task ran for as long as it was allowed -- so it exits 0 and says
 why in the log, rather than sitting on the console beside a crash.
+
+An orderly reason is success only when the sidecar's final cycle also committed. That
+cycle runs after the backend's flush and holds the only copy of the turns in it, so a
+non-zero status from it -- a refused upload, or a kill when the drain window elapses
+mid-upload -- exits non-zero, and so does a status that could not be read. This applies
+to a spent lifetime as much as to a signal: both stop a task that was serving turns a
+moment earlier. A task with no bucket has no sidecar and nothing to weigh.
