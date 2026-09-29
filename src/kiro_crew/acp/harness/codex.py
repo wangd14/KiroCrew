@@ -127,7 +127,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from kiro_crew import acp_tool_gate
 from kiro_crew.acp.harness._common import MembershipHarness
@@ -145,6 +145,7 @@ from kiro_crew.acp.types import (
     METHOD_SESSION_CLOSE,
     METHOD_SESSION_UPDATE,
 )
+from kiro_crew.config.paths import config_dir
 from kiro_crew.providers.mirrors.codex import drop_unadvertised_transports
 from kiro_crew.sandbox import detect_backend
 
@@ -157,6 +158,37 @@ logger = logging.getLogger(__name__)
 #: claude's today: a divergence should be a one-line edit here rather than a silent
 #: downgrade of whichever harness moved first.
 PROTOCOL_VERSION_CODEX = 1
+
+
+#: Where ``codex`` keeps its SQLite databases; defaults to ``CODEX_HOME``.
+_SQLITE_HOME_ENV = "CODEX_SQLITE_HOME"
+
+
+def sqlite_slot_root(environ: Mapping[str, str]) -> Path | None:
+    """The directory each runtime's private SQLite slot is taken under.
+
+    Every ``codex app-server`` opens the same SQLite files by default, and they
+    lock each other out: a Codex Desktop daemon plus two Crew runtimes fail new
+    sessions with ``database is locked``. So each runtime gets its own
+    ``CODEX_SQLITE_HOME``.
+
+    Only the databases move. Config, auth and the thread rollouts stay in the
+    shared ``CODEX_HOME``, and a thread resumes from its rollout -- measured on
+    codex 0.159: a thread started under one SQLite home and resumed under an
+    empty one recalled the first turn. So ``spawn_continue`` still works across
+    runtimes. Slots are reused rather than minted per spawn, because a fresh home
+    backfills every rollout into ~60 MB of index on its first start.
+
+    The slots live in Crew's own config dir (``codex-sqlite/``), not under
+    ``CODEX_HOME``: Crew owns the lock files and the layout, and codex's home is
+    the operator's. ``None`` when the operator has set ``CODEX_SQLITE_HOME``
+    themselves: they chose that location, so no slot is taken and the variable
+    reaches the child as set. A ``sqlite_home`` in ``config.toml`` outranks the
+    variable inside codex, so that choice needs nothing from Crew to be honored.
+    """
+    if environ.get(_SQLITE_HOME_ENV):
+        return None
+    return config_dir() / "codex-sqlite"
 
 
 def _sandbox_wrapper_generations(sandbox_mode: str) -> int:
@@ -276,11 +308,13 @@ class CodexHarness(MembershipHarness):
         wrapper_generations = await asyncio.to_thread(
             _sandbox_wrapper_generations, ctx.sandbox_mode
         )
+        slot_root = sqlite_slot_root(ctx.environ)
         return SpawnPlan(
             argv=list(argv),
             rss_depth=self.CORE_RSS_DEPTH + wrapper_generations,
             extra_hidden_dirs=hidden,
             extra_expose_files=expose,
+            private_state_dir=None if slot_root is None else (_SQLITE_HOME_ENV, str(slot_root)),
         )
 
     def apply_spawn_env(self, env: dict[str, str]) -> None:

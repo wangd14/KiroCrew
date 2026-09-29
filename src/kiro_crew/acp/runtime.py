@@ -107,6 +107,7 @@ from kiro_crew.acp.session_mcp import (
     session_mcp_disabled_tools,
     session_mcp_server_is_disabled,
 )
+from kiro_crew.acp.state_slots import StateSlot, acquire_state_slot, release_slot_off_loop
 from kiro_crew.acp.transport_errors import (
     is_auth_failure_output,
     is_sandbox_init_failure_output,
@@ -845,6 +846,19 @@ class _MirroredSessionMcp(NamedTuple):
     """
 
 
+def _release_unclaimed_slot(acquiring: asyncio.Future[StateSlot]) -> None:
+    """Give back a slot whose awaiter was cancelled before it could store it.
+
+    Done-callback for the shielded acquisition in ``_bind_state_slot``. Reading
+    the exception also marks a late failure retrieved, so it is not logged as
+    an unretrieved task exception. The callback runs on the loop and cannot
+    await, so the release itself is handed to a worker thread.
+    """
+    if acquiring.cancelled() or acquiring.exception() is not None:
+        return
+    release_slot_off_loop(acquiring.result())
+
+
 async def _retrying_spawn_factory(
     factory: "Callable[..., Awaitable[asyncio.subprocess.Process]]", **kwargs: Any
 ) -> asyncio.subprocess.Process:
@@ -1176,6 +1190,13 @@ class AcpRuntime:
         # The mask set this spawn asked for, so a trusted corroboration run can
         # exercise the same mounts rather than a weaker profile.
         self._sandbox_hidden_dirs: tuple[str, ...] = ()
+        # The private state slot the harness asked for, held across respawns of
+        # this runtime and released once its process is confirmed killed.
+        self._state_slot: StateSlot | None = None
+        # Slots a process of this runtime may still have open: a kill that could
+        # not confirm the whole tree dead moves the slot here. Held, so no runtime
+        # is handed one, and never reused, so the next spawn takes a fresh slot.
+        self._retired_state_slots: list[StateSlot] = []
         # Unroutable-frame drop accounting: (sessionId, method) → count since
         # the last flush, plus the monotonic timestamp of that flush (0.0 = no
         # window open yet; the first counted drop opens it). Written ONLY from
@@ -1481,6 +1502,96 @@ class AcpRuntime:
 
     # ── Lifecycle ──
 
+    async def _bind_state_slot(self, env: dict[str, str], request: tuple[str, str] | None) -> None:
+        """Point the host's state variable at this runtime's own slot.
+
+        A value already in *env* is the caller's (``extra_env`` from a cron or a
+        workflow): they chose that location, so no slot is taken and it reaches
+        the child as set -- the same answer the harness gives the operator's own
+        variable.
+
+        Acquisition walks and locks slot directories, so it runs off the loop.
+        The thread cannot be stopped, so a cancellation landing while it runs
+        shields the acquisition and gives back whatever it eventually takes:
+        nobody is left to store it, and an unreleased lock would hold the slot
+        for the gateway's lifetime.
+
+        A runtime that still holds a slot reuses it, and a freed slot goes to the
+        next runtime lowest-first, so a restart reuses already-built databases.
+        Release is fire-and-forget on a worker thread (``release_slot_off_loop``),
+        so an acquire racing a release in flight may take the next slot instead
+        of the one being freed: warm-database reuse is lost for that spawn, never
+        exclusivity, since the lock stays the authority. A slot a survivor may
+        still have open is never here: kill() retires it (see
+        ``_settle_state_slot``), so a respawn after such a kill takes a fresh
+        one. When no slot can be taken, the child gets the host's shared default
+        and a warning says why: a shared database is the behavior before slots
+        existed, and a refused spawn is worse.
+        """
+        if request is None:
+            return
+        env_var, root = request
+        if env.get(env_var):
+            return
+        slot: StateSlot | None = getattr(self, "_state_slot", None)
+        if slot is None or slot.root != Path(root):
+            self._release_state_slot()
+            acquiring = asyncio.ensure_future(asyncio.to_thread(acquire_state_slot, Path(root)))
+            try:
+                slot = await asyncio.shield(acquiring)
+            except asyncio.CancelledError:
+                acquiring.add_done_callback(_release_unclaimed_slot)
+                raise
+            except OSError as exc:
+                logger.warning(
+                    "AcpRuntime: no private %s under %s (%s); the child shares the "
+                    "default, so concurrent processes may lock each other out",
+                    env_var,
+                    root,
+                    exc,
+                )
+                return
+            self._state_slot = slot
+        env[env_var] = str(slot.path)
+
+    def _release_state_slot(self) -> asyncio.Future[None] | None:
+        """Give this runtime's state slot back. Safe when none is held.
+
+        The unlock and close run off the loop; the returned future completes when
+        the slot is actually free, for a caller that wants to wait on that.
+        """
+        slot = getattr(self, "_state_slot", None)
+        self._state_slot = None
+        if slot is None:
+            return None
+        return release_slot_off_loop(slot)
+
+    def _settle_state_slot(self) -> asyncio.Future[None] | None:
+        """Decide the slot's fate once this runtime's process handle is gone.
+
+        Freed only when nothing can still hold its databases open: no process was
+        ever created (``_pid`` is set once, never cleared), or the kill confirmed
+        the whole tree dead. Freeing is fire-and-forget on a worker thread (see
+        ``_release_state_slot``). Otherwise a survivor -- an unsignalled root or a
+        retained descendant -- may still have them open, so the slot is retired:
+        kept held, so the next runtime is not handed it, and dropped from
+        ``_state_slot``, so this runtime's own respawn takes a fresh one instead of
+        sharing databases with the process it just failed to kill.
+        """
+        unspawned = self._pid is None
+        if unspawned or self._process_tree_confirmed_dead:
+            return self._release_state_slot()
+        slot = getattr(self, "_state_slot", None)
+        self._state_slot = None
+        if slot is not None:
+            logger.warning(
+                "AcpRuntime: a process may still be using state slot %s; retiring it "
+                "until this gateway exits",
+                slot.path,
+            )
+            self._retired_state_slots.append(slot)
+        return None
+
     def _discard_sandbox_cleanup(self) -> None:
         """Unlink and forget the sandbox temp file allocated by ``wrap_argv``.
 
@@ -1743,6 +1854,10 @@ class AcpRuntime:
         finally:
             process = self._process
             if process is None:
+                # No process, so nothing of this spawn's can be using the slot
+                # unless a reap left a survivor: _settle_state_slot tells the two
+                # apart and retires the slot in the second case.
+                self._settle_state_slot()
                 process_state = "absent"
             elif process.returncode is None:
                 process_state = "running"
@@ -1987,6 +2102,14 @@ class AcpRuntime:
             env.update(self._extra_env)
 
         env["PATH"] = augmented_path(env.get("PATH", ""))
+        # Off the loop (see _bind_state_slot), so a cancellation can land inside
+        # it: the sandbox file is live and must go the way every other suspension
+        # in this window sends it, and spawn()'s cleanup frees the slot.
+        try:
+            await self._bind_state_slot(env, plan.private_state_dir)
+        except BaseException:
+            self._discard_sandbox_cleanup()
+            raise
 
         def _resolve_env_off_loop() -> None:
             # KRB5CCNAME resolution lstat/stats /tmp/krb5cc_<uid>, and the
@@ -2808,6 +2931,13 @@ class AcpRuntime:
         try:
             await self._kill_inner(expected=expected, reason=reason)
         finally:
+            # Freed once the whole tree is confirmed gone; retired when a survivor
+            # may still have its databases open, so neither the next runtime nor
+            # this runtime's own respawn is handed it. Runs even when the kill
+            # raises or is cancelled: the tree is then unconfirmed (the flag was
+            # cleared above and only a completed kill sets it), so the slot is
+            # retired rather than handed to the next runtime.
+            self._settle_state_slot()
             self._discard_sandbox_cleanup()
             await self._discard_bound_workspace()
 

@@ -97,6 +97,9 @@ VOLATILE_ENV = {
     # /proc to tell the root's own descendants from a fresh runtime's. That the
     # runtime's child RECEIVES it is the fact being pinned.
     KIROCREW_SPAWN_INSTANCE_ENV: "<spawn-instance>",
+    # A per-runtime slot directory under the capture's temp dir. That the codex child
+    # RECEIVES it is the fact being pinned; the slot number is not.
+    "CODEX_SQLITE_HOME": "<sqlite-slot>",
 }
 
 #: The parent environment every capture runs against, whatever the recording host's
@@ -585,6 +588,9 @@ def _capture_runtime_served(backend: str, tmp_path: Path, parent_env: dict) -> d
                 codex_harness_mod, "resolve_spawn_masks", new=AsyncMock(return_value=((), ()))
             ),
             patch.object(codex_harness_mod, "_sandbox_wrapper_generations", return_value=0),
+            # The codex SQLite slots, under this run's temp dir rather than the
+            # recording host's Crew config dir.
+            patch.object(codex_harness_mod, "sqlite_slot_root", lambda _env: tmp_path / "sqlite"),
             # Same default-home pin as the client capture, for the same reason.
             patch.object(config_paths, "_resolve_default_home", lambda: tmp_path / "default-home"),
             # ... and the breadcrumb that default resolution drops OUTSIDE the data
@@ -620,6 +626,8 @@ def _capture_runtime_served(backend: str, tmp_path: Path, parent_env: dict) -> d
             asyncio.run(runtime._spawn_admitted())
         except _Captured:
             pass
+        finally:
+            runtime._release_state_slot()
     finally:
         for ctx in reversed(stack):
             try:

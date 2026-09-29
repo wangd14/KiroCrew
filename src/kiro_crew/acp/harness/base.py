@@ -147,6 +147,16 @@ class SpawnPlan:
     hides, or it re-exposes something nothing denied.
     """
 
+    private_state_dir: tuple[str, str] | None = None
+    """``(env_var, root)``: this process needs a state directory nobody shares.
+
+    ``None`` for a host whose state tolerates concurrent processes. Otherwise the
+    runtime takes an exclusive slot under ``root`` (see
+    :mod:`kiro_crew.acp.state_slots`), holds it until the process is killed, and
+    points ``env_var`` at it. The harness names the need; the runtime owns the
+    lock, as it owns the process.
+    """
+
 
 # ── Seam 3: session/new and session/load extras ──
 

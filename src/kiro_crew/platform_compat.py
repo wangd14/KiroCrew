@@ -7364,8 +7364,10 @@ def unlink_link_or_junction(path: str | os.PathLike) -> None:
 #: name is seen for what it is rather than silently traversed. The share mode
 #: deliberately omits ``FILE_SHARE_DELETE``: that omission is the pin.
 _WIN_GENERIC_READ = 0x80000000
+_WIN_GENERIC_WRITE = 0x40000000
 _WIN_FILE_SHARE_READ_WRITE = 0x00000001 | 0x00000002
 _WIN_OPEN_EXISTING = 3
+_WIN_OPEN_ALWAYS = 4
 _WIN_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _WIN_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _WIN_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
@@ -7731,13 +7733,21 @@ def pinned_directory(path: str | os.PathLike) -> PinnedDirectory:
     return PinnedDirectory(pin_directory(target), target)
 
 
-def _win_open_without_following(path: str | os.PathLike) -> int:
-    """``CreateFileW`` *path* for reading, opening a reparse point INSTEAD of following it.
+def _win_open_without_following(
+    path: str | os.PathLike,
+    *,
+    access: int = _WIN_GENERIC_READ,
+    disposition: int = _WIN_OPEN_EXISTING,
+    crt_flags: int = os.O_RDONLY,
+) -> int:
+    """``CreateFileW`` *path*, opening a reparse point INSTEAD of following it.
 
-    Shared by :func:`pin_directory` and :func:`open_file_no_reparse` so the two do
-    not carry separate copies of the same security-critical flags. What each of
-    them then asserts about the descriptor differs; how the object is reached must
-    not.
+    Shared by :func:`pin_directory`, :func:`open_file_no_reparse` and
+    :func:`create_file_no_reparse_rw` so the callers do not carry separate copies
+    of the same security-critical flags. What each of them then asserts about the
+    descriptor differs, and so may the *access* and the creation *disposition* (a
+    lock file is created read-write if absent); how the object is reached must not.
+    *crt_flags* is the CRT descriptor's own mode and has to agree with *access*.
 
     ``OPEN_REPARSE_POINT`` is the whole point: a junction or symlink at the name is
     opened AS ITSELF, so the caller sees what is really there and the target is
@@ -7773,17 +7783,17 @@ def _win_open_without_following(path: str | os.PathLike) -> int:
     kernel32.CreateFileW.restype = wintypes.HANDLE
     handle = kernel32.CreateFileW(
         os.fspath(path),
-        _WIN_GENERIC_READ,
+        access,
         _WIN_FILE_SHARE_READ_WRITE,
         None,
-        _WIN_OPEN_EXISTING,
+        disposition,
         _WIN_FILE_FLAG_BACKUP_SEMANTICS | _WIN_FILE_FLAG_OPEN_REPARSE_POINT,
         None,
     )
     if handle is None or handle == wintypes.HANDLE(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
     return msvcrt.open_osfhandle(  # type: ignore[attr-defined]
-        handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        handle, crt_flags | getattr(os, "O_BINARY", 0)
     )
 
 
@@ -7820,6 +7830,50 @@ def open_file_no_reparse(path: str | os.PathLike, *, nonblocking: bool = False) 
         return os.open(os.fspath(path), flags)
 
     fd = _win_open_without_following(path)
+    try:
+        attrs = getattr(os.fstat(fd), "st_file_attributes", 0)
+        if attrs & _WIN_FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError(errno.ELOOP, "reparse point at the final component", os.fspath(path))
+        if attrs & _WIN_FILE_ATTRIBUTE_DIRECTORY:
+            raise IsADirectoryError(errno.EISDIR, "is a directory", os.fspath(path))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def create_file_no_reparse_rw(path: str | os.PathLike, mode: int = 0o600) -> int:
+    """Open, creating if absent, a regular FILE read-write, refusing a reparse point.
+
+    The read-write, creating counterpart to :func:`open_file_no_reparse`, for a
+    lock file that has to exist to be locked: a caller that first creates the file
+    by name and then opens it has a check-to-open window, and one that opens it
+    with ``os.open(O_CREAT | O_NOFOLLOW)`` has no link refusal at all on Windows,
+    where ``getattr(os, "O_NOFOLLOW", 0)`` is 0 and the open FOLLOWS a reparse
+    point -- into a UNC target, which is an outbound SMB authentication.
+
+    * POSIX: ``os.open(O_RDWR | O_CREAT | O_NOFOLLOW, mode)``; the kernel refuses
+      a link at the final component with ``ELOOP`` in the same operation.
+    * Windows: ``CreateFileW`` with ``OPEN_ALWAYS`` and
+      ``FILE_FLAG_OPEN_REPARSE_POINT`` opens a reparse point AS ITSELF, and the
+      attribute read off the descriptor is a fact about what was opened. Refused
+      with ``ELOOP`` to match POSIX; a directory with ``EISDIR``. *mode* has no
+      Windows meaning and is ignored there.
+
+    The descriptor is opened ``O_RDWR`` on both platforms, so ``os.fstat``,
+    :func:`file_lock` (``fcntl.flock`` / ``msvcrt.locking``) and ``os.close`` all
+    work on it. Nothing else about the file is asserted: a caller that needs a
+    plain, single-link inode checks ``os.fstat`` on what came back.
+    """
+    if IS_POSIX:
+        return os.open(os.fspath(path), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), mode)
+
+    fd = _win_open_without_following(
+        path,
+        access=_WIN_GENERIC_READ | _WIN_GENERIC_WRITE,
+        disposition=_WIN_OPEN_ALWAYS,
+        crt_flags=os.O_RDWR,
+    )
     try:
         attrs = getattr(os.fstat(fd), "st_file_attributes", 0)
         if attrs & _WIN_FILE_ATTRIBUTE_REPARSE_POINT:

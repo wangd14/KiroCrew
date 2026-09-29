@@ -2420,3 +2420,31 @@ The Codex spawn environment sets `DISABLE_MCP_CONFIG_FILTERING=true` so the
 adapter honors the session's MCP overrides even when a global configuration
 contains the same server name. This applies to both create and load; it changes
 configuration precedence, not authentication or the sandbox's credential mask.
+
+The Codex spawn environment also sets `CODEX_SQLITE_HOME` to a private slot, so
+concurrent `codex app-server` processes (Codex Desktop and each Crew runtime) do
+not share one set of SQLite databases and fail with `database is locked`. Slots
+are numbered directories under `<config_dir>/codex-sqlite/`, each held by an
+exclusive lock on a regular, single-link file; the lowest free slot wins so a
+restarted runtime reuses built databases. No name on the way to the lock is
+resolved before it is screened: a linked ancestor of the root is refused first,
+each directory is created with `os.mkdir` and inspected with `lstat` (never
+`Path.mkdir(exist_ok=True)`, whose `is_dir()` traverses a junction), and the lock
+is opened by `platform_compat.create_file_no_reparse_rw`, which refuses a link or
+reparse point inside the open itself -- `O_NOFOLLOW` on POSIX, `CreateFileW` with
+`FILE_FLAG_OPEN_REPARSE_POINT` on Windows, where `O_NOFOLLOW` is 0 and a plain
+`os.open` would follow a junction into a UNC target (an outbound SMB
+authentication). `AcpRuntime` takes the slot off the event loop at spawn (a
+cancelled spawn gives back whatever the worker thread later takes), keeps it
+across respawns, and releases it only when the process never started or `kill()`
+confirmed the whole tree dead. The release (an unlock and a close) is also off
+the loop: `release_slot_off_loop` hands it to the subprocess-teardown pool,
+fire-and-forget, so a respawn racing a release in flight may take the next slot
+rather than the one being freed -- warm-database reuse lost for that spawn, never
+exclusivity, since the lock stays the authority. Otherwise a
+survivor may still hold the databases open, so the slot is retired: it stays
+locked and is never reused, and the respawn takes a fresh one. No slot is taken
+when the operator set `CODEX_SQLITE_HOME`, or when the spawn env already carries
+it from a cron or workflow `extra_env` (a `sqlite_home` in `config.toml`
+outranks the variable inside codex). When no slot can be taken, the child gets codex's shared default
+and a warning is logged.

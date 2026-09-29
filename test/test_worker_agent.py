@@ -3014,6 +3014,7 @@ def _runtime_for_spawn(monkeypatch, attempts_outcomes):
     rt = object.__new__(runtime_mod.AcpRuntime)
     rt._acp_backend = ACP_BACKEND_KIRO
     rt._process = None
+    rt._pid = None  # what __init__ sets; spawn()'s cleanup reads it
     calls: list[int] = []
     outcomes = list(attempts_outcomes)
 
