@@ -8,6 +8,7 @@ import logging
 
 from aiohttp import web
 
+from kiro_crew.dashboard.chat_delivery import attachment_meta
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_runner import _run_chat, _start_next_queued_turn
 from kiro_crew.dashboard.chat_utils import (
@@ -19,6 +20,12 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.remote_relay import remote_bound_refusal
+from kiro_crew.dashboard.slot_queue_repository import (
+    ATTACHMENT_LIST_MAX_ITEMS,
+    IMAGE_ATTACHMENT_META_KEY,
+    retained_image_meta,
+    with_added_images,
+)
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -136,6 +143,10 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "empty user message", "code": "empty_user_message"}, status=400
             )
+        # The row's pictures, so the regenerated turn sees what the original
+        # saw: the text's ``![image](path)`` line is a rendering, and only the
+        # structured list puts the image in front of the model.
+        _image_meta = retained_image_meta(msgs[u_idx].get("meta"), user_msg, user_msg)
 
         ai_msg = msgs[ai_idx]
         _rv = ai_msg.get("variants")
@@ -231,6 +242,10 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
             "vary phrasing, structure, or angle. Do not say you already answered or "
             "reference the prior reply."
         )
+        _regen_kwargs: dict = {}
+        if _image_meta:
+            _regen_kwargs["_attachments"] = [p for ps in _image_meta.values() for p in ps]
+            _regen_kwargs["_attachment_meta"] = _image_meta
         task = asyncio.create_task(
             _run_chat(
                 state,
@@ -242,6 +257,7 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
                 # actor resolver's fallback is ``user``. ``""`` is the parameter's
                 # own default and reads as "not named".
                 _turn_actor="app" if request.get("app", "") else "",
+                **_regen_kwargs,
             )
         )
         slot.task = task
@@ -540,6 +556,28 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
         # truncated live window here could make a rejected edit permanent.
         _bc, _ = redact_exfiltration_urls(content)
         _bc, _ = redact_credentials(_bc)
+        # The edited row keeps the pictures the edit left in place: the text's
+        # ``![image](path)`` line is a rendering, and only the structured list
+        # puts the image in front of the model, so it rides onto the new row and
+        # into the turn. A picture whose line the edit removed is dropped, and
+        # one the client ATTACHED while editing (``meta.images`` on this request,
+        # validated and redacted like a send's) is added: an edit that drops a
+        # picture and one that adds a picture are both edits.
+        _image_meta = retained_image_meta(
+            slot.messages[index].get("meta"), _bc, slot.messages[index].get("content") or ""
+        )
+        _added_images = attachment_meta(body.get("meta")).get(IMAGE_ATTACHMENT_META_KEY) or []
+        if _added_images:
+            _merged_image_meta = with_added_images(_image_meta, _added_images)
+            if _merged_image_meta is None:
+                return web.json_response(
+                    {
+                        "error": f"edited message would carry more than {ATTACHMENT_LIST_MAX_ITEMS} images",
+                        "code": "edit_resend_images_over_bound",
+                    },
+                    status=400,
+                )
+            _image_meta = _merged_image_meta
         prospective_slot = copy.copy(slot)
         prospective_slot.messages = list(slot.messages[:index])
         # ``copy.copy`` is SHALLOW, so every mutable attribute still IS the live
@@ -566,7 +604,7 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
             prospective_slot.event.set()
         prospective_slot._dirty = True
         prospective_slot._resumed_count = 0
-        prospective_slot.append("user", _bc, "msg msg-u")
+        prospective_slot.append("user", _bc, "msg msg-u", meta=_image_meta or None)
         msgs_snapshot = list(prospective_slot.messages)
         # Which question cards the prospective append retired. Announced at
         # commit time instead, through the LIVE callback the copy was denied.
@@ -622,6 +660,11 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
         dispatch_ready = asyncio.Event()
         dispatch_commit = False
 
+        _edit_kwargs: dict = {}
+        if _image_meta:
+            _edit_kwargs["_attachments"] = [p for ps in _image_meta.values() for p in ps]
+            _edit_kwargs["_attachment_meta"] = _image_meta
+
         async def _edit_resend_dispatch() -> None:
             await dispatch_ready.wait()
             if dispatch_commit:
@@ -634,6 +677,7 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
                     # actor resolver's fallback is ``user``. ``""`` is the
                     # parameter's own default and reads as "not named".
                     _turn_actor="app" if request_app else "",
+                    **_edit_kwargs,
                 )
                 return
             # Edit rejected. A send diverted to the queue by this reservation

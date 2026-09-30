@@ -28,11 +28,10 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app, _make_state
 
-from kiro_crew.dashboard.chat_delivery import (
+from kiro_crew.dashboard.chat_delivery import MAX_PENDING_STEERS, attachment_meta
+from kiro_crew.dashboard.slot_queue_repository import (
     ATTACHMENT_LIST_MAX_ITEMS,
     ATTACHMENT_PATH_MAX_LEN,
-    MAX_PENDING_STEERS,
-    attachment_meta,
 )
 
 _PATH = "/tmp/My Report.pdf"
@@ -286,6 +285,99 @@ class TestDrainedRow:
         ]
         pop = next(p for p in pops if p.get("content") == _WIRE)
         assert pop.get("meta") == {"files": [_PATH], "dirs": [_DIR]}
+
+    @pytest.mark.asyncio
+    async def test_the_provider_gets_the_raw_image_path_and_every_observer_the_redacted_one(
+        self, tmp_path, monkeypatch
+    ):
+        """A picture whose uploaded filename looks like a credential: the
+        redactor rewrites the path on every copy a person or a peer reads (the
+        entry meta and its frames, the drained row, the durable projection),
+        but the prompt builder must open the REAL file, so the copy the drain
+        hands ``_run_chat`` keeps the raw path -- otherwise the user's own
+        upload is probed at a path that exists nowhere and silently dropped."""
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.dashboard.slot_queue_repository import (
+            PROMPT_IMAGES_ENTRY_KEY,
+            durable_queue_entries,
+        )
+
+        raw = "/tmp/uploads/ab12_ghp_" + "A" * 36 + ".png"
+        state, slot = _busy_state(tmp_path, monkeypatch)
+        await _post_busy(state, "busy-chat", f"look\n\n![image]({raw})", {"images": [raw]})
+
+        entry = next(i for i in slot._queue if i["content"].startswith("look"))
+        assert entry["meta"]["images"] != [raw], "the entry meta is a client-visible copy"
+        assert entry[PROMPT_IMAGES_ENTRY_KEY] == [raw]
+        assert all(PROMPT_IMAGES_ENTRY_KEY not in d for d in durable_queue_entries(slot._queue))
+        (frame,) = _queue_push_frames(state)
+        assert "ghp_" not in frame["meta"]["images"][0]
+
+        state.subagents = None
+        slot._in_stage_execution = False
+        run_chat = MagicMock()
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()),
+            patch.object(chat_runner, "_run_chat", run_chat),
+        ):
+            assert await chat_runner._start_next_queued_turn(state, slot) is True
+
+        kwargs = run_chat.call_args.kwargs
+        assert kwargs.get("_prompt_images") == [raw]
+        assert kwargs["_attachment_meta"]["images"] != [raw]
+        assert "ghp_" not in (_user_rows(slot)[-1].get("meta") or {})["images"][0]
+
+    @pytest.mark.asyncio
+    async def test_a_queued_edit_that_removes_the_picture_removes_it_from_the_provider_copy(
+        self, tmp_path, monkeypatch
+    ):
+        """The provider copy rides the entry beside the redacted list; an edit
+        that removes the picture's line prunes ``meta.images`` -- and must prune
+        the provider copy in step, or the drain hands the model the very picture
+        the user took out. An emptied copy stays on the entry as authoritative:
+        the drain must not fall back to ``meta.images`` for it."""
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.dashboard.slot_queue_repository import PROMPT_IMAGES_ENTRY_KEY
+
+        raw = "/tmp/uploads/ab12_ghp_" + "A" * 36 + ".png"
+        keep = "/tmp/uploads/ab12_keep.png"
+        state, slot = _busy_state(tmp_path, monkeypatch)
+        receipt = await _post_busy(
+            state,
+            "busy-chat",
+            f"two\n\n![image]({raw})\n![image]({keep})",
+            {"images": [raw, keep]},
+        )
+        entry = next(i for i in slot._queue if i["id"] == receipt["queue_id"])
+        assert entry[PROMPT_IMAGES_ENTRY_KEY] == [raw, keep]
+        redacted_keep = entry["meta"]["images"][1]
+
+        # The user edits the queued message and removes the first picture's line.
+        assert slot.queue_edit_by_id(
+            receipt["queue_id"], f"two\n\n![image]({redacted_keep})", directive_user_origin=True
+        )
+        assert entry["meta"]["images"] == [redacted_keep]
+        assert entry[PROMPT_IMAGES_ENTRY_KEY] == [keep]
+
+        # ...and then the second, leaving no picture at all.
+        assert slot.queue_edit_by_id(receipt["queue_id"], "two", directive_user_origin=True)
+        assert "images" not in entry["meta"]
+        assert entry[PROMPT_IMAGES_ENTRY_KEY] == []
+
+        state.subagents = None
+        slot._in_stage_execution = False
+        run_chat = MagicMock()
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()),
+            patch.object(chat_runner, "_run_chat", run_chat),
+        ):
+            assert await chat_runner._start_next_queued_turn(state, slot) is True
+        kwargs = run_chat.call_args.kwargs
+        assert kwargs.get("_prompt_images") == []
+        assert "images" not in (kwargs.get("_attachment_meta") or {})
+        # A present-but-empty provider copy builds no image list, even beside a
+        # meta that still names one (the copy is authoritative).
+        assert chat_runner._turn_prompt_attachments({"images": [raw]}, []) == ()
 
     @pytest.mark.asyncio
     async def test_queue_pop_frame_without_attachments_has_no_meta_key(self, tmp_path, monkeypatch):

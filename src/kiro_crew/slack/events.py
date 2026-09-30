@@ -60,6 +60,7 @@ from kiro_crew.messaging.link import canonical_key
 from kiro_crew.messaging.queue_drain import register_drain, tag_entry
 from kiro_crew.platform import current_context, safe_context_call
 from kiro_crew.platform.interfaces import InterceptDecision
+from kiro_crew.prompt_attachments import PromptAttachment
 from kiro_crew.safety_override import safety_override, yolo_policy_permits
 from kiro_crew.security import (
     redact_credentials,
@@ -1898,6 +1899,7 @@ async def _dispatch_queued(
                 # immediate dispatch above).
                 from_trusted_bot=bool(kwargs.get("from_trusted_bot", False)),
                 dm_single_session=KiroCrewConfig.load().slack.dm_single_session,
+                attachments=tuple(kwargs.get("prompt_attachments") or ()),
             )
             return
         await handle_message(
@@ -1919,6 +1921,7 @@ async def _dispatch_queued(
             channel_agent=kwargs.get("agent_override"),
             user_display_name=kwargs.get("user_display_name"),
             from_trusted_bot=bool(kwargs.get("from_trusted_bot", False)),
+            attachments=tuple(kwargs.get("prompt_attachments") or ()),
         )
     finally:
         # The enqueue path deferred temp-image cleanup to here so the queued
@@ -2518,6 +2521,9 @@ async def _route_message(
     # Placed after dedup + auth to avoid expensive work on duplicate events
     # or unauthorized users.
     _attachment_temp_paths: list[str] = []
+    # The ingested images as the structured list the turn hands to the provider
+    # (the only way a picture reaches the model); empty for a text-only message.
+    _prompt_attachments: tuple[PromptAttachment, ...] = ()
     _had_voice_input = False
     if files and orch.slack and _user_authorized:
         memos = [f for f in files if is_voice_memo(f)]
@@ -2550,10 +2556,15 @@ async def _route_message(
             text = _voice_memo_context(text, len(memos), len(transcripts), available=stt_ok)
 
         # ── Process non-audio files (images, text, opaque files, etc.) ──
-        attachment_paths, text_blocks = await process_slack_files(orch, files)
+        attachment_paths, text_blocks, _prompt_attachments = await process_slack_files(
+            orch, files
+        )
         _attachment_temp_paths = attachment_paths
 
-        # Image paths are inlined by ACP; opaque paths remain available to agent tools.
+        # Every path is appended as text for agent tools. An IMAGE reaches the
+        # model only through the structured list (`_prompt_attachments`), which
+        # rides beside the text to the turn: the prompt builder never scans the
+        # text for paths, so a path alone would ship no picture.
         if attachment_paths:
             paths_text = "\n".join(attachment_paths)
             text = f"{text}\n{paths_text}" if text else paths_text
@@ -2789,6 +2800,9 @@ async def _route_message(
             user_display_name=_sender_display,
             # Historical key; carries every attachment temp path for cleanup.
             image_temp_paths=list(_attachment_temp_paths),
+            # The structured image list, so the drained turn hands the model
+            # the picture (the text alone never does).
+            prompt_attachments=tuple(_prompt_attachments),
             from_trusted_bot=from_trusted_bot,
             **_SLACK_QUEUE_TAGS,
         )
@@ -2806,6 +2820,7 @@ async def _route_message(
                         agent_override=agent_override,
                         user_display_name=_sender_display,
                         image_temp_paths=list(_attachment_temp_paths),
+                        prompt_attachments=tuple(_prompt_attachments),
                         from_trusted_bot=from_trusted_bot,
                     ),
                 )
@@ -2833,6 +2848,7 @@ async def _route_message(
         agent_override=agent_override,
         user_display_name=_sender_display,
         image_temp_paths=list(_attachment_temp_paths),
+        prompt_attachments=tuple(_prompt_attachments),
         from_trusted_bot=from_trusted_bot,
         **_SLACK_QUEUE_TAGS,
     ):
@@ -2913,6 +2929,7 @@ async def _route_message(
                 # admits, so replying would ping-pong).
                 from_trusted_bot=from_trusted_bot,
                 dm_single_session=_dm_single_session,
+                attachments=tuple(_prompt_attachments),
             )
         )
         orch._session_tasks[session_key] = t
@@ -2973,6 +2990,7 @@ async def _route_message(
                 from_trusted_bot=from_trusted_bot,
                 channel_activation=activation,
                 had_voice_input=_had_voice_input,
+                attachments=tuple(_prompt_attachments),
             )
         )
     except Exception:

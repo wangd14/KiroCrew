@@ -115,7 +115,9 @@ from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY as _TURN_ACTOR
 from kiro_crew.dashboard.chat_delivery import (
     attachment_meta,
     find_written_steer_row,
+    prompt_image_paths,
     queued_text_for_display,
+    resolve_image_paths,
 )
 from kiro_crew.dashboard.chat_folders import (
     _resolve_folder_steering_dirs,
@@ -194,7 +196,12 @@ from kiro_crew.dashboard.session_directive_apply import (
     QUESTION_CARD_SHOWN_PREFIX,
     apply_session_directive,
 )
-from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY
+from kiro_crew.dashboard.slot_queue_repository import (
+    ALL_ATTACHMENT_META_KEYS,
+    IMAGE_ATTACHMENT_META_KEY,
+    PROMPT_IMAGES_ENTRY_KEY,
+    RESTORED_QUEUE_KEY,
+)
 from kiro_crew.dashboard.state import (
     _MAX_SLOT_MESSAGES,
     CRON_NOTIFY_PREFIX,
@@ -347,6 +354,7 @@ from kiro_crew.name_grant import (
 )
 from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
 from kiro_crew.platform import redact_log_via_context, redact_via_context
+from kiro_crew.prompt_attachments import PromptAttachment, image_attachments
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -8103,6 +8111,11 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
             steer_msg,
             meta=_meta,
             directive_user_origin=_requeue_user_origin,
+            # The steer map holds the send's lists as `attachment_meta` stored
+            # them (redacted); the entry's provider copy is that bounded list,
+            # and `_turn_prompt_attachments` resolves a redacted spelling back
+            # to the server-minted file at dispatch (`resolve_image_paths`).
+            prompt_images=prompt_image_paths(_meta),
         )
         try:
             _push: dict = {
@@ -8450,26 +8463,42 @@ def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
         )
 
 
-def _current_turn_carries_image_ref(message: str) -> bool:
-    """Whether *message* itself names a local image the builder would inline.
+def _turn_prompt_attachments(
+    attachment_meta: "dict[str, list[str]] | None",
+    prompt_images: "list[str] | None" = None,
+) -> tuple[PromptAttachment, ...]:
+    """The structured image list this turn hands to the provider.
 
-    The unsupported-image recovery must only fire for an image retained in
-    NATIVE history, because it clears a healthy conversation's resume SID and
-    replays the text verbatim. Empty dashboard attachment lists are not that
-    proof: a channel turn (``slack/events.py`` appends its attachment paths to
-    the text) and a dashboard turn that simply types a path both carry the image
-    as a bare path INSIDE the message, and ``build_prompt_blocks`` inlines it as
-    a real image block for the CURRENT turn. So read the builder's own scanner on
-    the builder's own haystack -- ``_PATH_RE`` over the raw message, image
-    suffixes only -- rather than re-deriving the grammar here; a match means the
-    rejection may be of the image the user just sent, and the recovery declines.
-
-    Imported inside the function on purpose: ``kiro_crew.image_refs`` documents a
-    load-bearing import rule, and this is the shape its other consumers use.
+    Read off the send's image list -- the PROVIDER copy *prompt_images*
+    (``chat_delivery.prompt_image_paths``: validated raw paths) when the
+    dispatch carries it, else the redacted ``meta.images`` of *attachment_meta*
+    (``IMAGE_ATTACHMENT_META_KEY``), the copy the crew log and the refusal
+    replay read and the only copy a regenerate, an edit-resend, a rewind, an
+    entry restored from disk or a row the restart marker re-appended still
+    has. Either way the list goes through ``chat_delivery.resolve_image_paths``,
+    the one server-side resolver: a spelling the redactor rewrote (a
+    sender-chosen filename that looked like a credential) is mapped back to
+    the file the server minted through the upload's own key, so every rebuild
+    opens the same file the first send did while the stored copies stay
+    redacted. This list is the ONLY source of the turn's image blocks: the
+    prompt builder never scans the message text for paths, so the
+    ``![image](path)`` line the composer writes into the text is a rendering
+    for the bubble, not the upload. Empty for a turn whose send carried no
+    image -- including every injected turn (cron, sub-agent completion, nudge
+    cycle, ledger snapshot), which is exactly what keeps a path those texts
+    name from becoming a re-inlined image on every cycle.
     """
-    from kiro_crew.image_refs import _PATH_RE
-
-    return bool(_PATH_RE.search(message or ""))
+    paths: "list[str] | tuple[str, ...]" = ()
+    if prompt_images is not None:
+        # A PRESENT provider copy is authoritative, empty included: the drain
+        # passes one for every entry that carried it, and a queued edit that
+        # removed the last picture leaves it empty on purpose.
+        paths = prompt_images
+    elif attachment_meta:
+        paths = attachment_meta.get(IMAGE_ATTACHMENT_META_KEY) or ()
+    if not paths:
+        return ()
+    return image_attachments(resolve_image_paths(paths))
 
 
 def _session_stop_generation_for(sessions: Any, session_key: str) -> int:
@@ -9292,15 +9321,34 @@ async def _start_next_queued_turn(
     # across `consumed` because a row that carries attachments drains ALONE
     # (`carries_attachments`), so there is exactly one such row to read.
     _drained_attachment_meta: dict[str, list[str]] = {}
+    _drained_prompt_images: list[str] = []
+    _saw_prompt_images = False
     for item in consumed:
         for _meta_key, _meta_paths in attachment_meta(item.get("meta")).items():
             _drained_attachment_meta.setdefault(_meta_key, []).extend(_meta_paths)
+        # The PROVIDER copy of the entry's image list (raw paths, stamped at
+        # enqueue); an entry restored from disk carries none and falls back to
+        # its redacted list, the persisted copy's rule.
+        _raw_images = item.get(PROMPT_IMAGES_ENTRY_KEY)
+        if isinstance(_raw_images, list):
+            # Present means authoritative, EMPTY included: a queued edit that
+            # removed every picture leaves an empty copy behind on purpose
+            # (`prune_queued_entry`), and falling back to `meta.images` here
+            # would hand the model the picture the edit took out.
+            _saw_prompt_images = True
+            _drained_prompt_images.extend(p for p in _raw_images if isinstance(p, str) and p)
+        else:
+            _drained_prompt_images.extend(
+                attachment_meta(item.get("meta")).get(IMAGE_ATTACHMENT_META_KEY) or []
+            )
     _drained_attachments = [path for paths in _drained_attachment_meta.values() for path in paths]
     if _drained_attachments:
         _run_kwargs["_attachments"] = _drained_attachments
         # The typed form rides along so the refusal replay can rebuild the
         # entry's meta without retyping ``dirs`` entries as files.
         _run_kwargs["_attachment_meta"] = _drained_attachment_meta
+    if _saw_prompt_images or _drained_prompt_images:
+        _run_kwargs["_prompt_images"] = _drained_prompt_images
     # Replay identity rides as a parameter, matched by queue-entry id at the one
     # site that still has the entry. The replay must have drained ALONE: a merge
     # folding user input into the same dispatch is a correction, not the retry.
@@ -9642,10 +9690,14 @@ def _local_turn_generation_for(slot: _ChatSlot) -> int:
 
 
 # Keys of the opening row copied into the marker: the row's identity, its
-# attachment lists and, for an inject, the kind that makes the classifier
-# count it as a turn opener. Everything else about the row is recomputed by
-# ``_ChatSlot.append`` or belongs to the process that wrote it.
-_LOCAL_TURN_PROMPT_META_KEYS = ("mid", "files", "dirs", "injectKind")
+# attachment lists -- every list of ``ALL_ATTACHMENT_META_KEYS``, ``images``
+# included, since the picture a send attached rides ``meta.images`` and nothing
+# else, and a restored opener without it is a row whose later regenerate or
+# edit-resend cannot replay the image -- and, for an inject, the kind that
+# makes the classifier count it as a turn opener. Everything else about the row
+# is recomputed by ``_ChatSlot.append`` or belongs to the process that wrote
+# it. Mirrors ``chat_persistence._LOCAL_TURN_PROMPT_META_KEYS``.
+_LOCAL_TURN_PROMPT_META_KEYS = ("mid", *ALL_ATTACHMENT_META_KEYS, "injectKind")
 #: Roles whose row opens a turn by itself. ``inject`` opens one only with a
 #: dispatching ``injectKind`` (``_is_turn_inject``). Mirrors
 #: ``_LOCAL_TURN_PROMPT_ROLES`` in ``chat_persistence.py`` minus ``inject``.
@@ -9867,19 +9919,27 @@ async def _run_chat(
     message: str,
     *,
     _prompt_depth: int = 0,
-    # Attachment identifiers of the message this turn runs -- `meta.files` and
-    # `meta.dirs`, the same lists the renderer resolves `[attached_file N]` markers
-    # against. Passed by the two sites that OBSERVED them (the accepting handler and
-    # the queue drain) rather than read back off the slot's last user row, which
-    # would attribute a previous turn's files to a synthetic or recovery turn.
+    # Attachment identifiers of the message this turn runs -- `meta.files`,
+    # `meta.dirs` (the lists the renderer resolves `[attached_file N]` markers
+    # against) and `meta.images` (the composer's uploaded pictures). Passed by
+    # the two sites that OBSERVED them (the accepting handler and the queue
+    # drain) rather than read back off the slot's last user row, which would
+    # attribute a previous turn's files to a synthetic or recovery turn.
     _attachments: "tuple[str, ...] | list[str]" = (),
-    # The same attachments keyed by their meta list (``files`` / ``dirs``),
-    # preserving each path's TYPE where the flat list above cannot. The refusal
-    # replay rebuilds the queue entry's meta from this, so a folder attachment
-    # retries as a folder -- rebucketing the flat list under ``files`` would
-    # retype it and resolve its ``[attached_dir N]`` marker against the wrong
-    # list. Optional so the many existing callers and test doubles stay valid.
+    # The same attachments keyed by their meta list (``files`` / ``dirs`` /
+    # ``images``), preserving each path's TYPE where the flat list above cannot.
+    # The refusal replay rebuilds the queue entry's meta from this, so a folder
+    # attachment retries as a folder -- rebucketing the flat list under
+    # ``files`` would retype it and resolve its ``[attached_dir N]`` marker
+    # against the wrong list -- and the ``images`` list is what the turn hands
+    # the provider as its structured image attachments (the ONLY source of image
+    # blocks; the text is never scanned). Optional so the many existing callers
+    # and test doubles stay valid.
     _attachment_meta: "dict[str, list[str]] | None" = None,
+    # The PROVIDER copy of the send's image list: validated raw paths, unredacted
+    # (`chat_delivery.prompt_image_paths`). `_attachment_meta` is the redacted copy
+    # every observer reads; the prompt builder opens THESE.
+    _prompt_images: "list[str] | None" = None,
     _synthetic_payload: bool = False,
     # This dispatch IS the queued refusal replay (agent.refusal_fallback_model):
     # the drain matched the drained entry's queue id against the slot's recorded
@@ -10601,6 +10661,18 @@ async def _run_chat(
             ),
             directive_user_origin=_directive_user_origin,
             directive_channel_origin=_directive_channel_origin,
+            # Only an ORIGINAL replay reopens this turn's pictures, the same gate
+            # as the attachment-list merge above: the provider copy rides the
+            # entry as it did the dispatch while the merged meta stays the
+            # redacted copy. A continuation body is runner prose the model
+            # already holds the pictures for; stamping the copy on it would
+            # re-inline every image block and spend the one-shot poisoned-image
+            # reset on a turn that never carried a picture of its own.
+            prompt_images=(
+                list(_prompt_images)
+                if _prompt_images and payload == RecoveryPayload.ORIGINAL
+                else None
+            ),
         )
         if slot._in_stage_execution and not _consumed_reported and content == message:
             stage_boundary_for(slot).retry_queue_id = _recovery_qid
@@ -13493,7 +13565,22 @@ async def _run_chat(
         # the step's duration would include the time the gates took.
         _crew_log_step = crew_log_emit.on_step_started(_crew_log_sid, _crew_log_turn_no)
         _crew_log_step_t0 = time.monotonic()
-        event_stream = client.stream_command(message) if is_slash else client.stream(full_message)
+        # The turn's image blocks come from the send's structured image list
+        # alone (see ``_turn_prompt_attachments``); passed only when there is
+        # one, so a provider double predating the keyword still takes every
+        # text-only turn. Off the loop: resolving a redacted spelling lists the
+        # upload directory (``resolve_image_paths``), and a listing of an
+        # unpruned directory is filesystem work the shared gateway loop must
+        # not wait on -- the ordinary list touches no file and costs one hop.
+        _prompt_attachments = await asyncio.to_thread(
+            _turn_prompt_attachments, _attachment_meta, _prompt_images
+        )
+        if is_slash:
+            event_stream = client.stream_command(message)
+        elif _prompt_attachments:
+            event_stream = client.stream(full_message, attachments=_prompt_attachments)
+        else:
+            event_stream = client.stream(full_message)
         async for event in event_stream:
             if (_todo_sync_rendered or _todo_recovery_carried) and (
                 event.kind in _TODO_BLOCK_READ_EVENT_KINDS
@@ -19360,7 +19447,7 @@ async def _run_chat(
         elif (
             getattr(exc, "image_format_unsupported", False)
             and not _attachments
-            and not _current_turn_carries_image_ref(message)
+            and not _prompt_images
             and not slot._poisoned_reset_used
             and _prompt_depth == 0
             and not _should_suppress_requeue(slot)
@@ -19376,16 +19463,15 @@ async def _run_chat(
             # canary-based poison recovery, so a failed fresh attempt cannot
             # enter a discard loop.
             #
-            # "No new image" is TWO facts, not one. `_attachments` covers the
-            # dashboard upload lists, but a channel turn (and a dashboard turn
-            # that types a path) carries its image as a bare path inside the
-            # message TEXT, which `build_prompt_blocks` inlines as a real image
-            # block for the CURRENT turn while `_attachments` stays empty. Such a
-            # rejection is of the image the user just sent: discarding the
-            # conversation would clear a healthy resume SID and the verbatim
-            # replay would re-inline the same bytes, so it must fall through to
-            # the terminal error whose formatted text already says to remove or
-            # re-encode the attachment.
+            # "No new image" is ONE fact now: `_attachments` carries every
+            # list the send named, images included (`IMAGE_ATTACHMENT_META_KEY`),
+            # and that list is the ONLY source of the turn's image blocks -- the
+            # builder never scans the message text for a path, so a typed path
+            # ships no picture. A rejection on a turn WITH a new image is of the
+            # image the user just sent: discarding the conversation would clear a
+            # healthy resume SID and the replay would re-inline the same bytes,
+            # so it falls through to the terminal error whose formatted text
+            # already says to remove or re-encode the attachment.
             _persist_partial_reply()
             slot._prestream_exhausted_cycles = 0
             slot._poisoned_reset_used = True

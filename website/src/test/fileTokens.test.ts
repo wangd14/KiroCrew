@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { addPendingFile, extendsConsumably, findUnreferencedAttachments, foldWinSep, isWindowsShapedPath, mentionBoundary, mentionBoundaryFor, mentionTokenRegex, normalizeWindowsPath, parseFiles, prepareSendPayload, buildFileLabels, resolveFileSegment, mdImageDest, mdImageDestToPath, restoreQueuedContent, restoreUnreferencedImages, serializeDirTokens } from '../utils/fileTokens'
 
 describe('buildFileLabels uniqueness', () => {
@@ -283,6 +285,24 @@ describe('prepareSendPayload', () => {
       // Pre-existing history was written raw: `%20` there is part of the
       // on-disk name, not an encoding.
       expect(mdImageDestToPath('/tmp/photo%20copy.png')).toBe('/tmp/photo%20copy.png')
+    })
+
+    it('mdImageDest matches the shared vectors the gateway mirror is pinned to', () => {
+      // The gateway re-implements this grammar (`markdown_image_dest` in
+      // src/kiro_crew/prompt_attachments.py) to rewrite an inlined picture's
+      // line to its `[image: <name>]` marker and to see, on a queued edit, that
+      // the user removed a picture whose destination the composer escaped. One
+      // vector file pins both halves: the backend test asserts the same cases,
+      // so a change here that is not mirrored there goes red instead of
+      // silently keeping a deleted picture in the turn.
+      const fixturePath = resolve(__dirname, '../../../test/fixtures/markdown_image_dest.json')
+      const cases: { name: string; path: string; dest: string }[] = JSON.parse(
+        readFileSync(fixturePath, 'utf8'),
+      ).cases
+      expect(cases.length).toBeGreaterThanOrEqual(8)
+      for (const c of cases) {
+        expect(mdImageDest(c.path), c.name).toBe(c.dest)
+      }
     })
   })
 

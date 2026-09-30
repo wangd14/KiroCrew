@@ -478,6 +478,9 @@ describe('ChatPanel composer', () => {
     ).toBeInTheDocument()
     // The typed text is not lost, so the user can retry.
     expect(composer()).toHaveValue('keep me')
+    // The caret returns to the restored draft (the Send click had moved focus
+    // to the button), so the text reads as the user's own, not as the placeholder.
+    await waitFor(() => expect(composer()).toHaveFocus())
   })
 
   it('dismisses the failure banner', async () => {
@@ -1111,12 +1114,72 @@ describe('ChatPanel screenshot capture', () => {
       await userEvent.type(composer(), 'crop it')
       expect(composer()).toHaveValue('crop it')
       await userEvent.click(screen.getByRole('button', { name: 'Send' }))
-      // Referenced by path, so the crop reaches the agent as a real image
-      // instead of living only in this window.
+      // Referenced by path in the text (so the sent bubble renders it) AND
+      // handed over as the structured image list, which is what puts the
+      // crop in front of the model -- the gateway never scans the text.
       await waitFor(() =>
         expect(sendMessage).toHaveBeenCalledWith(
           'crop it\n\n![image](/home/u/uploads/snip.png)',
           undefined,
+          ['/home/u/uploads/snip.png'],
+        ),
+      )
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+
+  it('puts the crop back in the strip, beside the typed text, when the send is refused', async () => {
+    // The strip was cleared before the send awaited. A refused send must hand
+    // back the TYPED text and the chip -- not the composed wire text, whose
+    // `![image](dest)` line would either double the picture on the next send
+    // (composeMessage re-adds the line) or ship no picture at all (the gateway
+    // builds image blocks from the structured list, never from the line).
+    const fetchSpy = stubUpload({ ok: true, body: { paths: ['/home/u/uploads/snip.png'] } })
+    try {
+      await renderPanel()
+      emit('onCaptureDone', 'QUJD')
+      expect(await screen.findByAltText('snip.png')).toBeInTheDocument()
+      sendMessage.mockRejectedValueOnce(new Error('offline'))
+      await userEvent.type(composer(), 'what is this')
+      await userEvent.click(screen.getByRole('button', { name: 'Send' }))
+      await screen.findByText("Couldn't send — check your connection and try again.")
+      expect(composer()).toHaveValue('what is this')
+      expect(await screen.findByAltText('snip.png')).toBeInTheDocument()
+      // The retry sends the picture exactly once: the chip serialises it, the
+      // composer text carries no leftover reference line.
+      sendMessage.mockResolvedValueOnce(undefined)
+      await userEvent.click(screen.getByRole('button', { name: 'Send' }))
+      await waitFor(() =>
+        expect(sendMessage).toHaveBeenLastCalledWith(
+          'what is this\n\n![image](/home/u/uploads/snip.png)',
+          undefined,
+          ['/home/u/uploads/snip.png'],
+        ),
+      )
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+
+  it('hands a crop attached while editing to the edit route as the image list', async () => {
+    // An edit that ADDS a picture must send it structurally too: the gateway
+    // merges it with the pictures the original row kept and builds the turn's
+    // image blocks from that list alone, never from the `![image](dest)` line.
+    history = [{ role: 'user', content: 'what is this?', timestamp: 1700000000000 }]
+    const fetchSpy = stubUpload({ ok: true, body: { paths: ['/home/u/uploads/snip.png'] } })
+    try {
+      await renderPanel()
+      await screen.findByText('what is this?')
+      await userEvent.click(screen.getByRole('button', { name: 'Edit & resend' }))
+      emit('onCaptureDone', 'QUJD')
+      expect(await screen.findByAltText('snip.png')).toBeInTheDocument()
+      await userEvent.click(screen.getByRole('button', { name: 'Send' }))
+      await waitFor(() =>
+        expect(editResend).toHaveBeenCalledWith(
+          'what is this?\n\n![image](/home/u/uploads/snip.png)',
+          '1700000000000',
+          ['/home/u/uploads/snip.png'],
         ),
       )
     } finally {

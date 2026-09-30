@@ -17,13 +17,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.dashboard.chat_utils import _redact_for_display, _redact_meta
-from kiro_crew.dashboard.slot_queue_repository import ATTACHMENT_META_KEYS, warn_if_not_durable
+from kiro_crew.dashboard.slot_queue_repository import (
+    ALL_ATTACHMENT_META_KEYS,
+    IMAGE_ATTACHMENT_META_KEY,
+    bounded_attachment_list,
+    warn_if_not_durable,
+)
 from kiro_crew.history import HUMAN_TURN_META_KEY
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -81,20 +89,13 @@ MAX_PENDING_STEERS = 32
 # dots, path-shaped tokens).
 _SEND_ID_RE = re.compile(rf"^[A-Za-z0-9_-]{{1,{SEND_ID_MAX_LEN}}}$")
 
-# Upper bounds on a send's attachment lists (``meta.files`` / ``meta.dirs``) as
-# RETAINED by ``attachment_meta``. Every retention site stores the normalized
-# result -- the queue entry, the pending-steer map, the persisted row meta, and
-# the ``steer_push`` / ``queue_pop`` frames -- after paths pass through
-# ``_redact_meta``. Redaction can rewrite credential content, but it does not
-# limit input size. The gateway caps request bodies at 60 MiB, still far above
-# the roughly 1 MiB per list these bounds admit, so these per-field bounds at
-# the one normalizer remain the only size check before every retained copy. One
-# named constant per bound, applied in the one normalizer every site calls, so
-# no two stores can disagree about what was admitted. Generous against the
-# composer (20 files per upload batch; a path is a filesystem path, PATH_MAX
-# 4096 on Linux) so a legitimate send never trips them.
-ATTACHMENT_LIST_MAX_ITEMS = 256
-ATTACHMENT_PATH_MAX_LEN = 4096
+# The attachment-list bounds live beside the meta keys in
+# ``slot_queue_repository`` (``ATTACHMENT_LIST_MAX_ITEMS`` /
+# ``ATTACHMENT_PATH_MAX_LEN``, applied by ``bounded_attachment_list``):
+# ``attachment_meta`` below is the send-path normalizer that applies them, and
+# the read-back sites (``retained_image_meta``, ``with_added_images``, the
+# restart marker's opening-row copy) apply the same helper, so no two stores
+# can disagree about what was admitted.
 
 
 def normalize_send_id(value: object) -> str | None:
@@ -813,6 +814,7 @@ def queue_for_next_turn(
     attachments: dict[str, list[str]] | None = None,
     decision_strip: dict | None = None,
     turn_actor: str = "",
+    prompt_images: list[str] | None = None,
 ) -> str:
     """Append *message* to the slot's queue and announce it; return the queue id.
 
@@ -845,6 +847,12 @@ def queue_for_next_turn(
     the row it appends, so this is the only way a QUEUED send's row carries the
     receipt for the decision that queued it. Absent on every send that was not
     decided, which keeps the entry's prior shape.
+
+    *prompt_images* is the PROVIDER copy of the send's image list
+    (:func:`prompt_image_paths`: bounded, unredacted). It rides the entry under
+    ``PROMPT_IMAGES_ENTRY_KEY`` -- process-local, never persisted, never in a
+    frame -- so the drain can hand ``_run_chat`` the paths the prompt builder
+    opens, while ``meta.images`` stays the redacted copy every observer reads.
     """
     # circular import: session_control imports this module at module level.
     from kiro_crew.dashboard.session_control import containment_meta
@@ -867,6 +875,7 @@ def queue_for_next_turn(
         message,
         meta=meta,
         directive_user_origin=directive_user_origin,
+        prompt_images=prompt_images,
     )
     # Append-only session ledger. The session id comes off the client the running
     # turn published on the slot -- a message is only queued because a turn IS
@@ -1011,51 +1020,164 @@ def attachment_meta(user_meta: dict | None) -> dict[str, list[str]]:
     carry them drains alone (``chat_utils.carries_attachments``), so the row
     the drain writes has exactly one text for the lists to index.
 
+    The image list (``IMAGE_ATTACHMENT_META_KEY``) rides with them under the
+    same bounds: it indexes no marker, but it is the STRUCTURED list the turn
+    hands to the provider, and the only source of the turn's image blocks.
+
     The paths pass through ``_redact_meta``, the same redaction every persisted
     row meta gets: a path is user-supplied text and can embed a credential
     just as a message can, and this list reaches every client of the slot
     (queue entry, drained row, ``queue_pop`` frame) -- the same places the
     message text reaches only after ``redact_credentials``.
 
-    Bounded here, at the point of retention: a list over
-    ``ATTACHMENT_LIST_MAX_ITEMS`` entries, or one carrying a path over
-    ``ATTACHMENT_PATH_MAX_LEN`` chars, is refused WHOLE rather than sliced. A
-    list cut at N leaves the markers past N resolving through the renderer's
-    whitespace-bounded fallback (a spaced path truncated at its first space),
-    and a path cut in place is a different path -- so the refusal takes the
-    same shape a malformed list already gets, and says so once in the log.
+    Bounded here, at the point of retention, through the shared
+    ``bounded_attachment_list``: a list over ``ATTACHMENT_LIST_MAX_ITEMS``
+    entries, or one carrying a path over ``ATTACHMENT_PATH_MAX_LEN`` chars, is
+    refused WHOLE rather than sliced. A list cut at N leaves the markers past N
+    resolving through the renderer's whitespace-bounded fallback (a spaced
+    path truncated at its first space), and a path cut in place is a
+    different path -- so the refusal takes the same shape a malformed list
+    already gets, and says so once in the log. The read-back sites
+    (``retained_image_meta``, ``with_added_images``, the restart marker's
+    opening-row copy) apply the same helper, so a persisted or rebuilt list
+    cannot exceed what this normalizer admits.
     """
     out: dict[str, list[str]] = {}
     if not isinstance(user_meta, dict):
         return out
-    for key in ATTACHMENT_META_KEYS:
-        raw = user_meta.get(key)
-        if not isinstance(raw, list) or not raw:
+    for key in ALL_ATTACHMENT_META_KEYS:
+        paths = bounded_attachment_list(key, user_meta.get(key))
+        if paths is None:
             continue
-        if not all(isinstance(p, str) and p for p in raw):
-            continue
-        if len(raw) > ATTACHMENT_LIST_MAX_ITEMS:
-            logger.warning(
-                "attachment meta %r refused: %d entries over the %d-entry bound",
-                key,
-                len(raw),
-                ATTACHMENT_LIST_MAX_ITEMS,
-            )
-            continue
-        longest = max(len(p) for p in raw)
-        if longest > ATTACHMENT_PATH_MAX_LEN:
-            logger.warning(
-                "attachment meta %r refused: a %d-char path over the %d-char bound",
-                key,
-                longest,
-                ATTACHMENT_PATH_MAX_LEN,
-            )
-            continue
-        out[key] = list(raw)
+        out[key] = paths
     if not out:
         return out
     redacted = _redact_meta(out)
     return {k: v for k, v in redacted.items() if isinstance(v, list)}
+
+
+def prompt_image_paths(user_meta: dict | None) -> list[str]:
+    """The send's ``meta.images`` as the PROVIDER reads it: bounded, NOT redacted.
+
+    :func:`attachment_meta` is the copy every persisted and client-visible
+    surface holds -- the transcript row, the queue entry and its frames, the
+    crew log, the refusal replay -- and it runs each path through
+    ``_redact_meta`` like the message text beside it. The image list is
+    different from the marker lists in one respect: it is not only displayed,
+    it is READ BACK as a filesystem path by the prompt builder, which emits
+    the turn's image blocks from it alone. The upload writer keeps the
+    caller's filename in the path, so a picture whose name looks like a
+    credential (a CDN object key, a ``ghp_`` prefix) came back from the
+    redactor as a path that exists nowhere, the builder skipped it with a
+    debug line, and the user's own upload silently never reached the model.
+    So the ONE copy the provider reads keeps the validated raw paths, under
+    the same count and length bounds; redaction stays on every copy a person
+    or a peer can observe. Returns ``[]`` for a send without images.
+    """
+    if not isinstance(user_meta, dict):
+        return []
+    return (
+        bounded_attachment_list(IMAGE_ATTACHMENT_META_KEY, user_meta.get(IMAGE_ATTACHMENT_META_KEY))
+        or []
+    )
+
+
+#: The upload writer names every file it stores ``<uuid4 hex>_<sanitized
+#: sender name>`` (``handlers/files.py``). The 32-hex prefix is the server's
+#: own unique key for the upload, and no redaction rule rewrites it: the
+#: credential rules are anchored on the credential shape inside the sender's
+#: part of the name, so a redacted spelling still opens with the key.
+_UPLOAD_KEY_RE = re.compile(r"^([0-9a-f]{32})_")
+
+
+def _upload_files_by_key(upload_dir: Path) -> dict[str, list[str]]:
+    """The regular files of *upload_dir* grouped by their ``<uuid>_`` key.
+
+    ONE directory listing, taken only when a call has a redacted spelling to
+    place and shared by every path of that call -- never retained across calls
+    (no cache, no sweeper): the directory is the source of truth and a stale
+    view of it would resolve a spelling to a file that is gone. An unreadable
+    directory reads as empty, so nothing resolves and the builder skips the
+    spelling as before.
+    """
+    by_key: dict[str, list[str]] = {}
+    try:
+        with os.scandir(upload_dir) as entries:
+            for entry in entries:
+                key = _UPLOAD_KEY_RE.match(entry.name)
+                if key is None:
+                    continue
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                by_key.setdefault(key.group(1), []).append(entry.path)
+    except OSError:
+        return {}
+    return by_key
+
+
+def _resolve_redacted_upload(path: str, upload_dir: Path, by_key: dict[str, list[str]]) -> str:
+    """The file the server minted for a REDACTED upload spelling, or *path*.
+
+    The candidate must sit in the server's own upload directory (a lexical
+    comparison, so caller text never drives a ``resolve()``), carry the upload
+    key, and match exactly ONE file under that key in *by_key* -- so a
+    persisted or client string can select among the server's own uploads and
+    nothing else. Anything short of that returns *path* unchanged and the
+    prompt builder skips it as before.
+    """
+    candidate = Path(path)
+    key = _UPLOAD_KEY_RE.match(candidate.name)
+    if key is None:
+        return path
+    same_dir = os.path.normcase(os.path.normpath(str(candidate.parent))) == os.path.normcase(
+        os.path.normpath(str(upload_dir))
+    )
+    if not same_dir:
+        return path
+    matches = by_key.get(key.group(1)) or []
+    if len(matches) != 1:
+        return path
+    return matches[0]
+
+
+def _is_redacted_spelling(path: str) -> bool:
+    return "[REDACTED" in path or "[redacted" in path
+
+
+def resolve_image_paths(paths: Iterable[str]) -> list[str]:
+    """Every image path as the file the server minted, order kept.
+
+    The ONE resolver every prompt rebuild reaches (``_turn_prompt_attachments``
+    hands the turn's list through it, off the event loop): a regenerate, an
+    edit-resend, a rewind, a queue entry restored from disk, a row the restart
+    marker re-appended and the peer side of a relay all rebuild the turn from a
+    PERSISTED or client-visible copy of the list, whose paths went through the
+    redactor like the text beside them. A picture whose sender-chosen filename
+    looked like a credential therefore comes back as a spelling that exists
+    nowhere -- and this maps it back to the real file through the server's own
+    upload key (:func:`_resolve_redacted_upload`), so those turns open the same
+    file the first send did while the stored copies stay redacted. A list with
+    no redacted spelling costs no filesystem work at all; one that has some
+    costs ONE listing of the upload directory (:func:`_upload_files_by_key`),
+    however many paths it carries. A raw path passes through untouched; a
+    spelling that cannot be resolved is kept as it is and skipped by the
+    builder, as before.
+    """
+    todo = [p for p in paths if isinstance(p, str) and p]
+    if not any(_is_redacted_spelling(p) for p in todo):
+        return todo
+    # Lazy: ``handlers.files`` imports most of the dashboard at module level.
+    from kiro_crew.dashboard.handlers.files import _upload_dir
+
+    upload_dir = _upload_dir()
+    by_key = _upload_files_by_key(upload_dir)
+    return [
+        _resolve_redacted_upload(p, upload_dir, by_key) if _is_redacted_spelling(p) else p
+        for p in todo
+    ]
 
 
 def queue_entry_view(item: dict[str, Any]) -> dict[str, Any]:

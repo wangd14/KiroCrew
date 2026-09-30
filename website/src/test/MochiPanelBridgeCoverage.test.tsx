@@ -727,6 +727,32 @@ describe('panelBridge send', () => {
     expect(bodyOf(calls('/api/chat?ws=1', 'POST')[0]).meta).toBeUndefined()
   })
 
+  it('rejects when the gateway refuses the send, so the panel can restore the composer', async () => {
+    // ChatPanel clears the composer before awaiting and restores the typed
+    // text and the attachment strip only from a thrown error; a resolved
+    // promise on a 4xx/5xx would lose both while no turn ran.
+    route('/api/chat/slots', { body: { agent: 'mochi' } }, 'POST')
+    route('/api/chat?ws=1', { ok: false, status: 409, body: { error: 'busy' } }, 'POST')
+    const bridge = await loadBridge()
+    const seen: Record<string, unknown>[] = []
+    bridge.onChatMessage((m) => seen.push(m))
+    await expect(bridge.sendMessage('keep me', undefined, ['/tmp/uploads/a.png'])).rejects.toThrow(
+      /409/,
+    )
+    // No ghost bubble: the message is echoed only once the gateway accepted
+    // it. Echoed before the POST, a refused send left the transcript showing
+    // the message as sent while the composer held it again, and the retry
+    // then drew it twice (UX review).
+    expect(seen).toHaveLength(0)
+  })
+
+  it('resolves when the gateway accepts the send', async () => {
+    route('/api/chat/slots', { body: { agent: 'mochi' } }, 'POST')
+    route('/api/chat?ws=1', { ok: true, status: 200, body: { ok: true } }, 'POST')
+    const bridge = await loadBridge()
+    await expect(bridge.sendMessage('go')).resolves.toBeUndefined()
+  })
+
   it('refuses to send into a slot another agent owns', async () => {
     route('/api/chat/slots', { body: { agent: 'someone-else' } }, 'POST')
     const bridge = await loadBridge()

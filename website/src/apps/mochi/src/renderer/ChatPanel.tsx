@@ -946,24 +946,48 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
   const screenshotRef = useRef(screenshot)
   screenshotRef.current = screenshot
 
-  const sendText = useCallback(async (text: string) => {
+  const sendText = useCallback(async (
+    text: string,
+    images: readonly string[] = [],
+    staged: readonly PendingAttachment[] = [],
+    typed?: string,
+  ) => {
     if (!text && !screenshotRef.current) return
     setIsWaiting(true)
     setTurnActive(true)
     try {
-      await api?.sendMessage?.(text, screenshotRef.current || undefined)
+      // The dropped pictures ride as a third argument only when there are
+      // some, so a text-only send keeps the two-argument shape every caller
+      // and stand-in of `sendMessage` already has.
+      if (images.length) await api?.sendMessage?.(text, screenshotRef.current || undefined, images)
+      else await api?.sendMessage?.(text, screenshotRef.current || undefined)
       setScreenshot(null)
     } catch {
       // Send failed. handleSend already cleared the composer before awaiting, so
       // without this the typed text is lost, no error shows, and the spinner
-      // sticks forever. Restore the text (composer is empty on this path), clear
-      // the stuck waiting state, and surface the failure via the existing
+      // sticks forever. Restore what the user had -- the TYPED text and the
+      // attachment strip, not the composed wire text: `composeMessage` re-adds
+      // the reference lines on the next send, so restoring the composed form
+      // beside the chips would send each picture twice, and restoring the text
+      // alone would send the `![image](dest)` line with no picture behind it
+      // (the gateway builds image blocks from the structured list only) --
+      // clear the stuck waiting state, and surface the failure via the existing
       // error banner — the dashboard AddWatchForm "your input is still here,
       // try again" recovery.
       setIsWaiting(false)
       setTurnActive(false)
-      setInput((prev) => (prev ? prev : text))
+      setInput((prev) => (prev ? prev : (typed ?? text)))
+      if (staged.length) {
+        setAttachments((prev) => {
+          const have = new Set(prev.map((a) => a.path))
+          return [...staged.filter((a) => !have.has(a.path)), ...prev]
+        })
+      }
       setDropError(i18nT('apps.mochi.chat.send_failed'))
+      // The caret goes back into the restored draft: the Send click had moved
+      // focus to the button, and a caret is what tells the user's own text from
+      // the placeholder, so they retry instead of retyping.
+      inputRef.current?.focus()
     }
   }, [])
 
@@ -1007,8 +1031,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
     const result = await ingestFiles(files)
     if (result.images.length > 0 || result.files.length > 0) {
       // Referenced by PATH rather than stuffed into the single `screenshot` slot,
-      // which is what limited the fork to one image. Core's ACP client inlines
-      // every image path it finds, so the count is unbounded.
+      // which is what limited the fork to one image. The paths ride the send's
+      // `meta.images` list, one image block each, so the count is unbounded.
       setAttachments((prev) => [...prev, ...attachmentsFrom(result)])
       // The box grows when references are appended; keep the caret visible.
     }
@@ -1020,6 +1044,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
     if (!typed && !screenshot && attachments.length === 0) return
     // Attachment references are appended HERE, not kept in the composer.
     const text = composeMessage(input, attachments)
+    // The dropped pictures as a STRUCTURED list: the gateway builds the turn's
+    // image blocks from this alone and never scans the text for image paths,
+    // so the `![image](dest)` lines in `text` are a rendering for the bubble.
+    const images = attachments.filter((a) => a.isImage).map((a) => a.path)
+    // Snapshot of the strip, handed to the failure path so a send that never
+    // reached the gateway can put the chips back beside the typed text.
+    const staged = attachments.slice()
     setInput('')
     setAttachments([])
     // Re-measure rather than only clearing the inline height: an explicit height
@@ -1046,12 +1077,15 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
         scrollerRef.current?.scrollTo({ top: scrollerRef.current!.scrollHeight, behavior: 'smooth' })
       }, 50)
       wasNearBottomRef.current = true
-      const result = await api?.editResend?.(text, editTsStr)
+      const result = images.length
+        ? await api?.editResend?.(text, editTsStr, images)
+        : await api?.editResend?.(text, editTsStr)
       if (!result?.ok) {
         // Fallback: send as normal message — don't add user msg locally,
-        // sendMessage will trigger chat:message event which adds it
-        setIsWaiting(true)
-        await api?.sendMessage?.(text, screenshot || undefined)
+        // sendMessage will trigger chat:message event which adds it. Through
+        // sendText, so a fallback that fails too restores the typed text and
+        // the attachment strip like any other failed send.
+        await sendText(text, images, staged, typed)
       }
       return
     }
@@ -1086,7 +1120,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
       return
     }
 
-    sendText(text || i18nT('apps.mochi.chat.what_is_this'))
+    sendText(text || i18nT('apps.mochi.chat.what_is_this'), images, staged, typed)
   }
 
   // Float the capsule/pill a fixed gap above the measured bottom stack; the

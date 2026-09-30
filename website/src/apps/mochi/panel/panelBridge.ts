@@ -761,8 +761,11 @@ function echoOwnMessage(text: string, screenshot?: string): void {
   for (const cb of messageListeners) cb(msg)
 }
 
-export async function sendMessage(text: string, screenshot?: string): Promise<void> {
-  echoOwnMessage(text, screenshot)
+export async function sendMessage(
+  text: string,
+  screenshot?: string,
+  images: readonly string[] = [],
+): Promise<void> {
   // Bind the slot to the mochi agent before the first turn (idempotent).
   await ensureSlot()
   // The pet must react to the SEND, not to the first token: `thinking` is
@@ -771,16 +774,40 @@ export async function sendMessage(text: string, screenshot?: string): Promise<vo
   reportPetEvent('user_input')
   // `ws=1` tells the gateway to fan the turn out over the WebSocket instead of
   // holding an SSE response open (matching how the dashboard chat works).
-  await fetch('/api/chat?ws=1', {
+  // `meta.images` is the STRUCTURED attachment list the gateway builds the
+  // turn's image blocks from (the same key the dashboard composer sends). The
+  // `![image](dest)` lines in `text` render the pictures in the bubble; the
+  // gateway never scans text for image paths, so without this list a dropped
+  // picture would never reach the model.
+  const meta = {
+    ...(screenshot ? { screenshot } : {}),
+    ...(images.length ? { images: [...images] } : {}),
+  }
+  const resp = await fetch('/api/chat?ws=1', {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       message: text,
       slot: MOCHI_SLOT,
-      ...(screenshot ? { meta: { screenshot } } : {}),
+      ...(Object.keys(meta).length ? { meta } : {}),
     }),
   })
+  // A refused send (4xx/5xx) is a FAILURE to the caller, exactly like a
+  // refused approval or appearance write above: ChatPanel cleared the composer
+  // before awaiting and restores the typed text and the attachment strip only
+  // from a thrown error, so a resolved promise here would lose both while no
+  // turn ran. The status rides in the message; the response body is not
+  // surfaced (it is the gateway's error prose, not something to render).
+  if (!resp.ok) {
+    throw new Error(`send refused by the gateway (${resp.status})`)
+  }
+  // Echo the user's own message only now that the gateway ACCEPTED it. Echoed
+  // before the POST, a refused send left the transcript showing the message
+  // as sent while ChatPanel put it back in the composer, and the retry then
+  // drew it twice; the accept receipt is fast (the reply streams over the
+  // socket), so the bubble still appears as the send lands.
+  echoOwnMessage(text, screenshot)
 }
 
 // Whether the slot is currently known to be bound to the mochi agent. NOT a
@@ -1473,13 +1500,21 @@ export async function setModel(model: string): Promise<SetModelResult> {
 export async function editResend(
   text: string,
   ts: string,
+  images: readonly string[] = [],
 ): Promise<{ ok: boolean; message?: string }> {
   try {
+    // Pictures attached WHILE editing ride `meta.images`, the same structured
+    // list a send carries: the gateway merges them with the ones the original
+    // row kept and builds the turn's image blocks from that list alone.
     const res = await fetch(`/api/chat/slots/${MOCHI_SLOT}/edit-resend`, {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ts, content: text }),
+      body: JSON.stringify({
+        ts,
+        content: text,
+        ...(images.length ? { meta: { images: [...images] } } : {}),
+      }),
     })
     return { ok: res.ok }
   } catch {

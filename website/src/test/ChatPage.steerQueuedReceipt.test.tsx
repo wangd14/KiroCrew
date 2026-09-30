@@ -26,6 +26,7 @@ import chatReducer, { appendSlotMessage, setActiveSlot, sseChatMessage } from '.
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import { i18nT } from '../i18n/t'
+import { api } from '../api/client'
 import { DRAFTS_KEY } from '../utils/chatDrafts'
 
 vi.mock('react-virtuoso', () => ({
@@ -229,6 +230,49 @@ describe('optimistic steer bubble vs the steer receipt', { timeout: 20_000 }, ()
     await waitFor(() => expect(
       (rows.store.getState().chat.messages as ChatMessage[]).filter(m => m.role === 'user' && m.content === STEERED_TEXT),
     ).toHaveLength(0))
+  })
+
+  it('a refused steer hands the staged picture back with the text, and the steer carried it as meta.images', async () => {
+    // The picture rides the steer POST as `meta.images` (the list the gateway
+    // builds image blocks from when it queues the steer instead). A refusal
+    // that handed back only the text would leave a composer whose next send
+    // ships no picture, so the staged file comes back as a chip too.
+    const store = makeStore()
+    vi.mocked(api.uploadFiles).mockResolvedValueOnce({ paths: ['/tmp/uploads/shot.png'] })
+    sendChat.mockResolvedValue({ ok: false, status: 409, json: () => Promise.resolve({ ok: false, error: 'no running turn' }) })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    await act(async () => {
+      render(
+        <QueryClientProvider client={qc}>
+          <Provider store={store}>
+            <ThemeProvider>
+              <MemoryRouter><ChatPage /></MemoryRouter>
+            </ThemeProvider>
+          </Provider>
+        </QueryClientProvider>,
+      )
+    })
+    const input = await waitFor(() => screen.getByLabelText('Message input') as HTMLTextAreaElement)
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement
+    Object.defineProperty(fileInput, 'files', { value: [new File(['x'], 'shot.png', { type: 'image/png' })] })
+    fireEvent.change(fileInput)
+    await waitFor(() => expect(api.uploadFiles).toHaveBeenCalled())
+    // An image chip is a group named by its path (and an <img alt=path>).
+    expect(await screen.findByRole('group', { name: '/tmp/uploads/shot.png' })).toBeInTheDocument()
+    fireEvent.change(input, { target: { value: STEERED_TEXT } })
+    await act(async () => {
+      fireEvent.keyDown(input, { key: 'Enter' })
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(sendChat).toHaveBeenCalled())
+    const [wireText, , , , meta, steer] = sendChat.mock.calls[0]
+    expect(steer).toBe(true)
+    expect(wireText).toBe(`![image](/tmp/uploads/shot.png)\n\n${STEERED_TEXT}`)
+    expect(meta).toEqual({ sendId: expect.stringMatching(/^s-/), images: ['/tmp/uploads/shot.png'] })
+    await waitFor(() => expect(qc.isMutating()).toBe(0))
+    // Text AND chip are back: the composer can re-send the picture.
+    await waitFor(() => expect(input.value).toBe(STEERED_TEXT))
+    expect(await screen.findByRole('group', { name: '/tmp/uploads/shot.png' })).toBeInTheDocument()
   })
 
   it('a deadline-aborted steer removes the unconfirmed bubble and hands the text back under a WARN notice', async () => {

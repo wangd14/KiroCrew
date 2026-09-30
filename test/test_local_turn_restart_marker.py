@@ -1262,6 +1262,89 @@ def test_an_oversize_stored_copy_is_dropped_at_restore():
     assert _local_turn_prompt({"turn_in_flight_prompt": long_ts}) is None
 
 
+def test_the_opener_copy_carries_the_image_list_within_the_shared_bounds():
+    """The picture a send attached rides ``meta.images`` and NOTHING else --
+    the builder never scans the text -- so a restored opener without the list
+    is a row whose later regenerate or edit-resend cannot replay the image.
+    The copy keeps it under the same count and length bounds as the marker
+    lists, and an oversize list drops the copy whole like theirs does."""
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    slot = _ChatSlot("chat-1")
+    slot.append(
+        "user",
+        "look\n\n![image](/tmp/uploads/shot.png)",
+        "msg msg-u",
+        meta={"files": [], "images": ["/tmp/uploads/shot.png"], "sendId": "s-1"},
+    )
+    copy = _local_turn_opening_row(slot)
+    assert copy is not None
+    assert copy["meta"]["images"] == ["/tmp/uploads/shot.png"]
+    assert set(copy["meta"]) == {"mid", "files", "images"}
+
+    slot = _ChatSlot("chat-1")
+    slot.append(
+        "user",
+        "many pictures",
+        "msg msg-u",
+        meta={"images": [f"/tmp/p{i}.png" for i in range(_LOCAL_TURN_PROMPT_MAX_ATTACHMENTS + 1)]},
+    )
+    assert _local_turn_opening_row(slot) is None
+
+    slot = _ChatSlot("chat-1")
+    slot.append(
+        "user",
+        "long picture path",
+        "msg msg-u",
+        meta={"images": ["/" + "p" * _LOCAL_TURN_PROMPT_MAX_FIELD_CHARS + ".png"]},
+    )
+    assert _local_turn_opening_row(slot) is None
+
+
+def test_a_restored_opener_keeps_its_image_list(tmp_path):
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("chat-1")
+    slot.append("user", "first", "msg msg-u")
+    slot.append("assistant", "answered", "msg msg-a")
+    assert _save_slot_to_history(state, slot, force=True)
+    assert state.conversation_log is not None
+    state.conversation_log.update_metadata(
+        "dashboard:chat-1",
+        {
+            "turn_in_flight_generation": 21,
+            "turn_in_flight_prompt": {
+                "role": "user",
+                "content": "look\n\n![image](/tmp/uploads/shot.png)",
+                "ts": "",
+                "meta": {"mid": "m-img", "images": ["/tmp/uploads/shot.png"], "files": []},
+            },
+        },
+    )
+
+    del state._slots["chat-1"]
+    restored = _rehydrate_slot_from_history(state, "chat-1")
+
+    assert restored is not None
+    tail = restored.messages[-1]
+    assert tail["content"] == "look\n\n![image](/tmp/uploads/shot.png)"
+    assert tail["meta"]["images"] == ["/tmp/uploads/shot.png"]
+    # The re-run paths read the list back off exactly this row.
+    from kiro_crew.dashboard.slot_queue_repository import retained_image_meta
+
+    assert retained_image_meta(tail["meta"], tail["content"], tail["content"]) == {
+        "images": ["/tmp/uploads/shot.png"]
+    }
+    crowded = {
+        "role": "user",
+        "content": "x",
+        "ts": "",
+        "meta": {
+            "images": [f"/tmp/p{i}.png" for i in range(_LOCAL_TURN_PROMPT_MAX_ATTACHMENTS + 1)]
+        },
+    }
+    assert _local_turn_prompt({"turn_in_flight_prompt": crowded}) is None
+
+
 def test_a_cron_openers_json_cls_does_not_round_trip(tmp_path):
     # A cron inject carries a JSON ``cls`` in memory that the transcript never
     # persists. Had the copy carried it, the re-appended row would reach the

@@ -623,11 +623,11 @@ export function prepareSendPayload(raw: string, pendingFiles: string[]): SendPay
   // on every surface that replays stored content — dashboard re-render after a
   // turn, gateway restart, Slack replay, exports — not just the in-memory
   // optimistic bubble. The extra blank line is safe for image attachment: the
-  // ACP path (kiro-cli) extracts images in AcpClient._send_prompt by matching
-  // the absolute file path and inlines them as a base64 `image` content block.
-  // It is newline-agnostic and pulls the image into its own content block, so
-  // the surrounding whitespace never changes what the model receives. The
-  // caption keeps a single '\n' to its appended [attached_file N] tokens.
+  // picture reaches the model through the send's `meta.images` list (the
+  // gateway builds one image block per entry and never scans the text for
+  // paths), so the surrounding whitespace never changes what the model
+  // receives. The caption keeps a single '\n' to its appended
+  // [attached_file N] tokens.
   const textBody = [llmRaw, unreferencedTokens].filter(Boolean).join('\n')
   return {
     txt: [imgMd, textBody].filter(Boolean).join('\n\n'),

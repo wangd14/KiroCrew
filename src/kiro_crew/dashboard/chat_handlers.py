@@ -49,6 +49,7 @@ from kiro_crew.dashboard.chat_delivery import (
     TURN_ACTOR_META_KEY,
     attachment_meta,
     normalize_send_id,
+    prompt_image_paths,
     queue_entry_is_user_origin,
     queue_entry_view,
     queue_for_next_turn,
@@ -177,7 +178,7 @@ from kiro_crew.dashboard.slot_buffers import (
     persist_deferred_notes_sync,
 )
 from kiro_crew.dashboard.slot_projection import resolved_row_identity
-from kiro_crew.dashboard.slot_queue_repository import warn_if_not_durable
+from kiro_crew.dashboard.slot_queue_repository import IMAGE_ATTACHMENT_META_KEY, warn_if_not_durable
 from kiro_crew.dashboard.state import (
     _MAX_DISMISSED_SOURCE_LINKS,
     DashboardState,
@@ -1011,6 +1012,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             turn_actor="app" if request_app else "",
             send_id=normalize_send_id(user_meta.get("sendId")) if user_meta else None,
             attachments=attachment_meta(user_meta),
+            prompt_images=prompt_image_paths(user_meta),
             # The receipt travels whichever way the send went, including the one
             # case where the two disagree: `auto` answered steer and the steer was
             # UNAVAILABLE, so this path runs with a record saying steer. That is the
@@ -1055,6 +1057,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             message,
             meta=_hold_meta,
             directive_user_origin=not bool(request_app),
+            prompt_images=prompt_image_paths(user_meta),
         )
         _redacted = queued_text_for_display(message, user_origin=not bool(request_app))
         warn_if_not_durable(slot._queue, qid, slot.key)
@@ -1454,17 +1457,38 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     _turn_kwargs: dict = {"_directive_user_origin": not bool(request_app)}
     if request_app:
         _turn_kwargs["_turn_actor"] = "app"
+    # The remote arm gets the same lists: the peer's prompt builder emits image
+    # blocks from ``meta.images`` alone, so a relay that forwarded only the text
+    # would drop the picture the user dropped in (`remote_relay._peer_turn_chunks`
+    # puts them on the peer body as ``meta``). Passed only when there ARE some,
+    # for the same reason as `_run_chat`'s kwargs above.
+    _relay_kwargs: dict = {}
     if _accepted_attachments:
         _turn_kwargs["_attachments"] = _accepted_attachments
         # Typed form for the refusal replay: keeps ``dirs`` entries as folders.
         _turn_kwargs["_attachment_meta"] = _accepted_attachment_meta
+        _relay_kwargs["attachments"] = _accepted_attachment_meta
+    # The PROVIDER copy of the image list: the validated raw paths the prompt
+    # builder opens (`prompt_image_paths`). `_attachment_meta` above is the
+    # redacted copy every observer reads (ledger, refusal replay, frames); a
+    # picture whose filename the redactor rewrote would otherwise be probed at
+    # a path that does not exist and silently dropped. The relay body is the
+    # peer's provider input, not a copy anyone reads, so it carries the raw
+    # list too; the peer redacts its own persisted and client copies.
+    _prompt_images = prompt_image_paths(user_meta)
+    if _prompt_images:
+        _turn_kwargs["_prompt_images"] = _prompt_images
+        _relay_kwargs["attachments"] = {
+            **_relay_kwargs.get("attachments", {}),
+            IMAGE_ATTACHMENT_META_KEY: _prompt_images,
+        }
     task = spawn_guarded_turn(
         state,
         slot,
         state.run_background_turn(
             slot,
             (
-                relay_remote_turn(state, slot, message)
+                relay_remote_turn(state, slot, message, **_relay_kwargs)
                 if slot.is_remote
                 else _run_chat(state, slot, message, **_turn_kwargs)
             ),

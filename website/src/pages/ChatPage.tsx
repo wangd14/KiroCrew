@@ -111,7 +111,7 @@ import TranscriptScrollShell, { useTranscriptWidth } from './chat/TranscriptScro
 import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
 import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
-import { MENTION_LINE_SUFFIX, WRAPPER_CLOSER, addPendingFile, extendsConsumably, foldWinSep, isWindowsShapedPath, leadingMentionBoundary, mentionBoundary, mentionBoundaryFor, mentionTokenRegex, normalizeWindowsPath, parseDirTokens, prepareSendPayload, serializeDirTokens, spliceDirTokens } from '../utils/fileTokens'
+import { MENTION_LINE_SUFFIX, WRAPPER_CLOSER, addPendingFile, extendsConsumably, foldWinSep, isWindowsShapedPath, leadingMentionBoundary, mentionBoundary, mentionBoundaryFor, mentionTokenRegex, normalizeWindowsPath, parseDirTokens, prepareSendPayload, restoreQueuedContent, serializeDirTokens, spliceDirTokens } from '../utils/fileTokens'
 import { makeRelative } from '../components/FilePickerMenu'
 import { type PasteBlock, carryPastes, expandAll as expandPasteTokens, findTokenRanges, mergeCarriedDraft, pruneBlocks as pruneBlocksUtil, saveStoredPaste } from '../utils/pasteTokens'
 import { extractPromptFromToken, extractSlackContextFromToken } from '../utils/tokenPrompt'
@@ -1206,14 +1206,33 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // (`decisions/points/message_steer.py`). The receipt policy below is unchanged,
     // because the answer arrives as the `dispatched` of a steer or the `queued` of
     // a queue -- both rulings `applySteerReceipt` already owns.
-    mutationFn: ({ text, sendId, slot, auto }: { text: string; sendId?: string; slot: string; auto?: boolean }) =>
-      sendTurn({ message: text, slot, steer: auto ? 'auto' : true, ...(sendId ? { meta: { sendId } } : {}) }),
-    onSuccess: (receipt, { text, sendId, slot }) => {
+    // `images` is the structured image list the gateway builds image blocks
+    // from. A live steer is text-only and ignores it, but a steer the gateway
+    // cannot inject falls through to the QUEUE, and the queued turn reads its
+    // pictures from this list alone -- without it the drained turn would render
+    // the `![image](dest)` line and ship no picture. `files` is the ORDERED
+    // non-image list the wire text's `[attached_file N]` markers index; it is
+    // not sent (the steer POST carries only `meta.images` beside the id) but
+    // it lets the hand-back below re-stage a marker's file losslessly.
+    mutationFn: ({ text, sendId, slot, auto, images }: { text: string; sendId?: string; slot: string; auto?: boolean; images?: string[]; files?: string[] }) =>
+      sendTurn({
+        message: text,
+        slot,
+        steer: auto ? 'auto' : true,
+        ...(sendId || images?.length
+          ? { meta: { ...(sendId ? { sendId } : {}), ...(images?.length ? { images } : {}) } }
+          : {}),
+      }),
+    onSuccess: (receipt, { text, sendId, slot, files }) => {
       // Receipt policy for a steer, owned once in chat-core (issue #9457):
       // applySteerReceipt decides WHICH ruling applies; the adapter below is
       // ChatPage's HOW. The composer was cleared at submit and the optimistic
       // bubble is NOT persisted -- the next transcript rebuild drops it -- so a
-      // steer that did not provably reach the gateway hands its text back.
+      // steer that did not provably reach the gateway hands its text back,
+      // and its staged files with it: the picture rode the POST as
+      // `meta.images`, so a refused steer that returned only the text would
+      // leave the `![image](dest)` line in the composer with nothing behind
+      // it, and the next send would ship no picture.
       // Everything here is addressed to the SENDING slot, not the active one:
       // the user can switch sessions inside the deadline window, and this text
       // and its rows belong to the transcript they were typed into (the same
@@ -1227,9 +1246,26 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // updating the live input instead is what the flush then persists.
       const onScreenNow = composerSlotRef.current === slot
       const handBack = () => {
+        // The wire text is the SERIALIZED form (a leading `![image](dest)`
+        // block, `[attached_file N] path` markers). Hand back what the user
+        // HAD: the typed text and the staged chips, through the same inverse
+        // the queue-cancel restore uses. Restoring the wire text beside the
+        // chips would send each picture twice; restoring it alone would ship
+        // none (the gateway builds image blocks from `meta.images`, never
+        // from the line). A text-only steer passes through unchanged.
+        const recovered = restoreQueuedContent(text, files)
         const kept = onScreenNow ? inputRef.current : (drafts.current[slot] ?? '')
-        const back = mergeRecoveredDraft(kept, text)
+        const back = mergeRecoveredDraft(kept, recovered.text)
         setDraft(drafts.current, slot, back)
+        if (recovered.files.length) {
+          // Chips MERGE like the text does (the same rule restoreQueuedDraft
+          // and send()'s restore follow): deduped, so a re-send serializes each
+          // attachment exactly once.
+          const keptFiles = onScreenNow ? pendingFilesRef.current : (fileDrafts.current[slot] ?? [])
+          const backFiles = [...new Set([...keptFiles, ...recovered.files])]
+          setFileDraft(fileDrafts.current, slot, backFiles)
+          if (onScreenNow) setPendingFiles(backFiles)
+        }
         saveDrafts()
         if (onScreenNow) setInput(back)
       }
@@ -2757,8 +2793,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // option-click or composer-send behavior.
     const sentSessionRefs = isolated || optionText ? [] : pendingSessionsRef.current.slice()
     const stagedFilesAtSend = [...new Set(sentFiles)]
-    const { txt: typedTxt, displayTxt: typedDisplayTxt, filePaths } = isolated
-      ? { txt: raw, displayTxt: raw, filePaths: [] }
+    const { txt: typedTxt, displayTxt: typedDisplayTxt, filePaths, imgPaths } = isolated
+      ? { txt: raw, displayTxt: raw, filePaths: [], imgPaths: [] }
       : prepareSendPayload(raw, sentFiles)
     // Folder references serialize like files but from the text alone: each
     // `@rel/` token becomes `[attached_dir N] /abs/path` in the LLM-facing
@@ -3019,6 +3055,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const meta: Record<string, unknown> = {}
     if (filePaths.length) meta.files = filePaths
     if (dirPaths.length) meta.dirs = dirPaths
+    // `meta.images` is the STRUCTURED attachment list the gateway builds the
+    // turn's image blocks from. The `![image](dest)` lines in the wire text are
+    // a rendering for the bubble and history; the gateway never scans text for
+    // image paths (a path in prose is a mention, not an upload), so without
+    // this list the model would never see the picture.
+    if (imgPaths.length) meta.images = imgPaths
     if (bubblePastes.length) meta.pastes = bubblePastes
     if (knowledgeBlock) meta.knowledge = { items: knowledgeBlock.items.length, tokens: knowledgeBlock.totalTokens, titles: knowledgeBlock.items.map(i => i.title), content: knowledgeBlock.items.map(i => ({ title: i.title, text: i.content.slice(0, 2000) })) }
     if (widgetOrigin) meta.origin = 'widget'
@@ -3088,7 +3130,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // blocks cannot claim one `[ Paste #N ]` marker.
       const keepText = onScreenNow ? inputRef.current : (drafts.current[slot] ?? '')
       const keepPastes = onScreenNow ? pasteBlocksRef.current : (pasteDrafts.current[slot] ?? [])
-      const carried = carryPastes(typedTxt, activePastes, keepPastes)
+      // `typedTxt` is the wire text: prepareSendPayload put the staged pictures'
+      // `![image](dest)` lines in front of what was typed, and the staged files
+      // were cleared at send time. Hand both back the way the steer's hand-back
+      // does -- the lines come off the text and the files come back as chips --
+      // so the retry ships the picture as `meta.images` again. The gateway
+      // builds image blocks only from that list, so a marker left in the text
+      // would render in the bubble while the model never saw the picture. The
+      // pictures come back from the marker block itself; `filePaths` is the
+      // non-image list in the `[attached_file N]` numbering order the tokens
+      // in the text were minted with, which is what the restore matches on.
+      const recovered = restoreQueuedContent(typedTxt, filePaths)
+      const carried = carryPastes(recovered.text, activePastes, keepPastes)
+      const keptFiles = onScreenNow ? pendingFilesRef.current : (fileDrafts.current[slot] ?? [])
+      const filesBack = [...new Set([...keptFiles, ...recovered.files])]
       const pastesBack = carried.pastes
       // Same merge rule as the create-failure path above, and the separator lives
       // in `mergeRecoveredDraft` rather than in a template literal here: the blank
@@ -3099,9 +3154,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       setDraft(drafts.current, slot, textBack)
       setPasteDraft(pasteDrafts.current, slot, pastesBack)
       setSessionRefDraft(sessionRefDrafts.current, slot, refsBack)
+      if (filesBack.length) setFileDraft(fileDrafts.current, slot, filesBack)
       saveDrafts()
       if (onScreenNow) {
         setInput(textBack); setPasteBlocks(pastesBack); setPendingSessions(refsBack)
+        if (filesBack.length) setPendingFiles(filesBack)
       }
       // Aliases come back with the text they describe -- MERGE, never
       // overwrite, so a file picked while the send was in flight keeps its
@@ -6033,7 +6090,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       setInput(''); setPasteBlocks([])
       return
     }
-    const { txt } = prepareSendPayload(raw, files)
+    const { txt, imgPaths: steerImgPaths, filePaths: steerFilePaths } = prepareSendPayload(raw, files)
     // Folder tokens deliberately stay in their `@rel/` form on steer: the
     // steer transport is TEXT-ONLY (no meta), so a `[attached_dir N] /abs
     // path` marker would have no meta.dirs index to replay against and the
@@ -6041,7 +6098,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // chip would then open the wrong directory. The raw token is what the
     // agent resolved before serialization existed, and it stays correct
     // under replay. Serialize on steer only if that transport ever carries
-    // attachment metadata.
+    // attachment metadata. The image list is the one exception: it rides the
+    // POST's meta so a steer the gateway queues instead keeps its pictures.
     const activePastes = pasteBlocksRef.current
     const llmTxt = activePastes.length ? expandPasteTokens(txt, activePastes) : txt
     // Optimistically show the steered text immediately. Steer is the default
@@ -6066,12 +6124,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // is the answer every refusal keeps, so it is the honest guess while the POST
     // is in flight, and a queue answer replaces this row through the same
     // `queue_push` reconcile a manual queue uses.
-    steerMutation.mutate({ text: llmTxt, sendId: steerSendId, slot: activeSlot, auto: opts?.auto === true })
+    steerMutation.mutate({ text: llmTxt, sendId: steerSendId, slot: activeSlot, auto: opts?.auto === true, ...(steerImgPaths.length ? { images: steerImgPaths } : {}), ...(steerFilePaths.length ? { files: steerFilePaths } : {}) })
     // Staged session references are deliberately NOT part of steering: neither
-    // carried into the payload nor cleared. Only the TEXT has a restore path
-    // (steerMutation hands it back on a refused, failed or unconfirmed steer);
-    // attachments and pastes are still discarded, and adding refs to that set
-    // would lose a reference the user cannot recover except by dragging again.
+    // carried into the payload nor cleared. The TEXT and the staged FILES have a
+    // restore path (steerMutation hands both back on a refused, failed or
+    // unconfirmed steer -- the files because a picture rides the POST as
+    // `meta.images`, and handing back only its `![image](dest)` line would
+    // leave a composer that ships no picture on the next send); pastes are
+    // still discarded, and adding refs to that set would lose a reference the
+    // user cannot recover except by dragging again.
     // Leaving them staged is lossless and predictable: the chip stays in the
     // composer and rides the next real send, which does have a full restore path.
     // Drops only this slot's own token sub-map -- see the same-shaped
