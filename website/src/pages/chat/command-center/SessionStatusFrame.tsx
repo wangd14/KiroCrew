@@ -26,8 +26,12 @@ export default function SessionStatusFrame({ slot, title, active }: { slot: stri
   const { t } = useTranslation()
   const { theme, colorTheme, themeVersion } = useTheme()
   const owner = useAppSelector(s => s.dashboard.slots.find(item => item.key === slot))
-  // Mirrors the producer: team workers (a creator link) get no automatic card.
-  const eligible = !isPrivateMemoryMode(owner?.memory_mode) && owner?.executor !== 'remote' && !owner?.created_by
+  // Mirrors the backend's _derived_allowed: privacy and remoteness only. The creator-link
+  // exclusion is a COST term on the model path, not a privacy one -- a spawned conductor
+  // still owns a DERIVED board, which the read route serves before the cost gate, so we must
+  // fetch here or that board never reaches its own panel. When there is no derived card the
+  // route answers 'unavailable', which renders as the unavailable status below.
+  const eligible = !isPrivateMemoryMode(owner?.memory_mode) && owner?.executor !== 'remote'
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const vars = useMemo(() => readThemeVars(), [theme, colorTheme, themeVersion])
   const query = useQuery({ queryKey: ['dashboard-card', slot, owner?.linked_session_key ?? '', owner?.memory_mode ?? 'persistent'], queryFn: () => api.dashboardCard(slot),
