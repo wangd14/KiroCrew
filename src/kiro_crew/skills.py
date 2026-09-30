@@ -755,11 +755,90 @@ def _iter_skill_files(
         return []
     allowed_roots = (os.path.realpath(base),) + _trusted_skill_roots()
 
-    def probe(directory: Path) -> tuple[str | None, list[Path], Path | None]:
+    def _identity(path: Path) -> tuple[int, int] | None:
+        """``(st_dev, st_ino)`` of *path* without following a final link, or None."""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    def probe(
+        directory: Path,
+        parent_real: str | None,
+        parent_identity: tuple[int, int] | None,
+    ) -> tuple[str | None, list[tuple[Path, str, tuple[int, int] | None]], Path | None]:
         lexical = os.path.abspath(directory)
         if exclude_roots and _within_any(lexical, exclude_roots):
             return lexical, [], None
-        real = os.path.realpath(directory)
+        # Resolve the node's real path from its ALREADY-RESOLVED parent instead
+        # of re-resolving the whole chain from scratch. os.path.realpath
+        # consults the filesystem to canonicalize case and 8.3 short names on
+        # Windows, and the walk probes nodes CONCURRENTLY (ThreadPoolExecutor):
+        # two independent realpath() calls on a shared prefix could canonicalize
+        # its case differently before the OS path cache warmed, so a
+        # case-sensitive is_relative_to(realpath(child), realpath(base)) read a
+        # genuine descendant as outside base and dropped its subtree — dropping
+        # the NESTED skill while the depth-1 flat skill (fewer shared-prefix
+        # components) survived. Deriving child real = parent_real / name fixes
+        # the shared prefix's case exactly once.
+        #
+        # Parent-derived trust is guarded: `parent_identity` is the (dev, ino)
+        # of the directory as it was when it enqueued this child. Before
+        # trusting `parent_real`, re-verify the immediate parent — and the ORDER
+        # of the two sub-checks is load-bearing: capture the parent's current
+        # identity FIRST, THEN test its link status, and trust the derivation
+        # only if the just-captured identity equals the recorded `parent_identity`
+        # AND the parent is not a link/junction. Testing link status first and
+        # comparing identity second leaves a window where a plain dir passes the
+        # link test and is then swapped for a link before identity is read; by
+        # reading identity first and requiring it unchanged, a swap in either
+        # order changes `(dev, ino)` and fails the check. On any mismatch (or if
+        # identity cannot be read) the node is resolved FRESH through realpath —
+        # authoritative, re-runs full containment. The root, and any node that
+        # is itself a link/junction (targets live elsewhere — an app symlinks
+        # its skills in), always resolve fresh. Identity on POSIX; no case
+        # folding, no stat through a plain directory.
+        parent_now = _identity(directory.parent)
+        # This node's identity, captured BEFORE the link screen and the
+        # containment decision below so those checks and the post-scan recheck
+        # all judge the SAME object. Capturing it after them would let a
+        # dir->link swap that happens between the containment decision and the
+        # capture be recorded as the post-swap identity — the recheck would then
+        # compare the scanned content against an already-swapped baseline and
+        # admit it. lstat, not stat: identity of the node itself, not its target.
+        my_identity = _identity(directory)
+        # Re-establish the parent-trust decision AFTER this node's identity is
+        # captured, so the two are consistent to the same instant: a swap of the
+        # parent between the first `parent_now` read and the `my_identity`
+        # capture would otherwise leave a stale `parent_ok` deciding whether we
+        # trust a derived path for a node whose own identity was read afterwards.
+        # Re-read identity FIRST, THEN link status (the load-bearing order), and
+        # require both unchanged from what the parent enqueued.
+        parent_recheck = _identity(directory.parent)
+        # The derived path is composed onto `parent_real` (the parent's RESOLVED
+        # anchor), not onto `directory.parent` (its lexical spelling), so the
+        # anchor itself must still identify the object we recorded. Verifying
+        # only `directory.parent` leaves `parent_real` unbound: if it names a
+        # different object now — its target swapped, or the lexical and resolved
+        # parents diverged — a derived `parent_real / name` would land under an
+        # anchor we never re-vetted. Require `parent_real` to still resolve to
+        # `parent_identity`; otherwise the anchor is untrusted and the node is
+        # resolved fresh.
+        parent_real_now = _identity(Path(parent_real)) if parent_real is not None else None
+        parent_ok = (
+            parent_real is not None
+            and parent_identity is not None
+            and parent_now == parent_identity
+            and parent_recheck == parent_identity
+            and parent_real_now == parent_identity
+            and not is_link_or_junction(directory.parent)
+        )
+        directory_is_link = is_link_or_junction(directory)
+        if parent_real is None or not parent_ok or directory_is_link:
+            real = os.path.realpath(directory)
+        else:
+            real = os.path.join(parent_real, directory.name)
         if exclude_roots and _within_any(real, exclude_roots):
             return real, [], None
         if not _within_any(real, allowed_roots) or is_sensitive_resolved_path(real):
@@ -771,7 +850,23 @@ def _iter_skill_files(
             # A failed alias has not visited its target. Another spelling may
             # still enumerate it successfully, as with os.walk's error handling.
             return None, [], None
-        children = []
+        # Post-scan TOCTOU recheck (same family as the parent-identity guard
+        # above, closed at the scanned node itself). `real` and containment were
+        # decided from the directory as it was BEFORE the scan; if the directory
+        # was swapped for a DIFFERENT object between the pre-scan identity
+        # capture and now, the `entries` just read belong to the swapped content
+        # while `real` still describes the pre-swap path. Committing a SKILL.md
+        # discovered here under that stale `real` would let a swapped-in
+        # directory's skill be admitted as contained. Re-lstat and require the
+        # SAME (dev, ino); on a mismatch — or when identity cannot be
+        # established at all — the scanned content is untrusted, so the node is
+        # dropped (no children, no discovered file). A node that was LEGITIMATELY
+        # a link/junction already resolved fresh above and keeps the same lstat
+        # identity here, so it is not rejected; a swap TO a link changes the
+        # (dev, ino) and IS caught. Cheap single lstat; identity on POSIX.
+        if my_identity is None or _identity(directory) != my_identity:
+            return None, [], None
+        children: list[tuple[Path, str, tuple[int, int] | None]] = []
         has_skill = False
         for entry in entries:
             if exclude_roots and _within_any(os.path.abspath(entry.path), exclude_roots):
@@ -781,14 +876,20 @@ def _iter_skill_files(
             except OSError:
                 is_dir = False
             if is_dir and not entry.name.startswith("."):
-                children.append(directory / entry.name)
+                children.append((directory / entry.name, real, my_identity))
             elif not is_dir and entry.name == "SKILL.md":
                 has_skill = True
-        children.sort(key=lambda path: path.name)
+        children.sort(key=lambda item: item[0].name)
         skill_file = directory / "SKILL.md"
         if not has_skill:
             return real, children, None
-        real_file = os.path.realpath(skill_file)
+        # A SKILL.md that is itself a link resolves fresh (its target may live
+        # outside the tree); a plain file's real path is its resolved parent
+        # joined with the filename — no fresh realpath, same race-free reason.
+        if is_link_or_junction(skill_file):
+            real_file = os.path.realpath(skill_file)
+        else:
+            real_file = os.path.join(real, _SKILL_FILE)
         if exclude_roots and _within_any(real_file, exclude_roots):
             return real, children, None
         if not _within_any(real_file, allowed_roots) or is_sensitive_resolved_path(real_file):
@@ -799,20 +900,26 @@ def _iter_skill_files(
     seen_real: set[str] = set()
     # Commit probes in sorted depth-first order, irrespective of completion
     # order, so links sharing a target keep the same canonical skill key.
-    stack = [base]
-    pending: dict[Path, Future[tuple[str | None, list[Path], Path | None]]] = {}
+    stack: list[tuple[Path, str | None, tuple[int, int] | None]] = [(base, None, None)]
+    pending: dict[
+        Path, Future[tuple[str | None, list[tuple[Path, str, tuple[int, int] | None]], Path | None]]
+    ] = {}
     with ThreadPoolExecutor(
         max_workers=_CATALOG_READ_WORKERS, thread_name_prefix="skill-walk"
     ) as pool:
         while stack:
-            for directory in reversed(stack):
+            for directory, parent_real, parent_identity in reversed(stack):
                 if len(pending) >= _CATALOG_READ_BATCH:
                     break
                 if directory not in pending:
-                    pending[directory] = pool.submit(copy_context().run, probe, directory)
-            directory = stack.pop()
+                    pending[directory] = pool.submit(
+                        copy_context().run, probe, directory, parent_real, parent_identity
+                    )
+            directory, parent_real, parent_identity = stack.pop()
             future = pending.pop(directory, None)
-            real, children, discovered_file = future.result() if future else probe(directory)
+            real, children, discovered_file = (
+                future.result() if future else probe(directory, parent_real, parent_identity)
+            )
             if real is None or real in seen_real:
                 continue
             seen_real.add(real)
