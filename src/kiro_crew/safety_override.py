@@ -2224,6 +2224,80 @@ def grant_declared_yolo() -> ActivationResult:
     return so.activate(SafetyOverride._DECLARED_SOURCE)
 
 
+def revalidate_standing_override(new_mode: str) -> bool:
+    """Re-check the standing (declared) grant against a NEW ``agent.sandbox`` mode.
+
+    The declared grant is evaluated ONCE at startup (:func:`grant_declared_yolo`,
+    from the then-current ``agent.sandbox``) and then held in memory with no
+    expiry. But ``agent.sandbox`` is a LIVE field -- a change applies to sessions
+    started after it, with no restart (see ``config.sections`` and
+    ``config/live.py``) -- and the declared grant is honoured only where
+    :func:`standing_approval.is_declared` holds, which in turn requires the
+    sandbox mask to cover the keystone (:func:`standing_approval._keystone_is_masked`).
+    So a live flip from a masked mode to an unmasked one (e.g. ``off``) removes the
+    precondition the grant rests on, yet nothing was re-evaluating it: a new,
+    now-UNMASKED session would inherit permanent auto-approval AND be able to reach
+    the keystone directory itself.
+
+    This closes that gap. It is called by the TRUSTED gateway live-config applier
+    (never from an agent-reachable path) whenever a reload changes ``agent.sandbox``,
+    BEFORE the new mode governs any spawn. It:
+
+    * does nothing unless the live grant is the operator's DECLARED grant -- an
+      ad-hoc grant is the operator's own timed decision and is not mask-derived;
+    * re-evaluates :func:`standing_approval.is_declared` against *new_mode*; if the
+      declaration still holds under the new mode (the mask still covers the
+      keystone), the grant is RETAINED and nothing changes;
+    * otherwise REVOKES the declared override immediately via :meth:`SafetyOverride.deactivate`
+      (dropping it from in-memory state) and logs a clear WARNING, because the new
+      mode does not mask the keystone and the declaration is not an
+      authorization.
+
+    Returns ``True`` iff a declared override was revoked by this call. Import of
+    ``standing_approval`` is deferred to keep this module free of an import cycle
+    (``standing_approval`` reads ``sandbox`` predicates that pull in config).
+    """
+    so = safety_override()
+    if not so.is_declared:
+        # No declared grant is live (no grant at all, or an ad-hoc one the operator
+        # set explicitly). Nothing mask-derived to revoke.
+        return False
+    from kiro_crew import standing_approval
+
+    if standing_approval.is_declared(new_mode):
+        # The new mode still masks the keystone: the declaration remains an
+        # authorization, so the standing grant is legitimately retained.
+        return False
+    logger.warning(
+        "agent.sandbox changed to %r, which no longer masks the standing-approval "
+        "keystone away from agent subprocesses; REVOKING the operator's standing "
+        "auto-approve grant. Approvals are now REQUIRED for sessions started under "
+        "this mode. Re-establish a masked mode (and restart) to restore it, or "
+        "enable auto-approve ad hoc.",
+        new_mode,
+    )
+    # INHERITED trust FIRST, then drop the grant -- the same ordering, and the same
+    # installed hook, that ``_revoke_grants_for_policy_deny`` uses. A declared grant
+    # is session-wide, so it wrote ``approval_policy="auto"`` onto its slots and into
+    # the shared channel-trust mapping, and ``subagent_manager.admission.parent_trusted``
+    # reads THAT policy directly -- it consults no flag ``deactivate`` clears. Stopping
+    # at ``deactivate`` therefore left an in-flight turn and every channel session in
+    # the shared mapping auto-approving unapproved spawns under the now-unmasked
+    # sandbox until their next restart. ``on_policy_revoked`` is the synchronous,
+    # thread-safe, idempotent teardown the gateway installs
+    # (``_clear_override_derived_trust`` -> slot policy reset + ``clear_trusted_sessions``);
+    # reuse it exactly, no new state. It MUST run BEFORE the flag drops
+    # (see ``_revoke_grants_for_policy_deny`` and the ordering rationale there): the
+    # grant-first ordering opens an unrecoverable window in which ``is_active()`` reports
+    # no grant while the slots still carry "auto". Fails closed like the rest of this fn
+    # -- a raised teardown re-raises so the trusted ConfigWatch applier retries.
+    sync_cb = so.on_policy_revoked
+    if sync_cb is not None:
+        sync_cb(POLICY_REVOKED_SOURCE)
+    so.deactivate(source=SafetyOverride._DECLARED_SOURCE)
+    return True
+
+
 # ── User-facing grant-lifetime text (channel-neutral) ──
 
 NO_EXPIRY_TEXT = "stays on until Kiro Crew restarts"

@@ -15435,7 +15435,55 @@ class GatewayOrchestrator:
                 callback=self._on_slack_config_change,
                 name="GatewayOrchestrator.slack",
             ),
+            live.subscribe(
+                "agent.sandbox",
+                callback=self._on_sandbox_config_change,
+                name="GatewayOrchestrator.sandbox_standing_override_revalidate",
+            ),
         ]
+
+    async def _on_sandbox_config_change(self, change: ConfigChange) -> None:
+        """Revalidate (and revoke) the standing auto-approve grant on a live sandbox flip.
+
+        ``agent.sandbox`` is a LIVE field: a change applies to sessions started
+        after it, with NO restart (``config.sections`` marks it without
+        ``restart``, and its own doc says "a change applies to sessions started
+        after it; a session already running keeps the tier it was spawned with").
+        The operator's STANDING (declared) auto-approve grant, however, is
+        evaluated ONCE at startup (``grant_declared_yolo``) and then held in memory
+        with no expiry -- and it is a valid authorization ONLY where the sandbox
+        mask covers the standing-approval keystone
+        (``standing_approval.is_declared`` -> ``_keystone_is_masked``). So a live
+        flip from a masked mode to an unmasked one (e.g. ``off``) removes the
+        precondition the grant rests on, and without this a new, now-UNMASKED
+        session would inherit permanent auto-approval AND be able to reach the
+        keystone directory itself.
+
+        This is the process's single TRUSTED revalidation point: the orchestrator
+        is constructed for every gateway mode (full dashboard AND headless
+        ``--slack-only``), and this applier fires from the live-config watcher --
+        never from an agent-reachable path. It runs synchronously in the reload
+        dispatch, so the declared override is re-evaluated and, if the new mode no
+        longer masks the keystone, REVOKED before that mode governs any session.
+        The grant is retained when the new mode still masks the keystone.
+
+        ``revalidate_standing_override`` reads a file (``is_declared`` opens the
+        keystone), so it runs off-loop like the boot-time establishment does.
+        """
+        if not change.touched("agent.sandbox"):
+            return
+        from kiro_crew.safety_override import revalidate_standing_override
+
+        try:
+            await asyncio.to_thread(revalidate_standing_override, change.new.agent.sandbox)
+        except Exception:
+            # Fail CLOSED toward safety: log and re-raise so ConfigWatch records
+            # this subscriber stale and retries it on the next tick. It never grants.
+            logger.warning(
+                "standing-override revalidation after an agent.sandbox change failed",
+                exc_info=True,
+            )
+            raise
 
     async def _on_channel_config_change(self, change: ConfigChange) -> None:
         """Restart every channel whose CONNECTION parameters changed -- and only those.
