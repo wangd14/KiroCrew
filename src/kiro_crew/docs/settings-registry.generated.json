@@ -517,13 +517,6 @@
       "description": "How long models think before answering by default. Higher is slower and costs more. Only available on reasoning-capable models (Opus, Sonnet, Fable, GPT-5.x)."
     },
     {
-      "id": "chat.default-to-autopilot-mode",
-      "label": "Default to Autopilot Mode",
-      "tab": "chat",
-      "route": "/settings/chat/sessions?highlight=chat.default-to-autopilot-mode",
-      "description": "New sessions start in autopilot mode (plan → approve → execute). You can still toggle individual sessions."
-    },
-    {
       "id": "chat.describe-your-role",
       "label": "Describe your role",
       "tab": "chat",

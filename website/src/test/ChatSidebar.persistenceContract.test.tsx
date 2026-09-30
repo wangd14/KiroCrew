@@ -63,7 +63,7 @@ vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
 // one: it persists the value and announces it, which is how the open sidebar
 // learns that board view was turned on or off.
 const cfg = vi.hoisted(() => ({
-  value: { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false } as Record<string, unknown>,
+  value: { tagColumnsEnabled: false, confirmCloseSession: false } as Record<string, unknown>,
 }))
 vi.mock('../pages/chat/ChatSettings', () => ({
   loadChatConfig: () => cfg.value,
@@ -189,7 +189,7 @@ function openFilterMenu() {
 beforeEach(() => {
   localStorage.clear()
   window.history.replaceState({}, '', '/chat')
-  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
   for (const m of Object.values(mocks)) m.mockReset()
   mocks.chatFolders.mockResolvedValue([])
   mocks.chatTags.mockResolvedValue([])

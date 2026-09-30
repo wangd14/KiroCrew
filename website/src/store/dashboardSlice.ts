@@ -7,6 +7,7 @@ import { ApiError } from '../api/apiError'
 import { sanitizeLlmOutput, isUnsafeKey } from '../utils/sanitize'
 import type { StatusData, ChatSlot, TodoList, McpSessionReport } from '../types'
 import type { SessionColorMode, PaletteName, DefaultColorSetting, IntensityName } from '../utils/sessionColors'
+import { isChatPageSurface } from '../utils/channelOrigin'
 
 export interface SubagentDetail {
   id: string; task: string; agent: string; turns: number; last_tool: string; startedAt: number
@@ -1427,13 +1428,13 @@ export function slotIsRemoteBound(slot: { executor?: string } | null | undefined
 function countUnreadByMode(slots: ChatSlot[], unread: string[], mode: string): number {
   if (unread.length === 0) return 0
   const surfaceByKey = new Map(slots.map(s => [s.key, slotSurfaceKey(s)]))
-  // Unified chat: when counting for the chat surface (''), include orchestrator
-  // slots too since they now live in the same sidebar.
+  // The chat surface ('') counts every slot the chat page renders, legacy
+  // Autopilot slots included (see `isChatPageSurface`).
   const isChatSurface = mode === ''
   let count = 0
   for (const k of unread) {
     const sk = surfaceByKey.get(k) ?? ''
-    if (isChatSurface ? (sk === '' || sk === 'orchestrator') : sk === mode) count++
+    if (isChatSurface ? isChatPageSurface(sk) : sk === mode) count++
   }
   return count
 }

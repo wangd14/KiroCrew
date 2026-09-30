@@ -2946,8 +2946,6 @@
       "reload_blocked_subagents": "sub-agents working",
       "reload_session": "Reload session",
       "reload_session_tooltip": "Restarts the agent process to pick up MCP/config changes. The conversation is kept.",
-      "switch_to_autopilot": "Switch to Autopilot",
-      "switch_to_chat": "Switch to Chat",
       "unpin": "Unpin"
     },
     "sessionGridView": {
@@ -3155,7 +3153,6 @@
       "some_pages_refuse_embedding_and_appear_blank": "Note: Some pages don't allow embedding and appear blank here."
     },
     "welcomeView": {
-      "autopilot": "Autopilot",
       "incognito": "Incognito",
       "incognito_desc": "Uses existing memory but learns no lessons. Keeps the transcript for tab recovery.",
       "suggestion_pipeline_status": "Check my pipeline status",
@@ -3807,9 +3804,7 @@
     "useSessionActions": {
       "close_this_session": "Close this session?",
       "reload_failed": "Session reload failed. The agent may be mid-turn or the gateway unreachable; try again when the session is idle.",
-      "reload_failed_subagents": "Sub-agents are still working on this session. Try again when they finish.",
-      "switch_to_autopilot_mode_future_messages_will_us": "Switch to Autopilot mode? Future messages will use autopilot behavior (plan → approve → execute).",
-      "switch_to_normal_chat_mode_future_messages_will": "Switch to normal Chat mode? Future messages will use standard chat behavior."
+      "reload_failed_subagents": "Sub-agents are still working on this session. Try again when they finish."
     },
     "useStreamingStt": {
       "audio_worklet_unavailable": "audio worklet unavailable",
@@ -4839,7 +4834,6 @@
       "turn_minimap_meta_grouped_windowed": "Turns {{first}}–{{last}} of {{count}} loaded",
       "turn_minimap_meta_position": "Turn {{n}} of {{count}}",
       "turn_minimap_meta_position_windowed": "Turn {{n}} of {{count}} loaded",
-      "autopilot_plans_before_executing_each_stage_need": "Autopilot plans before executing. Each stage needs your approval (or select 'Go All' to run autonomously). Sub-agents are delegated automatically. Plan lessons persist across sessions.",
       "collapse_knowledge_context": "Collapse knowledge context",
       "connection_error": "Connection error",
       "could_not_start_a_new_session": "Could not start a new session",
@@ -4868,7 +4862,6 @@
       "open_file": "Open file {{path}}",
       "attached_file_inert": "Attached file (can't be opened here): {{path}}",
       "open_folder": "Open folder {{path}}",
-      "plan_from_here_failed_error": "Plan from here failed: {{error}}",
       "send_failed": "Send failed",
       "send_failed_connection": "Couldn't send — check your connection and try again.",
       "session_not_found": "Session \"{{name}}\" not found",

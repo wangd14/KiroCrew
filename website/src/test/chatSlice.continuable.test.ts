@@ -142,18 +142,12 @@ describe('selectContinuable', () => {
     expect(selectContinuable(state({ messages: [msg('user')], pendingTurnSlot: 'slot-1' }))).toBe(false)
   })
 
-  it('is false while an autopilot plan is mid-flight', () => {
-    // A plan reads `running` False BETWEEN stages, so `running` alone would offer
-    // Continue on a slot the server refuses with `slot_orchestrating`.
-    expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', orchestrating: true }]))).toBe(false)
+  it('ignores a legacy orchestrating flag on the slot payload', () => {
+    expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', orchestrating: true }]))).toBe(true)
   })
 
   it('is false while a subagent is still running on the slot', () => {
     expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', subagents_running: true }]))).toBe(false)
-  })
-
-  it('is unaffected by another slot orchestrating', () => {
-    expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'other', orchestrating: true }]))).toBe(true)
   })
 
   it('is false on a crew-bound slot — the server refuses Continue there', () => {

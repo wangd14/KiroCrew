@@ -3364,10 +3364,8 @@ describe('selectComposerBusy', () => {
     expect(selectComposerBusy(wrap(withSlot, [{ key: 'slot-1', subagents_running: true }]), 'slot-1')).toBe(true)
   })
 
-  it('is busy while an autopilot plan is orchestrating (queues mid-plan messages)', () => {
-    // slot.running reads False between stages, but a mid-plan message must still
-    // queue as a chip rather than render an optimistic bubble.
-    expect(selectComposerBusy(wrap(withSlot, [{ key: 'slot-1', orchestrating: true }]), 'slot-1')).toBe(true)
+  it('ignores a legacy orchestrating flag on the slot payload', () => {
+    expect(selectComposerBusy(wrap(withSlot, [{ key: 'slot-1', orchestrating: true }]), 'slot-1')).toBe(false)
   })
 
   it('clears when the subagent finishes (done event — reaper self-heal path)', () => {

@@ -24,7 +24,6 @@ import { useDrawerSwipe, animateDrawer, registerDrawerTargets, takeOverDrawer, s
 import type { ResizeInfo } from '../utils/resizeImage'
 import { useAppSelector, useAppDispatch, useAppStore, store } from '../store'
 import { useConnected } from '../hooks/useConnected'
-import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useChatPopouts } from '../hooks/useChatPopouts'
 import {
@@ -341,7 +340,6 @@ import { MessageSquare, Clock, AppWindow, Undo2, Columns2, ExternalLink, X, More
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { PanelLeftSolid, PanelLeftLight, PanelRightSolid } from '../components/icons/panels'
 
-import InfoTip from '../components/InfoTip'
 import SlotTagPopover from '../components/SlotTagPopover'
 import { TagPopoverProvider } from '../hooks/useTagPopover'
 
@@ -612,7 +610,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // A user-facing switch gesture hit a session the server no longer has
   // (#6372); rendered through the pane ErrorNotice below (errors-use-error-notice).
   const switchSlotGone = useAppSelector(s => s.chat.switchSlotGone)
-  // Unified chat view: show default, orchestrator and crew slots together.
+  // Unified chat view: show default and crew slots together.
   // App-owned worker slots (s.app) are excluded by the sidebar itself.
   const filteredSlots = useMemo(
     () => slots.filter(s => isChatPageSurface(s.surface ?? s.mode)),
@@ -621,7 +619,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const filteredSlotsRef = useRef(filteredSlots)
   filteredSlotsRef.current = filteredSlots
   const unreadSlots = useAppSelector(s => s.dashboard.unreadSlots)
-  // Unified view: unread keys for all chat-like slots (both default and orchestrator).
+  // Unified view: unread keys for all chat-like slots.
   const surfaceUnreadSlots = useMemo(
     () => {
       if (unreadSlots.length === 0) return []
@@ -1183,7 +1181,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const { rect: modelBtnRect, anchorTo: anchorModelBtn } = useAnchoredTriggerRect(modelDropdown)
   // One in-page slot for every failed action whose only report used to be a
   // notification-centre toast, a native alert() or a swallowed catch (fork,
-  // plan-from-here, apply-plan, steer, rename, title generation, the agent
+  // apply-plan, steer, rename, title generation, the agent
   // default-model pin, a session create that failed while sending, a file the
   // panel could not read). Rendered once, above the composer, through
   // ErrorNotice; the newest failure wins, the same shape as `refusedPress`.
@@ -2395,22 +2393,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
   }, [activeSlot, dispatch, forkCfg, showActionError])
 
-  const handlePlanFromHere = useCallback(async (visibleIndex: number, messageId?: string) => {
-    if (!activeSlot) return
-    try {
-      const result = await dispatch(forkSlot({ slot: activeSlot, atIndex: visibleIndex, messageId, mode: 'orchestrator' })).unwrap()
-      if (result.ok) {
-        await dispatch(switchSlot(result.key))
-        // Unified view: the forked orchestrator slot lives in the same sidebar.
-        if (!mode) navigate('/chat')
-      } else {
-        showActionError(i18nT('pages.chatPage.plan_from_here_failed_error', { error: result.error || i18nT('pages.chatPage.unknown_error') }))
-      }
-    } catch (e) {
-      showActionError(i18nT('pages.chatPage.plan_from_here_failed_error', { error: errMessage(e) || i18nT('pages.chatPage.unknown_error') }))
-    }
-  }, [activeSlot, dispatch, mode, navigate, showActionError])
-
   const transcriptEarly = useChatPageTranscriptEarlyController({
     activeTip,
     mountIndexRef,
@@ -2555,13 +2537,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Swapping chats (activeSlot change) → messages change → memo recomputes fresh.
   // A pending question card suppresses them: both would offer the same choices in
   // the same band, and only the card can answer the blocked tool call.
-  const { followUpOptions, followUpIsPlan, followUpSourceKey } = useMemo(
+  const { followUpOptions, followUpSourceKey } = useMemo(
     () => deriveFollowUpOptions(messages, isStreaming, !!pendingQuestion),
     [messages, isStreaming, pendingQuestion],
   )
-  // Orchestrator plan dispatch — the hook owns the latch acknowledgement,
-  // keyed on the derived options-row identity passed here.
-  const planActionMutation = usePlanActionMutation(activeSlot, followUpSourceKey)
   // Visual-only highlight state; text in the input is the source of truth for
   // what gets sent. Cleared whenever the options list changes (new assistant
   // message) or the active chat switches — both signal a fresh turn.
@@ -2650,8 +2629,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Raw send — sends pre-built text directly to the server
   const modeRef = useRef(mode)
   modeRef.current = mode
-  const planActionMutationRef = useRef(planActionMutation)
-  planActionMutationRef.current = planActionMutation
 
   // Resolves true when the server accepted the message (dispatched, queued,
   // or received-but-late), false when nothing was delivered (offline, empty,
@@ -4548,22 +4525,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     })
   }, [coldFileResults, coldFileTabs, tabsCtl, showActionError])
   // Session mode of the active slot. In the unified chat view the page-level
-  // `mode` prop is always '' — the slot's own mode is the source of truth for
-  // header identity (Autopilot icon + tooltip).
+  // `mode` prop is always '' — the slot's own mode is the source of truth.
   const effectiveMode = currentSlot?.mode || mode
-  // One spelling for every plan-chip gesture (single-click, double-click,
-  // Send-now). `sourceKeyAtClick` is the row the gesture started on.
-  const dispatchPlanFollowUp = (action: string, sourceKeyAtClick?: string | null): boolean => {
-    if (!(followUpIsPlan && isPlanAction(action) && effectiveMode === 'orchestrator' && activeSlot)) {
-      return false
-    }
-    planActionMutationRef.current.mutate({
-      slot: activeSlot,
-      action,
-      clickedSourceKey: sourceKeyAtClick,
-    })
-    return true
-  }
   const title = currentSlot?.title && currentSlot.title !== currentSlot.key ? currentSlot.title : activeSlot || ''
   const displayMode = slotApprovalMode(approvalMode, currentSlot)
   // Resolve model for existing slots that don't have one stored
@@ -4902,7 +4865,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // conversation, and `interrupted` only decides how the button describes itself.
   //
   // The two COMPOSE at the ErrorCard; neither alone is right. `continuable` is the
-  // availability half (running, stopping, pending turn, autopilot, subagents,
+  // availability half (running, stopping, pending turn, subagents,
   // queue) and `interrupted` is the placement half — `i === lastErrorIdx` means
   // "newest error row", never "the transcript ends badly", so on
   // `[user, error, user, assistant]` availability alone would put a Continue
@@ -5972,11 +5935,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // server-side hold that keeps a user message behind running sub-agents.
     // Delegating here, BEFORE the composer is read and cleared below, leaves
     // send() owning the draft, attachment and optimistic-bubble bookkeeping.
-    // A multi-stage autopilot plan also reads busy-but-not-running. There the
-    // server keeps `_in_stage_execution` set for the WHOLE plan, so the flag
-    // finds no live session to inject into and the message queues — the right
-    // answer between stages, and unconditional across the plan rather than a
-    // race with the gaps.
     if (!slotRunning) { void send(undefined, undefined, true); return }
     const raw = inputRef.current.trim()
     const files = pendingFilesRef.current
@@ -6643,7 +6601,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 return !slotRunning
               })()} onSpeak={handleSpeak} onRegenerate={i === lastTextIdxRef.current && !slotRunning && !regenerating && activeSlot && !activeSlotRemoteBound ? handleRegenerate : undefined} variants={m.variants} variantIdx={m.variant_idx} onSwitchVariant={i === lastTextIdxRef.current && m.variants && m.variants.length > 1 && activeSlot ? (idx: number) => { api.switchVariant(activeSlot, idx).catch((e: unknown) => {
                 showRefusedPress('switch_variant', e)
-              }) } : undefined} onFork={embedded && !popout ? undefined : handleFork} onPlanFromHere={embedded && !popout ? undefined : handlePlanFromHere} forkIndex={forkIndex} forkMessageId={canResolveOnServer ? messageId : undefined} onLoadEarlier={cursorIsForActiveSlot ? handleLoadEarlier : undefined} loadingOlder={loadingOlder} earlierRemaining={slotOldestIndex} onApplyPlan={handleApplyPlan} />
+              }) } : undefined} onFork={embedded && !popout ? undefined : handleFork} forkIndex={forkIndex} forkMessageId={canResolveOnServer ? messageId : undefined} onLoadEarlier={cursorIsForActiveSlot ? handleLoadEarlier : undefined} loadingOlder={loadingOlder} earlierRemaining={slotOldestIndex} onApplyPlan={handleApplyPlan} />
             </div>
           )}
         </div>
@@ -6727,7 +6685,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       bubble,
     ])
     return { renderers, fallback: bubble }
-  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, activeSlotRemoteBound, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, handlePlanFromHere, planTaskId, artifactPaths, automationId, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, socialShareOn, voiceRecoverySlot, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, handleContinue, openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel, redactionCoachTs])
+  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, activeSlotRemoteBound, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, planTaskId, artifactPaths, automationId, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, socialShareOn, voiceRecoverySlot, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, handleContinue, openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel, redactionCoachTs])
 
   const renderMessage = useCallback((i: number, m: ChatMessage) => {
     // Key identity rules (clientTs preference + streaming->assistant role
@@ -7380,12 +7338,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     flyout.close()
   }, [dispatch, flyout])
   const flyoutNew = useCallback(() => {
-    const effectiveMode = loadChatConfig().defaultAutopilot ? 'orchestrator' : (mode || '')
     flyout.close()
     // `focusComposerAfter`, not a bare dispatch + rAF: there is one composer and
     // it is bound to the ACTIVE slot, so focusing before creation fulfils puts
     // the caret on the old session and loses whatever is typed. See the module.
-    focusComposerAfter(dispatch(createSlot({ agent: defaultAgent || undefined, mode: effectiveMode })).unwrap())
+    focusComposerAfter(dispatch(createSlot({ agent: defaultAgent || undefined, mode: mode || '' })).unwrap())
   }, [dispatch, defaultAgent, mode, flyout])
 
   // Force the list open when there is nothing in it, so a user with no sessions
@@ -7480,8 +7437,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       showActionError(errMessage(error) || i18nT('pages.chatPage.unknown_error'))
     }
   }
-  // The non-orchestrator welcome screen puts its memory chip directly above the composer.
-  const showComposerMemoryChip = isWelcomeState && (currentSlot?.mode || mode) !== 'orchestrator'
+  // The welcome screen puts its memory chip directly above the composer.
+  const showComposerMemoryChip = isWelcomeState
 
   // Memoized so the composer's memo holds across page renders that change
   // nothing it shows (a pin, a streamed frame): JSX written inline in the prop
@@ -7594,14 +7551,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     state: sessionControlStatuses[sc.key]?.state,
     statusTooltip: sessionControlStatuses[sc.key]?.tooltip,
   })), [sessionControls, openSessionControl, activeSlot, sessionControlStatuses])
-  // `isRefused` keeps one identity per slot and reads the module-level latches,
-  // so the latch set it answers from (`latchedActions`, published after a Go /
-  // Cancel click) is what has to re-key this memo.
-  const planLatches = planActionMutation.latchedActions
-  const followUpRefusedOptions = useMemo(() => {
-    void planLatches
-    return new Set(followUpOptions.filter(planActionMutation.isRefused))
-  }, [followUpOptions, planActionMutation.isRefused, planLatches])
 
   return (
     <RowDisclosureProvider resetKey={activeSlot}>
@@ -7887,14 +7836,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   }
                 />
               )}
-              {/* The autopilot explainer rides the bar too: it is the only
-                  place the mode is explained, and the inline row that carried
-                  it is not rendered here. A tooltip disclosure, not an action. */}
-              {/* No Autopilot InfoTip here: it is a third button in a two-button
-                  cell. The session menu already names the mode (its
-                  Autopilot/Normal switch row) and the composer shows it. No
-                  InboundLinkChip either, for the same reason: a two-way link
-                  would make it a third trigger. Its actions are the session
+              {/* No InboundLinkChip here: it is a third button in a two-button
+                  cell, and a two-way link would make it a third trigger. Its actions are the session
                   menu's "Linked surfaces" section (LinkedSurfacesSection). */}
             </div>
           )}
@@ -8291,7 +8234,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   />
                 )}
                 </div>
-              {effectiveMode === 'orchestrator' && <span className="pointer-events-auto"><InfoTip text={i18nT('pages.chatPage.autopilot_plans_before_executing_each_stage_need')} /></span>}
               <InboundLinkChip slotKey={activeSlot} />
               {/* Trailing controls grouped under a single ml-auto so multiple
                   right-aligned items don't each absorb free space (two ml-auto
@@ -8392,12 +8334,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 exit={{ opacity: 0 }}
                 transition={{ duration: 0.18 }}
               >
-                <WelcomeView
-                  mode={currentSlot?.mode || mode}
-                  setInput={setInput}
-                  memoryMode={currentSlot?.memory_mode ?? 'persistent'}
-                  onSwitchMode={switchMemoryMode}
-                />
+                <WelcomeView setInput={setInput} />
               </motion.div>
             ) : (
             <>
@@ -8846,13 +8783,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               // never runs, so offering the mode there would promise a decision
               // nothing makes.
               jevAutoAvailable={jevAutoConsented && !!slotRunning}
-              onFollowUpSend={(text?: string, sourceKeyAtClick?: string | null) => {
-                // Double-click and Send-now share dispatchPlanFollowUp with
-                // single-click (#6240). First-click row identity refuses a
-                // straddled double-click on a replaced footer.
-                if (text && dispatchPlanFollowUp(text, sourceKeyAtClick)) return
-                send(text)
-              }}
+              onFollowUpSend={(text?: string) => send(text)}
               disabled={
                 /* Streaming, compaction, and stopping all
                    keep the input interactive: api_chat queues on slot.running and
@@ -9231,14 +9162,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               quickSend={dashCfg?.quick_send}
               followUpLayout={chatConfig.followUpLayout}
               followUpSourceKey={followUpSourceKey}
-              followUpPendingOptions={planActionMutation.latchedActions}
-              followUpRefusedOptions={followUpRefusedOptions}
-              followUpError={planActionMutation.failure}
-              onFollowUpSelect={(o: string, e: React.MouseEvent, sourceKeyAtClick?: string | null) => {
-                // Plan options (Go / Go All / Cancel) dispatch directly — no input fill.
-                // Non-protocol labels on a plan-shaped message keep the composer path:
-                // the endpoint would 400 them while the append was already skipped.
-                if (dispatchPlanFollowUp(o, sourceKeyAtClick)) return
+              onFollowUpSelect={(o: string, e: React.MouseEvent) => {
                 // One-click: enabled + no shift + not busy + not already in multi-select
                 if (tryQuickSend(o, dashCfg?.quick_send, e.shiftKey, slotRunning, followUpPickedRef.current.size, send)) return
                 // Regular options: toggle. Click unpicked → append + mark; click

@@ -1731,7 +1731,7 @@ export default function App() {
     }
   }, [])
   // Sum across every registered built-in surface — Chat (slot-based),
-  // Autopilot (slot-based), Notifications (notifications slice), Secretary
+  // Notifications (notifications slice), Secretary
   // (attention slice), etc. App badges (dynamic, via `mc:app:badge` and the
   // global-approvals query below) are added below since they live outside
   // the Redux store and outside the registry.

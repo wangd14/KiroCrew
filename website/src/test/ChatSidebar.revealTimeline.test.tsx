@@ -66,7 +66,7 @@ vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
 
 /** Mutable so one case can put the sidebar in board view. */
 const cfg = vi.hoisted(() => ({
-  value: { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false } as Record<string, unknown>,
+  value: { tagColumnsEnabled: false, confirmCloseSession: false } as Record<string, unknown>,
 }))
 vi.mock('../pages/chat/ChatSettings', () => ({
   loadChatConfig: () => cfg.value,
@@ -173,7 +173,7 @@ beforeEach(() => {
   localStorage.clear()
   localStorage.setItem('mc-session-stale-collapse-ms', '0')
   motionPref.reduce = false
-  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
   for (const m of Object.values(mocks)) m.mockReset()
   mocks.chatFolders.mockResolvedValue([])
   mocks.chatTags.mockResolvedValue([])

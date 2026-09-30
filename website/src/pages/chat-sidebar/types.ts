@@ -73,9 +73,8 @@ export interface Slot {
   // The slot snapshot can report live child work before the detailed activity
   // map hydrates after reconnect. Never present that gap as an idle interruption.
   subagents_running?: boolean
-  // Autopilot orchestration and queued turns are also server-rejected Resume
-  // states, even when the slot's own turn is currently idle.
-  orchestrating?: boolean
+  // Queued turns are also a server-rejected Resume state, even when the slot's
+  // own turn is currently idle.
   queue_depth?: number
   mode?: string
   /** Which page renders this session; the backend mirrors `mode` into it. The chat

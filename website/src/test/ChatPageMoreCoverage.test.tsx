@@ -6,8 +6,7 @@
  * Three cold areas, all through a real `render(<ChatPage />)`:
  *
  *  1. The row callbacks ChatPage hands to AssistantMessage: `handleFork` (all
- *     three outcomes plus the cold-config refetch), `handlePlanFromHere`,
- *     `handleQuote`, `handleAsk`, `handleRegenerate` (including the snapshot
+ *     three outcomes plus the cold-config refetch), `handleQuote`, `handleAsk`, `handleRegenerate` (including the snapshot
  *     rollback on a failed request), `handleSpeak` (both voice states) and
  *     `handleApplyPlan`'s failure path. AssistantMessage is stubbed as a prop
  *     recorder so the callbacks can be invoked directly — the card's own
@@ -68,7 +67,6 @@ interface AssistantProps {
   content: string
   timestamp?: string
   onFork?: (visibleIndex: number) => void | Promise<void>
-  onPlanFromHere?: (visibleIndex: number) => void | Promise<void>
   onQuote?: (text: string, rect: DOMRect) => void
   onAsk?: (text: string) => void
   onSpeak?: (content: string) => void
@@ -161,16 +159,21 @@ vi.mock('../components/AgentDropdownList', () => ({ default: () => null, Default
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
 vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
-interface WelcomeProps {
-  onSwitchMode?: (mode: 'persistent' | 'incognito' | 'temporary') => void | Promise<void>
-}
-let welcomeProps: WelcomeProps | null = null
 vi.mock('../components/WelcomeView', async () => {
   const React = await import('react')
+  return { default: () => React.createElement('div', { 'data-testid': 'welcome' }) }
+})
+// The welcome-state memory chip sits above the composer, rendered by ChatPage itself.
+interface MemoryChipProps {
+  onSwitchMode?: (mode: 'persistent' | 'incognito' | 'temporary') => void | Promise<void>
+}
+let memoryChipProps: MemoryChipProps | null = null
+vi.mock('../components/MemoryModeChip', async () => {
+  const React = await import('react')
   return {
-    default: (props: WelcomeProps) => {
-      welcomeProps = props
-      return React.createElement('div', { 'data-testid': 'welcome' })
+    MemoryModeChip: (props: MemoryChipProps) => {
+      memoryChipProps = props
+      return React.createElement('div', { 'data-testid': 'memory-mode-chip' })
     },
   }
 })
@@ -372,7 +375,7 @@ beforeEach(() => {
   inputProps = null
   projectPickerProps = null
   gridProps = null
-  welcomeProps = null
+  memoryChipProps = null
   chatSettings = { contentWidth: 'compact' }
   localStorage.clear()
   sessionStorage.clear()
@@ -398,10 +401,10 @@ describe('Welcome recreation preserves remote execution', () => {
     })
     apiSpy('deleteChatSlot').mockResolvedValue({ ok: true })
     renderChatPage([], { slots: [REMOTE_SLOT] })
-    await waitFor(() => expect(welcomeProps).not.toBeNull())
+    await waitFor(() => expect(memoryChipProps).not.toBeNull())
 
     await act(async () => {
-      await welcomeProps!.onSwitchMode?.('persistent')
+      await memoryChipProps!.onSwitchMode?.('persistent')
     })
 
     await waitFor(() => expect(apiMocks.createChatSlot).toHaveBeenCalled())
@@ -465,26 +468,7 @@ describe('ChatPage row callbacks — fork', () => {
   })
 })
 
-describe('ChatPage row callbacks — plan from here', () => {
-  it('forks into an orchestrator session without a direction', async () => {
-    apiSpy('forkChatSlot').mockResolvedValue({ ok: true, key: 'chat-2' })
-    await renderTurn()
-    await act(async () => { await assistantProps!.onPlanFromHere!(2) })
-    await waitFor(() => expect(apiMocks.forkChatSlot).toHaveBeenCalled())
-    expect(apiMocks.forkChatSlot).toHaveBeenCalledWith('chat-1', 2, undefined, 'orchestrator', undefined)
-    expect(alertSpy).not.toHaveBeenCalled()
-  })
-
-  it('reports a refused plan-from-here with its own message, not the fork one', async () => {
-    apiSpy('forkChatSlot').mockResolvedValue({ ok: false, error: 'no orchestrator agent' })
-    await renderTurn()
-    await act(async () => { await assistantProps!.onPlanFromHere!(2) })
-    const said = (await screen.findByTestId('action-error')).textContent ?? ''
-    expect(said).toContain('no orchestrator agent')
-    expect(said).not.toContain('Fork failed')
-    expect(alertSpy).not.toHaveBeenCalled()
-  })
-
+describe('ChatPage row callbacks — apply plan', () => {
   it('surfaces a failed plan apply and resolves false', async () => {
     apiSpy('planFromChat').mockResolvedValue({ ok: false })
     await renderTurn()

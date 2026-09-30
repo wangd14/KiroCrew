@@ -49,12 +49,11 @@ export function useTurnCompletion({ dispatch, queryClient, reconnectingRef }: Tu
           workflowActive
           || selectSidebarSubagentCounts(soundState)[data.slot]
           || soundSlot?.subagents_running
-          || soundSlot?.orchestrating
           || (soundSlot?.queue_depth ?? 0) > 0
           || selectSidebarAutomationRunningKeys(soundState).includes(dashboardAutomationSlotKey(data.slot))
         )
         questionPending = !!soundState.chat.pendingQuestions?.[data.slot]
-        // An authoritative frame hint (explicit question, manual Go) or a
+        // An authoritative frame hint (explicit question) or a
         // live question card both mean the conversation paused for the
         // user rather than finished; the toast wording reads this too.
         completionNeedsInput = data.needs_input === true || questionPending

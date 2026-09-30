@@ -1,11 +1,10 @@
-/** Creating sessions from the sidebar: the New chat variants (local, autopilot, crew,
- *  plain, ephemeral) and a new chat inside a folder. */
+/** Creating sessions from the sidebar: the New chat variants (local, crew,
+ *  ephemeral) and a new chat inside a folder. */
 import { useState, useRef, useCallback, type Dispatch, type SetStateAction } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { type ErrorReport, findReport } from '../../utils/errorReport'
 import { resolveFolderAgent, resolveFolderProjectDir } from '../../utils/folderAgent'
-import { loadChatConfig } from '../chat/ChatSettings'
 import { createSlot } from '../../store/chatSlice'
 import { focusComposer } from '../chat/composerFocus'
 import { ApiError } from '../../api/apiError'
@@ -57,9 +56,6 @@ export function useFolderChatCreate({ folders, defaultAgent, mode, dispatch, dro
   const createChatInFolderMutation = useMutation({
     mutationFn: ({ folderId, memoryMode, inNewTab }: CreateChatInFolderVars) => {
       const agent = resolveFolderAgent(folders, folderId, defaultAgent)
-      // A mode-specific create pins plain mode, not the defaultAutopilot preference.
-      const ephemeral = !!memoryMode
-      const effectiveMode = (!ephemeral && loadChatConfig().defaultAutopilot) ? 'orchestrator' : (mode || '')
       // Carry folder membership in the create payload so createSlot publishes
       // the new slot to Redux in its final location. Assigning it after create
       // lets the sidebar render one frame at root before moving it.
@@ -71,7 +67,7 @@ export function useFolderChatCreate({ folders, defaultAgent, mode, dispatch, dro
       const project = resolveFolderProjectDir(folders, folderId)
       // The tab gesture registers the slot without stealing focus -- same
       // `activate: false` contract as the header New button's gesture.
-      return dispatch(createSlot({ agent, mode: effectiveMode, folder_id: folderId, project, activate: !inNewTab, ...(memoryMode ? { memory_mode: memoryMode } : {}) })).unwrap()
+      return dispatch(createSlot({ agent, mode: mode || '', folder_id: folderId, project, activate: !inNewTab, ...(memoryMode ? { memory_mode: memoryMode } : {}) })).unwrap()
     },
     onSuccess: (slot: Slot, { folderId, columnId, focus, attempt, inNewTab }: CreateChatInFolderVars) => {
       // A create that went through supersedes an earlier failure notice for
@@ -169,8 +165,6 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
   setRemoteCrewError: Dispatch<SetStateAction<string>>
   setNewChatMenuOpen: Dispatch<SetStateAction<boolean>>
 }) {
-  // Create autopilot session mutation (consistent with useMutation pattern)
-  //
   // Every local create below reports through `newChatError`. `createSlot(...)
   // .unwrap()` rejects with RTK's SerializedError — a PLAIN object carrying
   // `message`, not an Error instance — so the reader accepts both shapes (same
@@ -179,15 +173,6 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
   // the failed click a silent no-op again, which is the defect being fixed.
   // `errMessage` already reads the RTK SerializedError a rejected thunk carries.
   const onNewChatError = (err: unknown) => setNewChatError(errMessage(err) || i18nT('pages.chatSidebar.folder_create_failed'))
-  const createAutopilotMutation = useMutation({
-    mutationFn: () => {
-      setNewChatError('')
-      return dispatch(createSlot({ agent: defaultAgent || undefined, mode: 'orchestrator' })).unwrap()
-    },
-    onSuccess: focusComposer,
-    onError: onNewChatError,
-  })
-
   // Crew Members: the create menu's crew entry no longer creates anything. Crew
   // Mode (a `mode: 'crew'` session fanning topics out to sub-sessions) is
   // retired in favour of the Crew Members page, where each member is a
@@ -228,8 +213,7 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
   const createChatMutation = useMutation({
     mutationFn: ({ inNewTab }: { inNewTab: boolean }) => {
       setNewChatError('')
-      const effectiveMode = loadChatConfig().defaultAutopilot ? 'orchestrator' : (mode || '')
-      return dispatch(createSlot({ agent: defaultAgent || undefined, mode: effectiveMode, activate: !inNewTab })).unwrap()
+      return dispatch(createSlot({ agent: defaultAgent || undefined, mode: mode || '', activate: !inNewTab })).unwrap()
     },
     onSuccess: (slot, { inNewTab }) => {
       if (inNewTab && onOpenSlotInNewTab) {
@@ -243,13 +227,6 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
     onError: onNewChatError,
   })
 
-  // Create a PLAIN chat, ignoring the `defaultAutopilot` preference.
-  // The caret menu lists "New chat" and "New autopilot chat" side by side, so
-  // each must name exactly what it makes. Routing the plain entry through
-  // createChatMutation would hand an autopilot session to anyone who turned the
-  // default on — the one case where they picked the non-default on purpose.
-  // The button's main segment keeps honouring the preference; only this explicit
-  // entry pins the mode.
   // Create a LOCAL session whose turns run on a peer crew. The session belongs to
   // this machine — local sidebar row, local transcript, local history and search —
   // and only its execution moves, so this goes through the ordinary `createSlot`
@@ -309,20 +286,8 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
     },
   })
 
-  const createPlainChatMutation = useMutation({
-    mutationFn: () => {
-      setNewChatError('')
-      return dispatch(createSlot({ agent: defaultAgent || undefined, mode: mode || '' })).unwrap()
-    },
-    onSuccess: focusComposer,
-    onError: onNewChatError,
-  })
-
   // Create an ephemeral chat — incognito (memory reads, no writes) or temporary
-  // (neither). The mode is pinned plain for the same reason the plain entry
-  // above pins it: these entries name the MEMORY mode, so routing them through
-  // the `defaultAutopilot` preference would hand an autopilot session to
-  // someone who came to this submenu to choose something else.
+  // (neither).
   const createEphemeralChatMutation = useMutation({
     mutationFn: (memoryMode: 'incognito' | 'temporary') => {
       setNewChatError('')
@@ -332,7 +297,7 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
     onError: onNewChatError,
   })
   return {
-    createAutopilotMutation, crewPreview, openCrewMembers, remoteCrewChatPreview,
-    createChatMutation, createRemoteChatMutation, createPlainChatMutation, createEphemeralChatMutation,
+    crewPreview, openCrewMembers, remoteCrewChatPreview,
+    createChatMutation, createRemoteChatMutation, createEphemeralChatMutation,
   }
 }

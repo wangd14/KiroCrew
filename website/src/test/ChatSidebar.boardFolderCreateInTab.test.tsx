@@ -50,7 +50,7 @@ vi.mock('framer-motion', async () => {
 
 vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
 vi.mock('../pages/chat/ChatSettings', () => ({
-  loadChatConfig: () => ({ tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }),
+  loadChatConfig: () => ({ tagColumnsEnabled: true, confirmCloseSession: false }),
   saveChatConfig: vi.fn(),
 }))
 
