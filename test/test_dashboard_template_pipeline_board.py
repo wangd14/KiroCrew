@@ -51,8 +51,8 @@ from kiro_crew.dashboard.dynamic_cards import (
 )
 from kiro_crew.pipeline_board_contract import (
     BOARD_COLUMN_NAMES,
-    BOARD_TEMPLATE_ID,
     BOARD_STAT_KEYS,
+    BOARD_TEMPLATE_ID,
     CONTRACT_VERSION,
     NOT_SAID,
     UNREADABLE,
