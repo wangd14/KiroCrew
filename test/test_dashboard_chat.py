@@ -6761,6 +6761,47 @@ class TestRunChatCompactDeferredWait:
         assert len(notice) < _COMPACT_FAIL_REASON_MAX_CHARS + 60
 
 
+class TestRunChatImageBudgetNotice:
+    """An image the prompt path kept off the wire is told to the user as a notice
+    row -- about the question, not part of the answer."""
+
+    @pytest.mark.asyncio
+    async def test_the_withheld_image_event_becomes_a_notice_row(self, tmp_path, monkeypatch):
+        from kiro_crew.image_ledger import withheld_notice
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_IMAGE_BUDGET,
+            EVENT_TEXT_CHUNK,
+            LLMEvent,
+        )
+
+        notice = withheld_notice(2)
+        events = [
+            LLMEvent(kind=EVENT_IMAGE_BUDGET, text=notice),
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="the answer"),
+            LLMEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+        ]
+        state = TestRunChatCompactDeferredWait._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = TestRunChatCompactDeferredWait._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "look at these")
+
+        notices = [m for m in slot.messages if m.get("role") == "notice"]
+        assert [m["content"] for m in notices] == [notice]
+        assert notices[0].get("cls") == "msg msg-info"
+        # The answer is untouched: the notice is neither prepended to it nor
+        # counted as assistant output.
+        assistant = [m for m in slot.messages if m.get("role") == "assistant"]
+        assert [m["content"] for m in assistant] == ["the answer"]
+        # Ordered as the turn saw it: the notice precedes the answer.
+        roles = [m.get("role") for m in slot.messages]
+        assert roles.index("notice") < roles.index("assistant")
+
+
 class TestTokenPersistenceBackfill:
     """Regression tests for the late-backfill of slot.model before
     persist_token_record is called from _run_chat.

@@ -39,6 +39,7 @@ from kiro_crew.acp.types import (
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
+    EVENT_IMAGE_BUDGET,
     EVENT_MCP_OAUTH_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
@@ -16475,6 +16476,14 @@ async def _run_chat(
                         )
                         assistant_text = ""
                         _wsred.reset()
+            elif event.kind == EVENT_IMAGE_BUDGET:
+                # The prompt path kept part of the user's message off the wire.
+                # A notice row, not assistant text: it is about the question,
+                # not part of the answer, so it neither counts as the turn's
+                # visible output nor shadows the answer's follow-up buttons.
+                append_and_surface(
+                    state, slot, "notice", _redact_display_text(event.text), "msg msg-info"
+                )
             elif event.kind == EVENT_CLEAR_STATUS:
                 # A confirmed native clear is the one destructive slash command:
                 # replaying the persisted Kiro Crew history afterwards would undo

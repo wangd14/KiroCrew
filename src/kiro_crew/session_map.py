@@ -22,6 +22,7 @@ from typing import ParamSpec, TypeVar
 
 from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
 from kiro_crew.config.paths import config_dir, kiro_sessions_dir
+from kiro_crew.image_ledger import normalize_ledger as normalize_image_ledger
 from kiro_crew.messaging.link import (
     SLACK_NAMESPACE,
     UNBIND_REASON_ENTRY_DELETED,
@@ -114,6 +115,14 @@ MIRROR_OPT_OUT_FLAG = "mirror_opt_out"
 #: uninstall and the reinstall must not lose it. One-shot: consumed, and cleared as
 #: it is consumed, by the first cold start that honours it.
 SUPPRESS_REPLAY_FLAG = "suppress_replay"
+
+#: Entry field holding the inline-image ledger :mod:`kiro_crew.image_ledger`
+#: keeps per session (the digests of every image inlined into the native
+#: conversation, the running base64 total, and the per-prompt records a
+#: compaction refund reads). An ON-DISK contract like the
+#: flags above: renaming it would read every existing ledger as empty and
+#: re-inline every picture those conversations already carry.
+_IMAGE_LEDGER_FIELD = "image_ledger"
 
 # Highest explicit DM generation acknowledged before its first provider turn.
 # Stored on the stable bucket entry so repeated /new commands cost one integer,
@@ -1275,10 +1284,22 @@ class SessionMap:
 
     @_guarded
     def set(self, key: str, sid: str, *, provider: str = "", cwd: str = "") -> None:
-        """Save mapping and persist to disk, preserving existing slack fields."""
+        """Save mapping and persist to disk, preserving existing slack fields.
+
+        The inline-image ledger (:meth:`set_image_ledger`) names the native
+        conversation it describes, and a ledger describing a conversation other
+        than *sid* goes: that conversation's images are not in this one. The
+        comparison is against the LEDGER's sid, not the entry's previous one,
+        because a fresh session whose promotion is deferred behind a history
+        replay writes its own ledger under the new sid before this method
+        records that sid -- and that ledger must survive the promotion.
+        """
         key = canonical_key(key)
         existing = self._data.get(key)
         if existing:
+            ledger = existing.get(_IMAGE_LEDGER_FIELD)
+            if not isinstance(ledger, dict) or ledger.get("sid") != sid:
+                existing.pop(_IMAGE_LEDGER_FIELD, None)
             existing["sid"] = sid
             if provider:
                 existing["provider"] = provider
@@ -2462,3 +2483,49 @@ class SessionMap:
         """Return the per-thread project-dir override for *key*, or None."""
         entry = self._data.get(canonical_key(key))
         return entry.get("project_override") if entry else None
+
+    def get_image_ledger(self, key: str) -> dict | None:
+        """The inline-image ledger on *key*'s entry; ``None`` when there is no entry.
+
+        The ``None`` is load-bearing: it tells the prompt path this session has
+        no durable record, so its ledger must live in memory instead. An entry
+        without a ledger yet reads as ``{}``. Single-key probe, lock-free like
+        :meth:`get_flag`; the writer rebinds the sub-dict whole rather than
+        mutating it, so this read never observes a half-written ledger.
+        """
+        entry = self._data.get(canonical_key(key))
+        if entry is None:
+            return None
+        raw = entry.get(_IMAGE_LEDGER_FIELD)
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    @_guarded
+    def set_image_ledger(self, key: str, ledger: dict) -> bool:
+        """Store the inline-image ledger on *key*'s EXISTING entry.
+
+        Never materializes an entry: a stateless session (cron, subagent) has
+        none by design and keeps its ledger in memory, and writing one here
+        would accrete a row per such session. The ledger is normalized at this
+        point of retention -- digest list bounded, each digest shape-checked,
+        byte count a non-negative int, the sid it names held to the map's one
+        ACP-session-id bound -- so a caller cannot grow the record past what
+        :mod:`kiro_crew.image_ledger` bounds. An empty ledger removes the field
+        so empty state does not accrete on disk. Returns whether the entry took
+        the write.
+        """
+        entry = self._data.get(canonical_key(key))
+        if entry is None:
+            return False
+        clean = normalize_image_ledger(ledger)
+        # The one ACP-session-id bound every sid this map retains goes through.
+        clean["sid"] = bounded_session_id(clean.get("sid")) or ""
+        if not clean["hashes"] and not clean["b64_bytes"] and not clean["recent"]:
+            if _IMAGE_LEDGER_FIELD in entry:
+                entry.pop(_IMAGE_LEDGER_FIELD, None)
+                self._save()
+            return True
+        # Rebound whole, never edited in place: the lock-free reader above may
+        # be holding the previous dict.
+        entry[_IMAGE_LEDGER_FIELD] = clean
+        self._save()
+        return True

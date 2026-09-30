@@ -166,6 +166,7 @@ from kiro_crew.acp.types import (
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
+    EVENT_IMAGE_BUDGET,
     EVENT_MCP_OAUTH_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
@@ -262,6 +263,7 @@ from kiro_crew.hooks import (
     get_global_hook_store,
 )
 from kiro_crew.identity_stores import IDENTITY_STORE_ROOTS
+from kiro_crew.image_ledger import SessionImageBudget, withheld_notice
 from kiro_crew.kiro_cli import known_kiro_cli_dirs, resolve_kiro_cli
 from kiro_crew.mcp_gateway.claim import (
     STUB_SESSION_TOKEN_ENV,
@@ -3446,6 +3448,15 @@ class AcpClient:
         self._pi_gate_request_tool: dict[str, str] = {}
         self._pi_gate_denied_ids: set[str] = set()
         self._session_key = session_key
+        # Per-session image dedup + budget over the built prompt blocks; the
+        # same layer AcpSessionHandle applies, so neither prompt path can
+        # re-send a payload the conversation already carries.
+        self._image_budget = SessionImageBudget(
+            lambda: self._session_key or "", lambda: self._session_id or ""
+        )
+        # Image blocks the last written prompt kept off the wire as over the
+        # budget; stream_events turns it into the user's notice.
+        self._withheld_images = 0
         # When set, this client emits a per-tool-call SEL audit from the ACP
         # dispatch loop. Used by app/worker-pool clients (e.g. code-review-sage,
         # knowledge llm_pool) that have no external audit loop. Left None for
@@ -10536,6 +10547,10 @@ class AcpClient:
         self._turn_done.clear()
         await self.ensure_ready()
         req_id = await self._send_prompt(message)
+        if self._withheld_images:
+            # Before the answer streams, as the shared-runtime handle does: the
+            # user learns the model never saw part of the message.
+            yield AcpEvent(kind=EVENT_IMAGE_BUDGET, text=withheld_notice(self._withheld_images))
         async for event in self._dispatch_events(req_id, timeout):
             yield event
 
@@ -10803,6 +10818,11 @@ class AcpClient:
                     summary = compaction_failure_detail(params)
                 yield AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)
             elif action == "clear":
+                # The conversation was emptied under the SAME sid, so the
+                # sid-scoped ledger would otherwise still apply: forget every
+                # inlined image, or a picture attached again is dropped as
+                # "sent earlier" from a conversation that holds nothing.
+                self._image_budget.reset()
                 yield AcpEvent(kind=EVENT_CLEAR_STATUS)
             elif action == "subagent_list":
                 params = msg.params or {}
@@ -11386,15 +11406,29 @@ class AcpClient:
     async def _send_prompt(self, message: str) -> int:
         # Shared with AcpSessionHandle.prompt via prompt_blocks so the two paths
         # cannot drift.
-        return await self._send_request(
-            METHOD_PROMPT,
-            {
-                "sessionId": self._session_id,
-                # Offloaded: see the note in session_handle.prompt -- image
-                # reads and base64 encoding must not block the event loop.
-                "prompt": await asyncio.to_thread(build_prompt_blocks, message),
-            },
-        )
+        #
+        # Offloaded: see the note in session_handle.prompt -- image reads and
+        # base64 encoding must not block the event loop. The per-session
+        # dedup + budget layer then makes the list a wire payload (it strips
+        # the builder's host-side annotations), exactly as the handle does.
+        blocks = await asyncio.to_thread(build_prompt_blocks, message)
+        blocks = await self._image_budget.apply(blocks)
+        try:
+            req_id = await self._send_request(
+                METHOD_PROMPT,
+                {"sessionId": self._session_id, "prompt": blocks},
+            )
+        except BaseException:
+            # Never written, so nothing entered the conversation: a ledger
+            # charged now would drop the image from the caller's retry.
+            self._image_budget.discard()
+            raise
+        # Records the staged ledger. A ``/clear`` sent as text is an ordinary
+        # prompt to the ledger (text-only, so nothing is staged and every digest
+        # stays); only the confirmed clear notification resets it, from the
+        # clear branch of ``_dispatch_events``.
+        self._withheld_images = self._image_budget.commit()
+        return req_id
 
     async def _read_prompt_response(self, req_id: int, timeout: float) -> str:
         output: list[str] = []
@@ -13104,6 +13138,9 @@ class AcpClient:
         elif s_type == "completed":
             self._compaction_failed_at = None
             self.last_prompt_stats.reset_after_compaction()
+            # The images in the summarized history left the replay with it:
+            # refund the ledger so the conversation can inline images again.
+            self._image_budget.compacted()
 
     def _claude_compaction_event(self, chunk: str) -> AcpEvent | None:
         """Reclassify a claude-agent-acp compaction notice chunk as an event.

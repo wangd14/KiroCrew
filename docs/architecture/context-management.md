@@ -213,6 +213,17 @@ The guidance paragraphs sit **before** the request header on purpose: trailing
 them displaced the request from the prompt's recency edge and the model regressed
 to an older question.
 
+An image the turn attaches does not enter this text at all: it travels beside
+it as an ACP image block, built by `acp/prompt_blocks.py` and then passed
+through the per-session dedup and aggregate budget in
+`src/kiro_crew/image_ledger.py` → `apply_image_budget`, which drops a payload
+the conversation already carries and degrades a block past the session's byte
+budget to a text marker — and tells the user so, as a notice row in the
+transcript. A kiro-cli compaction refunds the budget for the images it
+summarized away, so a long conversation can keep attaching pictures. Its
+constants and the measurement behind them are in the
+[acp-client spec](../system-specs/modules/acp-client.md#image-support).
+
 ### Trigger-matched skills
 
 Off by default. `skills.max_triggered` defaults to **0**, which disables per-turn

@@ -120,6 +120,7 @@ from kiro_crew.acp.types import (
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
+    EVENT_IMAGE_BUDGET,
     EVENT_MCP_OAUTH_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
@@ -176,6 +177,7 @@ from kiro_crew.agent_sdk.drivers.acp import EntitlementRevalidating  # noqa: F40
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.image_ledger import SessionImageBudget, withheld_notice
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED, emit_counter
 from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.recovery.ladder import InfraError, classify_infra_error
@@ -973,6 +975,11 @@ class AcpSessionHandle:
         # host-supplied and is never used for either. Empty for a pooled session
         # nobody has claimed yet, which the execute path refuses.
         self._session_key = session_key
+        # Per-session image dedup + budget over the built prompt blocks. Reads
+        # the session key at call time because ``bind_session_key`` rebinds a
+        # pooled handle to its owner on claim; the ACP session id names the
+        # native conversation the ledger describes.
+        self._image_budget = SessionImageBudget(lambda: self._session_key, lambda: self._session_id)
         self._listed_hooks = kas_wire.ListedHookStore()
         # Strong references to in-flight hook executions: the loop holds only a
         # weak one, and a collected task would leave its request unanswered.
@@ -1421,6 +1428,12 @@ class AcpSessionHandle:
                 message,
                 allow_image=self._runtime.supports_image_prompt,
             )
+            # The per-session layer over the finished list: a payload already
+            # in this conversation is not re-sent, and the session's inlined
+            # bytes stay under the backend's request-body ceiling. It also
+            # strips the builder's host-side annotations, so this is what
+            # makes the list a wire payload.
+            prompt_blocks = await self._image_budget.apply(prompt_blocks)
             # Content-free outbound STRUCTURE diagnostics: one
             # line per turn build recording block counts, per-type counts, and
             # the serialized byte size — NEVER any block text or bytes — so an
@@ -1889,7 +1902,14 @@ class AcpSessionHandle:
                 _mark(self._session_id, True)
             req_id = await self._runtime.send_request(_method, _params)
             self._prompt_written = True
+            # The prompt reached the runtime: the images it inlined are now
+            # part of the conversation, so their digests may be recorded.
+            # Before this point a died runtime makes the caller re-queue the
+            # same message, and a ledger charged at build time would then
+            # read the undelivered image as already sent.
+            _withheld_images = self._image_budget.commit()
         except BaseException:
+            self._image_budget.discard()
             self._turn_done.set()
             _mark = getattr(self._runtime, "mark_turn_active", None)
             if _mark is not None:
@@ -1928,6 +1948,10 @@ class AcpSessionHandle:
                         f"{redact_text(str(_n_title)[:4096])[:120]}"
                     ),
                 )
+            if _withheld_images:
+                # Same position for the same reason: the user learns before the
+                # answer streams that the model never saw part of the message.
+                yield AcpEvent(kind=EVENT_IMAGE_BUDGET, text=withheld_notice(_withheld_images))
             async for event in self._dispatch_events(
                 req_id, timeout, extract_command_result=extract_command_result
             ):
@@ -3285,6 +3309,8 @@ class AcpSessionHandle:
                             # loop, so it must drop the stale counts itself —
                             # mirrors AcpClient._handle_compaction_status.
                             self.last_prompt_stats.reset_after_compaction()
+                            # ...and refund the image ledger, for the same reason.
+                            self._image_budget.compacted()
                             poisoned = await self._drain_post_compaction_metadata(buffered=buffered)
                         # Redact backend-echoed summary before it reaches callers
                         # (compact() surfaces this to the dashboard).
@@ -4837,6 +4863,10 @@ class AcpSessionHandle:
                         # Mirrors AcpClient._handle_compaction_status.
                         self._compaction_failed_at = None
                         self.last_prompt_stats.reset_after_compaction()
+                        # The images in the summarized history left the replay
+                        # with it: refund the ledger so the conversation can
+                        # inline images again under the same sid.
+                        self._image_budget.compacted()
                     # Compaction summary is backend-echoed text (LLM-influenced)
                     # that reaches the dashboard — redact exfil URLs/credentials
                     # before surfacing it (parity with other text surfaces).
@@ -4860,6 +4890,14 @@ class AcpSessionHandle:
                     # Same provenance as the compaction notice: one that named
                     # no session and was fanned out to co-tenants is not this
                     # session's own.
+                    if not msg.fanout_no_owner:
+                        # A confirmed native clear empties the conversation
+                        # under the SAME sid, so the sid-change reset on the
+                        # session record never fires for it: forget every
+                        # inlined image here, or a picture attached again
+                        # would be dropped as "sent earlier" from a
+                        # conversation that holds nothing.
+                        self._image_budget.reset()
                     yield AcpEvent(kind=EVENT_CLEAR_STATUS, runtime_global=msg.fanout_no_owner)
                 elif action == "agent_switched":
                     saw_agent_switch = True

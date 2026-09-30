@@ -593,6 +593,26 @@ def _drop_live_config_snapshot():
 
 
 @pytest.fixture(autouse=True)
+def _drop_image_ledger_store():
+    """Start and end every test with no durable image-ledger store registered.
+
+    ``SessionManager.__init__`` registers its live ``SessionMap`` as the
+    process-global store the prompt path persists image digests through
+    (``kiro_crew.image_ledger.set_image_ledger_store``). Left registered, a
+    manager built by one test would receive the ledgers of every later handle
+    or client prompt on the same xdist worker that reuses a session key -- and
+    the SECOND such test would see its image degraded to a ``sent earlier``
+    marker for a picture it never sent. The reset is one module attribute, so
+    the tests that never build a manager pay nothing measurable.
+    """
+    from kiro_crew import image_ledger
+
+    image_ledger.set_image_ledger_store(None)
+    yield
+    image_ledger.set_image_ledger_store(None)
+
+
+@pytest.fixture(autouse=True)
 def _inline_taskq_pump(_floor_monkeypatch):
     """Run the subagent pump and the store open inline for the suite.
 

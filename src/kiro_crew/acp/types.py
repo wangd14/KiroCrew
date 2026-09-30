@@ -98,6 +98,9 @@ EVENT_PERMISSION_REQUEST = "permission_request"
 EVENT_COMPLETE = "complete"
 EVENT_COMPACTION_STATUS = "compaction_status"
 EVENT_CLEAR_STATUS = "clear_status"
+# The prompt just written kept image blocks off the wire as over the image
+# budget; ``text`` is the ready sentence for the user (image_ledger.withheld_notice).
+EVENT_IMAGE_BUDGET = "image_budget"
 EVENT_AGENT_SWITCHED = "agent_switched"
 EVENT_MCP_OAUTH_REQUEST = "mcp_oauth_request"
 # Agent's own task/TODO list snapshot, recovered from the `todo_list` tool's

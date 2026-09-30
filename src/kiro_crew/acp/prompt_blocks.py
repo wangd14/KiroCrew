@@ -14,6 +14,16 @@ Keeping one builder matters: both paths need the same path-to-image
 conversion, so a single implementation stops any channel from shipping a
 filesystem path to the model as text.
 
+The list this module returns is HOST-SIDE, not yet the wire payload: every
+image block carries a ``_source`` annotation (``image_ledger.IMAGE_BLOCK_SOURCE_KEY``:
+the path as written and the offsets of the markers written for it) that the
+per-session dedup and budget layer in :mod:`kiro_crew.image_ledger`
+reads and strips. Both prompt paths run that layer
+(``image_ledger.SessionImageBudget.apply``) over the finished list before
+``session/prompt`` is sent, so a payload already in the conversation is not
+re-sent and the session's inlined bytes stay under the backend's request-body
+ceiling.
+
 Wire shape (per docs/reference/kiro-cli/acp.md):
 
 .. code-block:: json
@@ -33,6 +43,7 @@ import os
 from pathlib import Path
 
 from kiro_crew.hooks import is_unc_shape, safe_read_file_bytes, unc_probe_allowed
+from kiro_crew.image_ledger import IMAGE_BLOCK_SOURCE_KEY
 
 # The path grammar and the history scrubber live in the LEAF module
 # kiro_crew.image_refs for the same reason the Pillow machinery lives in
@@ -93,7 +104,10 @@ def build_prompt_blocks(
 
     Each readable image path found in *message* becomes an ``image`` block and is
     replaced in the text by ``[image: <name>]`` so the model still sees where the
-    attachment sat in the sentence.
+    attachment sat in the sentence. A second DISTINCT file with the same
+    basename in one message gets ``[image: <name> (2)]``, and so on: every
+    block's marker is unique within the prompt, which the budget layer relies
+    on to rewrite exactly the block it drops.
 
     ``allow_image=False`` (the agent did not advertise
     ``promptCapabilities.image``) leaves the path in the text untouched: the file
@@ -113,8 +127,22 @@ def build_prompt_blocks(
 
     if allow_image:
         seen: set[str] = set()
+        # Basename -> how many DISTINCT files with that name this call has
+        # inlined, so the marker of the second one can be told from the first.
+        marker_count: dict[str, int] = {}
+        # raw path -> the marker written for it and the block it produced, for
+        # every path this call inlines; filled by the loop, consumed by the
+        # one-pass substitution after it.
+        inlined: dict[str, tuple[str, dict]] = {}
+        # Every candidate the grammar matched, as ``(start, end, raw)`` in
+        # *message*, repeats included: a path named twice is one block whose
+        # marker stands at both places.
+        candidates: list[tuple[int, int, str]] = []
         for match in _PATH_RE.finditer(message):
-            raw = match.group(1).strip()
+            group = match.group(1)
+            raw = group.strip()
+            start = match.start(1) + (len(group) - len(group.lstrip()))
+            candidates.append((start, start + len(raw), raw))
             if raw in seen:
                 continue
             # UNC-shaped candidates name a HOST on Windows: gate them before
@@ -217,10 +245,64 @@ def build_prompt_blocks(
             out_bytes, out_mime = downscaled
             data = base64.b64encode(out_bytes).decode("ascii")
             seen.add(raw)
-            images.append({"type": "image", "data": data, "mimeType": out_mime})
-            text = text.replace(raw, f"[image: {path.name}]")
+            # One marker per block, unique within this prompt: two different
+            # files that share a basename get "[image: shot.png]" and
+            # "[image: shot.png (2)]", so the budget layer can rewrite exactly
+            # the dropped block's occurrences and never a neighbour's.
+            marker_count[path.name] = marker_count.get(path.name, 0) + 1
+            nth = marker_count[path.name]
+            marker = f"[image: {path.name}]" if nth == 1 else f"[image: {path.name} ({nth})]"
+            # The source annotation is HOST-SIDE: the per-session budget layer
+            # (kiro_crew.image_ledger) reads it to rewrite this block's marker
+            # when it drops the block, and strips it before the wire. ``spans``
+            # is filled by the substitution pass below.
+            block = {
+                "type": "image",
+                "data": data,
+                "mimeType": out_mime,
+                IMAGE_BLOCK_SOURCE_KEY: {"path": raw, "spans": []},
+            }
+            images.append(block)
+            inlined[raw] = (marker, block)
+        if inlined:
+            text = _substitute_markers(message, candidates, inlined)
 
     return [{"type": "text", "text": text}, *images]
+
+
+def _substitute_markers(
+    message: str,
+    candidates: list[tuple[int, int, str]],
+    inlined: dict[str, tuple[str, dict]],
+) -> str:
+    """*message* with every inlined candidate replaced by its block's marker.
+
+    One pass over the grammar's own match spans, in text order, so a marker
+    lands exactly where a candidate the grammar recognised stood -- never
+    inside a URL query or another path that merely contains the same
+    characters, which a whole-text ``str.replace`` would also rewrite. Each
+    marker's ``[start, end)`` in the RESULT is appended to its block's
+    annotation ``spans``: the budget layer rewrites those offsets, and only
+    those, when it drops the block, so a bracketed string the user typed is
+    never mistaken for a marker.
+    """
+    out: list[str] = []
+    length = 0
+    pos = 0
+    for start, end, raw in candidates:
+        entry = inlined.get(raw)
+        if entry is None:
+            continue
+        marker, block = entry
+        gap = message[pos:start]
+        out.append(gap)
+        length += len(gap)
+        out.append(marker)
+        block[IMAGE_BLOCK_SOURCE_KEY]["spans"].append([length, length + len(marker)])
+        length += len(marker)
+        pos = end
+    out.append(message[pos:])
+    return "".join(out)
 
 
 #: Block ``type`` values that get a dedicated counter in the structure summary.

@@ -2389,6 +2389,100 @@ and restore path to share one mutation protocol with in-memory dashboard state.
 The request path chooses the smaller fail-safe rule instead: stale sidecars are
 reversible, while deleting a successor's state is not.
 
+### Inline-image ledger on the entry
+
+The prompt path's per-session image dedup and aggregate budget
+([acp-client](acp-client.md#image-support), "Per-session dedup and aggregate
+budget") keeps its ledger — the SHA-256 digests of every image inlined into the
+native conversation, bounded at `image_ledger.MAX_LEDGER_HASHES`, plus the
+running base64 total — on the session's map entry, under the `image_ledger`
+field, through `SessionMap.get_image_ledger` / `set_image_ledger`. It sits
+there for the same reason the per-conversation flags and overrides do: the
+entry is the durable per-session record, so the ledger survives a gateway
+restart and is pruned with the entry. Three rules shape it:
+
+- **Scoped to the native conversation, not the key.** The ledger carries the
+  `sid` of the native conversation its images were inlined into. The prompt
+  path reads a ledger naming another sid as empty (`image_ledger.load_image_ledger`),
+  so a fresh conversation never inherits the previous one's ledger — including
+  the resume whose fresh session's sid promotion is deferred behind a history
+  replay, where the entry still records the OLD sid while the new conversation
+  already takes prompts: its first turn writes its own ledger under the new sid,
+  and `SessionMap.set` keeps a ledger whose sid matches the sid it is recording
+  and drops one that names any other conversation (`/new`, a discarded
+  conversation, a provider switch). The comparison is against the ledger's own
+  sid, never the entry's previous sid, which is what lets the deferred write
+  survive its promotion. A confirmed native `/clear` empties the conversation
+  under the SAME sid, so the scoping never fires for it: the prompt path that
+  owns the `_kiro.dev/clear/status` frame resets the ledger itself
+  (`SessionImageBudget.reset`, which stores an empty ledger and so removes the
+  field). A `/clear` a harness receives as prompt text is an ordinary prompt to
+  the ledger: no harness has been measured to empty its conversation on that
+  text, and the two possible errors are not symmetric -- a ledger emptied for a
+  harness that did NOT clear re-sends every picture into a history that still
+  holds them (the growth the ledger exists to stop), while a ledger kept across
+  a clear that did happen costs a `sent earlier` marker that names the file. A
+  harness shown to clear on the text can be admitted later by an opt-in
+  membership (H6 in `harness-parity.md`) carrying the measurement.
+- **Refunded on a kiro-cli compaction.** A compaction keeps the same `sid`, so
+  neither the sid scoping nor the clear reset fires, yet it turns the older
+  history -- and every image in it -- into summary text; only the newest
+  user/assistant pairs stay verbatim (at least two, plus as many more as it
+  takes, walked newest-first, to reach two percent of the context window in
+  raw bytes with images at full weight) and the prompt in flight is re-sent.
+  The completed `_kiro.dev/compaction/status` this session owns therefore
+  refunds the ledger (`SessionImageBudget.compacted`, on the prompt dispatch
+  loop, the `wait_for_compaction` drain and the direct client's compaction
+  handler alike): every digest is forgotten, so a picture attached again is
+  inlined again -- at worst once more than needed for one the kept tail still
+  carries -- and the byte total drops to what the kept prompts inlined. The
+  ledger knows which prompts those can be from the per-prompt records it keeps
+  under `recent` (each image prompt's inlined bytes, the prompt text written
+  after it, and its position from the newest prompt, saturating one past the
+  kept pairs); a record is dropped as soon as no compaction could keep it. The
+  walk sees only what this side wrote -- never the assistant's replies or tool
+  results -- and is sized for the largest window served, so it can only keep a
+  prompt kiro-cli summarized, never drop one it kept: the total errs toward
+  staying charged, and the wire stays under the ceiling. Only kiro-cli's
+  compaction refunds: its kept tail is measured; a refund against an
+  unmeasured tail (KAS, claude-agent-acp, codex) could re-open the growth, so
+  those conversations keep the pre-refund behaviour and `/new` starts a fresh
+  ledger.
+- **Charged by the write, not the build.** The prompt path stages the
+  recomputed ledger while it builds the blocks and writes it here only after
+  the `session/prompt` frame has been written; a write that raises discards the
+  stage, so a message the caller re-queues after a runtime death still carries
+  its image instead of a `sent earlier` marker for a picture the conversation
+  never received.
+- **Never materializes an entry.** `set_image_ledger` writes only onto an
+  existing entry and returns `False` otherwise; `get_image_ledger` returns
+  `None` for a key with no entry. That `None` is what tells the prompt path a
+  session is stateless (cron, subagent, the direct client outside a manager)
+  and must keep its ledger in memory on its own handle — so no row accretes
+  per stateless session. An empty ledger removes the field.
+- **Normalized at the point of retention.** The write bounds the digest list,
+  drops anything that is not a lowercase 64-hex-character SHA-256, holds the
+  byte count at zero or above (a floor only: the budget caps bound it upward,
+  and a total already past them reads as an exhausted budget) and holds the sid
+  to the map's one ACP-session-id bound (`bounded_session_id`; an over-long sid
+  is refused, not truncated), so a hand-edited or corrupt record can neither
+  grow the row nor be read as anything but a smaller ledger. The read is
+  bounded BEFORE it validates: only the newest `image_ledger.MAX_LEDGER_HASHES`
+  raw entries of a record are examined and any excess is counted and logged
+  once (the writer never stores more than the bound, so a longer record is
+  foreign), so a record of any length costs the constant on the event loop, not
+  its length. Every record the writer can produce fits that window whole, where
+  a malformed entry is dropped ahead of the cap and so occupies no slot and
+  evicts no real digest.
+
+The ACP layer holds a session KEY and nothing that reaches the manager, and a
+throwaway `SessionMap()` is read-only by this class's contract, so the LIVE map
+is registered once, by `SessionManager.__init__`, through
+`image_ledger.set_image_ledger_store`; the prompt path reads and writes through
+that registration. On the event loop the write is a `_save` like every other
+per-conversation field — a dirty mark and a deferred flush, never an inline disk
+write.
+
 ## Slack Thread Linking
 
 Sessions can be linked to Slack threads via `SessionMap` fields

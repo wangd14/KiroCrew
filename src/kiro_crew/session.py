@@ -119,7 +119,13 @@ if TYPE_CHECKING:
     from kiro_crew.acp.runtime import AcpRuntime, AcpSessionHandle
     from kiro_crew.session_capabilities import LoadedCapabilities
 
-from kiro_crew import model_registry, model_scope, platform_compat, shutdown_event
+from kiro_crew import (
+    image_ledger,
+    model_registry,
+    model_scope,
+    platform_compat,
+    shutdown_event,
+)
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
@@ -1878,6 +1884,11 @@ class SessionManager:
         self._compaction_state = CompactionState()
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         self._session_map = SessionMap()
+        # The prompt path's per-session image ledger persists on this map's
+        # entries. The ACP layer holds only a session KEY, and a throwaway
+        # ``SessionMap()`` is read-only by that class's contract, so the LIVE
+        # map is handed over here and reached through the leaf module.
+        image_ledger.set_image_ledger_store(self._session_map)
 
         self._pool = WarmSessionPool(
             cast(Any, self),
