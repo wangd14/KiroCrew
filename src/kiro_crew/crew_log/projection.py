@@ -1798,13 +1798,15 @@ def _usage_render(state: dict[str, Any]) -> dict[str, Any]:
             "by_source": {
                 name: dict(row) for name, row in sorted(state["context_by_source"].items())
             },
-            # The per-turn window, OLDEST FIRST, and the count that fell off its
-            # front. The pair is what makes this a window rather than a history: a
-            # reader shown 200 rows and no count cannot tell a session of 200 turns
-            # from one of 2,000. ``_closed`` is the fold's private seal (which closer
-            # already stamped this row) and ``unit`` (which run of the slot appended
-            # it) are both dropped here: together they keep one run's reading off
-            # another's same-ordinal rows, and no reader asks for either.
+            # The per-turn window, OLDEST FIRST. No count of what fell off the front
+            # rides beside it: each row carries its own ``ordinal``, assigned before
+            # any truncation, so the first row's number is what tells a reader this is
+            # a window rather than the whole history -- and it says how much precedes
+            # it, which a whole-session total could not for a narrower window.
+            # ``_closed`` is the fold's private seal (which closer already stamped this
+            # row) and ``unit`` (which run of the slot appended it) are both dropped
+            # here: together they keep one run's reading off another's same-ordinal
+            # rows, and no reader asks for either.
             "turns": [
                 {
                     **{k: v for k, v in row.items() if k not in ("_closed", "unit")},

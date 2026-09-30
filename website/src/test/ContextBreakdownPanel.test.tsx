@@ -55,6 +55,7 @@ const turn = (over: Partial<ContextTurn> = {}): ContextTurn => ({
   context_used: 2000,
   context_window: 200000,
   model: 'claude',
+  ordinal: 0,
   ...over,
 })
 
@@ -274,6 +275,59 @@ describe('ContextBreakdownPanel rendering', () => {
     expect(screen.getByText(`Turn ${MAX_CHART_TURNS + 5} · latest`)).toBeInTheDocument()
   })
 
+  it('counts every earlier turn from the first shown row ordinal', () => {
+    // 35 retained rows whose TRUE ordinals are 41..75 (40 turns ran before them). The
+    // chart draws the newest 30 (ordinals 46..75) and clips 5; the label must report
+    // all 45 earlier turns -- the 40 gone before the payload plus the 5 clipped here --
+    // derived from the first shown row's exact ordinal, not a uniform offset.
+    const many = Array.from({ length: MAX_CHART_TURNS + 5 }, (_, i) =>
+      turnOf({ your_message: 10 + i, memory: 100 }, { ordinal: 41 + i }),
+    )
+    render(<ContextBreakdownPanel trace={trace({ turns: many })} />)
+    expect(screen.getByText('45 earlier turns not shown')).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /^Turn \d+:/ })).toHaveLength(MAX_CHART_TURNS)
+    // The newest is turn 75, the oldest shown is 46.
+    expect(screen.getByText(/Turn 75 · latest/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Turn 46:/ })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^Turn 45:/ })).toBeNull()
+  })
+
+  it('reports earlier-hidden from the first row ordinal when the chart clips nothing', () => {
+    // Fewer rows than the chart cap, but 7 turns ran before them (ordinals 8, 9, 10):
+    // the count comes from the first row's ordinal, and the chart draws every row it has.
+    const few = [
+      turnOf({ your_message: 10, memory: 100 }, { ordinal: 8 }),
+      turnOf({ your_message: 20, memory: 100 }, { ordinal: 9 }),
+      turnOf({ your_message: 30, memory: 100 }, { ordinal: 10 }),
+    ]
+    render(<ContextBreakdownPanel trace={trace({ turns: few })} />)
+    expect(screen.getByText('7 earlier turns not shown')).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /^Turn \d+:/ })).toHaveLength(3)
+  })
+
+  it('shows each row EXACT ordinal, indexing the array window-local', () => {
+    // Three retained rows whose true ordinals are 41, 42, 43: the displayed label must
+    // show those exact numbers, while the array is still indexed by the window-local
+    // position (the earlier turns are not in it).
+    const few = [
+      turnOf({ your_message: 10, memory: 100 }, { ordinal: 41 }),
+      turnOf({ your_message: 20, memory: 200 }, { ordinal: 42 }),
+      turnOf({ your_message: 30, memory: 300 }, { ordinal: 43 }),
+    ]
+    render(<ContextBreakdownPanel trace={trace({ turns: few })} />)
+    const detail = screen.getByTestId('selected-turn-detail')
+    // Newest retained row is the 43rd turn, not the 3rd.
+    expect(within(detail).getByText(/Turn 43 · latest/)).toBeInTheDocument()
+    // The buttons are LABELLED by the true ordinal ...
+    const turn41 = screen.getByRole('button', { name: /^Turn 41:/ })
+    // ... but still IDENTIFIED window-local, so selecting it indexes the array at 1.
+    expect(turn41).toHaveAttribute('data-turn', '1')
+    fireEvent.click(turn41)
+    // Selecting the first retained row shows the 41st turn's detail, not the latest.
+    expect(within(detail).getByText('Turn 41')).toBeInTheDocument()
+    expect(within(detail).queryByText(/latest/)).toBeNull()
+  })
+
   it('carries neither a whole-window estimate nor a credits column', () => {
     render(
       <ContextBreakdownPanel
@@ -346,6 +400,29 @@ describe('session-start turns sit above the chart', () => {
       .filter(n => Number.isFinite(n))
     expect(Math.max(...ticks)).toBeLessThan(10_000)
     expect(screen.getByText(/shown above the chart so later turns stay readable/)).toBeInTheDocument()
+  })
+
+  it('announces the start row by its TRUE ordinal, matching what the row displays', () => {
+    // The chart's aria label names the selected turn. A session-start row is selected
+    // ABOVE the chart and is absent from the rows the chart draws, so the chart cannot
+    // look its ordinal up -- the selection key it receives is the window-local `n`.
+    // Announcing that would tell a screen-reader user a different number from the one
+    // printed on the row beside it, which is the only place the two can disagree.
+    const rows = [
+      turnOf({ your_message: 120, memory: 30_000 }, { phase: 'session_start', ordinal: 41 }),
+      turnOf({ your_message: 80, memory: 600 }, { ordinal: 42 }),
+      turnOf({ your_message: 80, memory: 1_000 }, { ordinal: 43 }),
+    ]
+    const { container } = render(<ContextBreakdownPanel trace={trace({ turns: rows })} />)
+    const row = container.querySelector('[data-start-row]') as HTMLElement
+    // Visible text and the selection key disagree on purpose: ordinal 41, window index 1.
+    expect(row.textContent).toContain('Turn 41 · session start')
+    expect(row).toHaveAttribute('data-turn', '1')
+
+    fireEvent.click(row)
+    const chart = container.querySelector('[role="img"]') as HTMLElement
+    expect(chart.getAttribute('aria-label')).toContain('Turn 41 is selected')
+    expect(chart.getAttribute('aria-label')).not.toContain('Turn 1 is selected')
   })
 
   it('selecting the start row drives the detail like any other turn', () => {

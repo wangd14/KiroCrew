@@ -530,12 +530,15 @@ class TestContextTrace:
         assert out["peak_context_used"] == 0
         assert out["context_window"] == 200_000
 
-    def test_a_reading_whose_window_is_unknown_does_not_borrow_another(self):
-        """A used count with no window is a reading whose denominator is unknown.
+    def test_a_reading_whose_window_is_unknown_is_not_a_peak_candidate(self):
+        """A used count with no window has no fullness ratio, so it cannot be the peak.
 
-        Reporting the previous turn's window here would pair the number with a size it
-        was never measured against; 0 is what the frontend's own guard reads as "no
-        occupancy to show" (``context_window <= 0`` returns 0).
+        The peak is the fullest turn -- the highest ``used / used_window`` -- and a
+        reading whose window is 0 has no denominator to be a fraction of. Crowning it
+        would report a peak over a zero window (a broken ratio the frontend then has to
+        hide). Here the later turn reports MORE used tokens (80k) but no window, while
+        an earlier turn is a valid pair (40k / 100k): the earlier, valid turn is the
+        peak, and its own window travels with it.
         """
         _open(window=100_000)
         _compose({"memory": 100}, turn=1)
@@ -544,8 +547,56 @@ class TestContextTrace:
         _billed(turn=2, used=80_000, window=0)
         _flush()
         out = usage_mod.context_trace(SLOT, 14)
-        assert out["peak_context_used"] == 80_000
-        assert out["context_window"] == 0
+        assert out["peak_context_used"] == 40_000, (
+            "the windowless 80k reading has no ratio and must not win the peak over "
+            "the valid 40k/100k pair"
+        )
+        assert out["context_window"] == 100_000
+
+    def test_peak_is_the_fullest_ratio_not_the_largest_used_across_a_switch(self):
+        """A smaller ``used`` against a smaller window can be fuller than a larger one.
+
+        This is the exact case GPT flagged: comparing ``used`` alone ignores the
+        window a model switch moves. Turn 1 uses 90k of a 100k window (90% full); turn
+        2 switches to a 1M window and uses 200k (20% full). 200k is the larger absolute
+        reading, but turn 1 is the fuller turn -- the peak and its window must be turn
+        1's, and the rendered ratio 90%, not turn 2's 20%.
+        """
+        _open(window=100_000, model="opus-5")
+        _compose({"memory": 100}, turn=1)
+        _billed(turn=1, used=90_000, window=100_000, model="opus-5")
+        crew_log_emit.on_request_configured(
+            UNIT, 2, model="haiku-9", provider="acp", context_window=1_000_000
+        )
+        _compose({"memory": 100}, turn=2)
+        _billed(turn=2, used=200_000, window=1_000_000, model="haiku-9")
+        _flush()
+        out = usage_mod.context_trace(SLOT, 14)
+        assert (
+            out["peak_context_used"] == 90_000
+        ), "the fuller 90k/100k turn wins over the larger-but-emptier 200k/1M turn"
+        assert out["context_window"] == 100_000
+        assert out["peak_context_used"] / out["context_window"] == 0.9
+
+    def test_peak_keeps_the_later_turn_among_equally_full_readings(self):
+        """``>=`` on the ratio keeps the LATEST equally-full turn, as before.
+
+        Two turns are exactly 50% full on different windows (a switch between them).
+        The later one describes the model currently running, so its pair is reported.
+        """
+        _open(window=100_000, model="opus-5")
+        _compose({"memory": 100}, turn=1)
+        _billed(turn=1, used=50_000, window=100_000, model="opus-5")
+        crew_log_emit.on_request_configured(
+            UNIT, 2, model="haiku-9", provider="acp", context_window=200_000
+        )
+        _compose({"memory": 100}, turn=2)
+        _billed(turn=2, used=100_000, window=200_000, model="haiku-9")
+        _flush()
+        out = usage_mod.context_trace(SLOT, 14)
+        # Both are 50% full; the later turn's pair wins the tie.
+        assert out["peak_context_used"] == 100_000
+        assert out["context_window"] == 200_000
 
     def test_a_later_zero_window_does_not_erase_the_size_stated_earlier(self):
         """A provider that reports no window writes 0, which is not a window of nothing.
