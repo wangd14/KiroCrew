@@ -39,7 +39,8 @@ with the unsent message available to copy and never sends to a fallback. A route
 chat waits for that exact target before using the message; an embedded chat never
 consumes the dashboard intent.
 `window.__mc_chat_launch` is claimed once: the session controller owns explicit
-targets and fresh drafts; `ChatPage` owns untargeted automatic sends. Unclaimed
+targets and fresh drafts; `ChatPage` owns untargeted automatic sends
+(`useAppLaunchIntake`, `website/src/pages/chat/page/launchIntake.ts`). Unclaimed
 intents expire after ten seconds. A newer intent supersedes a pending target
 by ref identity, so its later completion cannot release the older message.
 `autoSend: false` seeds

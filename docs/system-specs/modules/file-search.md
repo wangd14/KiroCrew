@@ -388,7 +388,11 @@ shows literally — the same trade-off inline file mentions make.
 | `website/src/components/chat-input/FilePreviewStrip.tsx` | Pending file/folder preview strip: basename-first folder labels, per-tile remove |
 | `website/src/utils/fileTokens.ts` | Attachment-marker owner: file AND dir token parse/serialize/resolve |
 | `website/src/utils/chatFileTokenDrafts.ts` | Per-slot persistence of file-chip aliases beside the staged-file drafts |
-| `website/src/pages/ChatPage.tsx` | Token-derived staging and send/steer serialization |
+| `website/src/pages/ChatPage.tsx` | Send serialization (`meta.dirs`); the host that composes the owners below |
+| `website/src/pages/chat/page/composerStaging.ts` | Staged-resource state; folder chips derived from `@rel/` tokens (`useStagedFolderRefs`) |
+| `website/src/pages/chat/page/composerFileMentions.ts` | Caret mention insertion, file-chip ↔ alias reconciliation, chip remove and its undo |
+| `website/src/pages/chat/page/composerDrafts.ts` | Per-slot draft stores, including the picked-file aliases, and their slot-switch save/restore |
+| `website/src/pages/chat/page/busyTurnControls.ts` | Steer serialization (folder tokens stay `@rel/`) |
 | `website/src/pages/chat/ChatPageMessageContent.tsx` | User-message folder marker resolution and inline folder chips |
 
 ## Tests

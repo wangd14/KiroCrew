@@ -1386,7 +1386,8 @@ effect: the host route `/artifacts/:slug` owns the URL, and an in-place
 
 **Composer staging** — "Ask agent to address" routes into the bound session and
 *stages* (never auto-sends) its message through the existing `writePrefill`
-sessionStorage channel ChatPage already consumes on slot activation.
+sessionStorage channel ChatPage already consumes on slot activation (the
+slot-change restore in `website/src/pages/chat/page/composerDrafts.ts`).
 
 ## Roadmap
 

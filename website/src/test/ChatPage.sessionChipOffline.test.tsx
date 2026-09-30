@@ -12,7 +12,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 /** Props the stubbed transcript last received, for asserting what ChatPage passes. */
 const lastAssistantProps: { sessions?: ReadonlyMap<string, string> } = {}
 import { render, screen, fireEvent, act } from '@testing-library/react'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -293,6 +293,11 @@ describe('one session-entry path', () => {
   // structure can distinguish the collapsed form from the duplicated one.
   const pageSource = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf-8')
   const sessionSource = readFileSync(join(__dirname, '..', 'pages', 'chat', 'useChatPageSessionController.ts'), 'utf-8')
+  // The page's owners (pages/chat/page/) are scanned too, so neither absence
+  // below can be escaped by moving code out of ChatPage.tsx.
+  const ownerSources = readdirSync(join(__dirname, '..', 'pages', 'chat', 'page'))
+    .filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f))
+    .map(f => readFileSync(join(__dirname, '..', 'pages', 'chat', 'page', f), 'utf-8'))
 
   it('routes the in-message chip through the shared switch callee', () => {
     expect(pageSource).toContain('onSessionOpen={selectSessionTab}')
@@ -302,11 +307,13 @@ describe('one session-entry path', () => {
     // The duplicate would diverge the first time either side gained a side effect.
     expect(pageSource).not.toContain('handleSessionOpen')
     expect(sessionSource).not.toContain('handleSessionOpen')
+    for (const src of ownerSources) expect(src).not.toContain('handleSessionOpen')
   })
 
   it('declares the shared callee exactly once', () => {
     // The callee is owned by the session controller; the page only receives it.
     expect(sessionSource.match(/const selectSessionTab = useCallback/g)).toHaveLength(1)
     expect(pageSource).not.toContain('const selectSessionTab = useCallback')
+    for (const src of ownerSources) expect(src).not.toContain('const selectSessionTab = useCallback')
   })
 })

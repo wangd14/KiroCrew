@@ -577,8 +577,9 @@ text back toward the session, but it **cannot inject a turn**. The path is:
    (truncated to 64 chars), the payload must be a plain object, and the composed
    text is capped. It formats `[UI] <action>: <JSON payload>` (or `[UI] <action>`
    with no payload) and dispatches an internal `mc-widget-send` event.
-3. `ChatPage.tsx` **pre-fills the composer** with that text and records it. It
-   never auto-submits.
+3. `ChatPage.tsx` **pre-fills the composer** with that text and records it
+   (the `mc-widget-send` listener in `useAutoSendIntake`,
+   `website/src/pages/chat/page/launchIntake.ts`). It never auto-submits.
 
 The iframe's own `isTrusted` click check is NOT the trust boundary and must not be
 treated as authoritative: LLM-emitted `<script>` in the same document can
