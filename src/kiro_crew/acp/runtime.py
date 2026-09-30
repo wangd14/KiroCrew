@@ -119,6 +119,7 @@ from kiro_crew.acp.transport_framing import (
     _drain_oversize_line,
     response_write_window_secs,
     write_notification_best_effort,
+    write_request_frame_bounded,
     write_response_frame_bounded,
 )
 from kiro_crew.acp.types import (
@@ -4622,13 +4623,13 @@ class AcpRuntime:
         data = json.dumps(req.to_dict()) + "\n"
 
         try:
-            # Under the write lock so a response frame waiting behind this
-            # (caller-sized, deliberately unbounded) frame measures the
-            # reader's progress exactly; see await_under_no_progress_bound.
-            async with self._stdin_write_lock():
-                self._refuse_write_if_dead()
-                self._process.stdin.write(data.encode())
-                await self._process.stdin.drain()
+            # Bounded on the reader's PROGRESS, not held across a raw drain: on
+            # the shared stdin a request write that parked while kiro-cli was
+            # flow-control-paused used to hold the write lock forever and wedge
+            # every other session (issue #15219). A stall now marks the runtime
+            # dead and raises AcpRuntimeStdinStalled (an AcpRuntimeDead), caught
+            # below so the routing registration is dropped like any other death.
+            await self._write_request_bounded(data.encode(), req_id, method)
         except AcpRuntimeDead:
             self._routed_requests.pop(req_id, None)
             raise
@@ -4749,6 +4750,54 @@ class AcpRuntime:
             f"delivering response to req={safe_id}"
         )
 
+    async def _write_request_bounded(self, data: bytes, request_id: int, method: str) -> None:
+        """Write a REQUEST frame under the write lock and the same no-progress bound.
+
+        The request twin of :meth:`_write_response_bounded`, and it exists for the
+        same shared-runtime hazard: one stdin serves every multiplexed session, so
+        a request write (``session/prompt``, ``session/new``, ``set_mode``,
+        ``_session/steering``) that held the lock across a RAW ``drain()`` parked
+        forever WITH the lock held whenever kiro-cli was flow-control-paused --
+        busy generating on one lane and not reading stdin, the exact state right
+        after ``spawn_run`` fans several session prompts onto the one pipe. Every
+        other session's stdin write then queued behind that lock at 0 CPU, while
+        the busy lane kept streaming stdout and looked healthy (issue #15219).
+
+        The bound is on PROGRESS, not elapsed time, so a caller-sized frame (a
+        prompt may carry any number of image blocks) stays legal: a reader still
+        consuming keeps the wait alive, and only a writer whose buffer has not
+        shrunk for ``_RESPONSE_WRITE_BOUND_SECS`` is the reader-gone stall. On a
+        stall the runtime is marked dead (resolving every pending wait by
+        teardown) and :class:`AcpRuntimeStdinStalled` is raised, which the session
+        provider translates to ``AcpProcessDied`` so the caller takes the same
+        session-reset + bounded-requeue recovery the broken-pipe case uses. The
+        method name and request id appear only through ``_loggable_request_id``.
+        """
+        assert self._process is not None and self._process.stdin is not None
+        if await write_request_frame_bounded(
+            self._process.stdin,
+            self._stdin_write_lock(),
+            data,
+            bound_secs=_RESPONSE_WRITE_BOUND_SECS,
+            before_write=self._refuse_write_if_dead,
+        ):
+            return
+        safe_id = _loggable_request_id(request_id)
+        window = response_write_window_secs(self._process.stdin, _RESPONSE_WRITE_BOUND_SECS)
+        logger.warning(
+            "ACP runtime stdin stalled: no write progress for %gs (floor %d bytes/window) "
+            "while sending request method=%s req=%s; marking runtime dead",
+            window,
+            _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
+            _loggable_request_id(method),
+            safe_id,
+        )
+        self._mark_dead("request write stalled (backend not reading stdin)")
+        raise AcpRuntimeStdinStalled(
+            f"stdin stalled: no write progress for {window:g}s while "
+            f"sending request req={safe_id}"
+        )
+
     async def send_request_for_answer(
         self,
         method: str,
@@ -4795,13 +4844,12 @@ class AcpRuntime:
         if on_registered is not None:
             on_registered(future)
         try:
-            # Through the transport's write lock like every other stdin writer:
-            # a response write measuring the buffer level for its no-progress bound
-            # must be the only writer in flight (see await_under_no_progress_bound).
-            async with self._stdin_write_lock():
-                self._refuse_write_if_dead()
-                self._process.stdin.write(data.encode())
-                await self._process.stdin.drain()
+            # Bounded like send_request (issue #15219): a raw drain here held the
+            # shared write lock forever against a flow-control-paused kiro-cli. A
+            # stall marks the runtime dead and raises AcpRuntimeStdinStalled (an
+            # AcpRuntimeDead), caught below so the pending future is retrieved or
+            # cancelled rather than left unretrieved.
+            await self._write_request_bounded(data.encode(), req_id, method)
         except AcpRuntimeDead:
             # From _refuse_write_if_dead: _mark_dead already failed or dropped the
             # future; retrieve or cancel it so asyncio logs nothing unhandled.
@@ -7324,10 +7372,12 @@ class AcpRuntime:
         self._pending_requests[req_id] = future
 
         try:
-            async with self._stdin_write_lock():
-                self._refuse_write_if_dead()
-                self._process.stdin.write(data.encode())
-                await self._process.stdin.drain()
+            # Bounded like send_request (issue #15219): the control-plane
+            # requests (initialize, session/new, set_mode) shared the same raw
+            # drain under the shared write lock and could park it forever against
+            # a flow-control-paused kiro-cli. A stall raises AcpRuntimeStdinStalled
+            # (an AcpRuntimeDead), caught below to retrieve/cancel the future.
+            await self._write_request_bounded(data.encode(), req_id, method)
         except AcpRuntimeDead:
             # Reached only through _refuse_write_if_dead: _mark_dead has already
             # failed this future and cleared the map, so retrieve its exception

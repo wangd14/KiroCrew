@@ -135,6 +135,7 @@ from kiro_crew.acp.transport_framing import (
     _STDOUT_BUFFER_LIMIT,
     response_write_window_secs,
     write_notification_best_effort,
+    write_request_frame_bounded,
     write_response_frame_bounded,
 )
 from kiro_crew.acp.types import (
@@ -9457,16 +9458,57 @@ class AcpClient:
         req = JsonRpcRequest(method=method, params=params, id=req_id)
         data = json.dumps(req.to_dict()) + "\n"
         try:
-            # Under the write lock so a response frame waiting behind this
-            # (caller-sized, deliberately unbounded) frame measures the
-            # reader's progress exactly; see await_under_no_progress_bound.
-            async with self._stdin_write_lock():
-                self._process.stdin.write(data.encode())
-                await self._process.stdin.drain()
+            # Bounded on the reader's PROGRESS, not held across a raw drain: a
+            # request write that parked while the backend was flow-control-paused
+            # used to hold the write lock forever (issue #15219 -- acute on the
+            # shared runtime, but a single session can self-wedge too). A stall
+            # raises AcpProcessDied, the same recovery a closed pipe already gets.
+            await self._write_request_bounded(data.encode(), req_id, method)
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise AcpProcessDied(f"ACP process pipe broken: {exc}") from exc
         self._last_activity = time.monotonic()
         return req_id
+
+    async def _write_request_bounded(self, data: bytes, request_id: int, method: str) -> None:
+        """Write a REQUEST frame under the write lock and the same no-progress bound.
+
+        The request twin of :meth:`_write_response_bounded`. A request frame is
+        caller-sized (a prompt may carry any number of image blocks), which is
+        why the bound is on the reader's PROGRESS rather than on elapsed time: a
+        reader still consuming keeps the wait alive, and only a writer whose
+        buffer has not shrunk for ``_RESPONSE_WRITE_BOUND_SECS`` is the
+        reader-gone stall. The prior code held the write lock across a RAW
+        ``drain()`` here, so a flow-control-paused backend parked it forever WITH
+        the lock held; on the shared runtime that wedged every co-tenant session
+        behind the lock at 0 CPU (issue #15219). A stall is mapped to
+        ``AcpProcessDied`` so the caller takes the existing session-reset +
+        bounded-requeue recovery. The method and id appear only through
+        ``_loggable_request_id``.
+        """
+        assert self._process is not None and self._process.stdin is not None
+        if await write_request_frame_bounded(
+            self._process.stdin,
+            self._stdin_write_lock(),
+            data,
+            bound_secs=transport_framing._RESPONSE_WRITE_BOUND_SECS,
+        ):
+            return
+        safe_id = _loggable_request_id(request_id)
+        window = response_write_window_secs(
+            self._process.stdin, transport_framing._RESPONSE_WRITE_BOUND_SECS
+        )
+        logger.warning(
+            "ACP stdin stalled: no write progress for %gs (floor %d bytes/window) while "
+            "sending request method=%s req=%s; treating the backend as dead",
+            window,
+            _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
+            _loggable_request_id(method),
+            safe_id,
+        )
+        raise AcpProcessDied(
+            f"ACP stdin stalled: no write progress for {window:g}s while "
+            f"sending request req={safe_id}"
+        )
 
     def _stdin_write_lock(self) -> asyncio.Lock:
         """The one lock every stdin write on this client takes (see

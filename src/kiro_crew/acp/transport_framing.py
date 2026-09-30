@@ -315,6 +315,23 @@ async def write_response_frame_bounded(
         lock.release()
 
 
+# A request frame (session/prompt, session/new, set_mode, _session/steering) is
+# written under the same discipline as a response frame: one writer in flight,
+# the lock wait and the drain both bounded by the reader's PROGRESS rather than
+# by elapsed time, so an unbounded frame size stays legal while a reader that
+# has stopped consuming is a dead runtime. The prior code held the shared write
+# lock across a RAW ``drain()`` here -- fine for the writer while the reader
+# keeps up, but on the shared runtime a flow-control-paused kiro-cli (busy on one
+# multiplexed lane, not reading stdin) parked that drain forever WITH the lock
+# held, wedging every other session's stdin write behind it at 0 CPU while the
+# busy lane kept streaming stdout. The bound turns that forever-hold into a
+# bounded stall the caller maps to a process death (session reset + requeue),
+# the same recovery a closed pipe already gets. The write body is frame-neutral,
+# so the request writers reuse it under this name rather than a second copy that
+# could drift from the response one's progress semantics.
+write_request_frame_bounded = write_response_frame_bounded
+
+
 def response_write_window_secs(stdin: asyncio.StreamWriter, bound_secs: float) -> float:
     """The no-progress window ``await_under_no_progress_bound`` applies to this
     writer -- ``bound_secs`` when its level is a progress signal, the

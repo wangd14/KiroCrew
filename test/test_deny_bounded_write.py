@@ -866,15 +866,23 @@ class TestWriteLock:
         # consumes would hide the shrink. Under the lock the prompt frame is the
         # only writer until its drain returns, then the response is the only
         # writer; a healthy shared runtime stays alive.
+        # The prompt is now a bounded writer too (issue #15219), so BOTH the
+        # prompt's own drain wait and the response's lock-wait poll this level.
+        # A monotonic shrink of one floor per poll therefore reads as progress on
+        # every poll of either writer (never a false flat), until it bottoms out
+        # at 0 -- well after both writers have finished. The point under test is
+        # unchanged: under the lock each writer is the only one in flight, so the
+        # level a writer measures is its own frame draining, never masked by a
+        # concurrent append.
         rt, proc = _runtime_with_stdin(stalled=False)
         released = asyncio.Event()
-        levels = [3_000_000, 2_000_000, 1_000_000, 0]
+        floor = acp_client._RESPONSE_WRITE_MIN_PROGRESS_BYTES
         polls = {"n": 0}
 
         def _level() -> int:
-            idx = min(polls["n"], len(levels) - 1)
+            idx = polls["n"]
             polls["n"] += 1
-            return levels[idx]
+            return max(0, 200 * floor - idx * floor)
 
         async def _slow_prompt_drain() -> None:
             await asyncio.sleep(short_bound * 2.5)  # a live reader on a big frame
@@ -931,6 +939,131 @@ class TestWriteLock:
         await client.cancel_session()
         assert held_during_write == [True, True, True, True]
         assert not lock.locked()
+
+
+class TestRequestWriteNoProgressBound:
+    """A REQUEST frame (session/prompt, session/new, set_mode, _session/steering)
+    is bounded on the reader's PROGRESS exactly like a response frame.
+
+    Issue #15219: on the shared runtime one stdin serves every multiplexed
+    session, and a request write used to hold the write lock across a RAW
+    ``drain()``. A flow-control-paused kiro-cli -- busy generating on one lane
+    and not reading stdin, the state right after ``spawn_run`` fans several
+    session prompts onto the one pipe -- parked that drain forever WITH the lock
+    held, so every other session's stdin write queued behind it at 0 CPU while
+    the busy lane kept streaming stdout. The bound turns that forever-hold into a
+    bounded stall the caller maps to a process death (session reset + requeue).
+    """
+
+    @pytest.mark.asyncio
+    async def test_runtime_send_request_on_a_flat_buffer_stalls_and_marks_dead(
+        self, short_bound: float, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        rt, proc = _runtime_with_stdin(stalled=True)
+        rt._session_queues["s1"] = asyncio.Queue()
+        proc.stdin = _stdin_with_buffer([3_000_000, 3_000_000, 3_000_000], drain_after=None)
+        proc.stdin.write = MagicMock()
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger=acp_runtime.logger.name):
+            with pytest.raises(AcpRuntimeDead, match=r"stdin stalled.* req=\d+"):
+                await asyncio.wait_for(
+                    rt.send_request("session/prompt", {"sessionId": "s1"}), timeout=_OUTER_GUARD
+                )
+        assert time.monotonic() - started < _OUTER_GUARD, "the bound did not fire"
+        assert rt._dead is True, "a stalled shared request write is a dead runtime"
+        # The routing registration is dropped like any other death, so no answer
+        # is ever waited on for a request that never went out.
+        assert rt._routed_requests == {}
+        stalled = [r.getMessage() for r in caplog.records if "stdin stalled" in r.getMessage()]
+        assert len(stalled) == 1 and "session/prompt" in stalled[0]
+
+    @pytest.mark.asyncio
+    async def test_runtime_send_request_for_answer_stalls_and_marks_dead(
+        self, short_bound: float
+    ) -> None:
+        rt, proc = _runtime_with_stdin(stalled=True)
+        proc.stdin = _stdin_with_buffer([3_000_000, 3_000_000, 3_000_000], drain_after=None)
+        proc.stdin.write = MagicMock()
+        with pytest.raises(AcpRuntimeDead, match=r"stdin stalled"):
+            await asyncio.wait_for(
+                rt.send_request_for_answer("_session/steering", {"sessionId": "s1"}),
+                timeout=_OUTER_GUARD,
+            )
+        assert rt._dead is True
+        assert rt._pending_requests == {}
+
+    @pytest.mark.asyncio
+    async def test_runtime_send_and_await_stalls_and_marks_dead(self, short_bound: float) -> None:
+        rt, proc = _runtime_with_stdin(stalled=True)
+        proc.stdin = _stdin_with_buffer([3_000_000, 3_000_000, 3_000_000], drain_after=None)
+        proc.stdin.write = MagicMock()
+        with pytest.raises(AcpRuntimeDead, match=r"stdin stalled"):
+            await asyncio.wait_for(
+                rt._send_and_await("session/new", {}, timeout=_OUTER_GUARD),
+                timeout=_OUTER_GUARD,
+            )
+        assert rt._dead is True
+        assert rt._pending_requests == {}
+
+    @pytest.mark.asyncio
+    async def test_client_send_request_on_a_flat_buffer_raises_process_died(
+        self, short_bound: float, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client, proc = _client_with_stdin(stalled=True)
+        proc.stdin = _stdin_with_buffer([3_000_000, 3_000_000, 3_000_000], drain_after=None)
+        proc.stdin.write = MagicMock()
+        with caplog.at_level(logging.WARNING, logger=acp_client.logger.name):
+            with pytest.raises(AcpProcessDied, match=r"stdin stalled.* req=\d+"):
+                await asyncio.wait_for(
+                    client._send_request("session/prompt", {"sessionId": "s"}),
+                    timeout=_OUTER_GUARD,
+                )
+        stalled = [r.getMessage() for r in caplog.records if "stdin stalled" in r.getMessage()]
+        assert len(stalled) == 1 and "session/prompt" in stalled[0]
+
+    @pytest.mark.asyncio
+    async def test_runtime_request_with_a_shrinking_buffer_is_not_a_stall(
+        self, short_bound: float
+    ) -> None:
+        # A live reader draining a large frame keeps the request wait alive past
+        # the bound; the frame goes out and the runtime stays alive. This is the
+        # property that keeps a legitimate multi-MB prompt from being mistaken
+        # for the wedge.
+        rt, proc = _runtime_with_stdin(stalled=False)
+        rt._session_queues["s1"] = asyncio.Queue()
+        proc.stdin = _stdin_with_buffer([3_000_000, 2_000_000, 1_000_000, 0], drain_after=3)
+        proc.stdin.write = MagicMock()
+        req_id = await asyncio.wait_for(
+            rt.send_request("session/prompt", {"sessionId": "s1"}), timeout=_OUTER_GUARD
+        )
+        assert rt._dead is False
+        assert rt._routed_requests.get(req_id) == "s1"
+        proc.stdin.write.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_request_write_does_not_hold_the_lock_for_a_peer(
+        self, short_bound: float
+    ) -> None:
+        # The wedge itself: a request write on a paused stdin must not hold the
+        # shared lock forever. Once it stalls (and marks the runtime dead), a
+        # peer stdin write on the same runtime is refused promptly rather than
+        # queuing behind the lock at 0 CPU indefinitely.
+        rt, proc = _runtime_with_stdin(stalled=True)
+        rt._session_queues["parent"] = asyncio.Queue()
+        proc.stdin = _stdin_with_buffer([3_000_000, 3_000_000, 3_000_000], drain_after=None)
+        proc.stdin.write = MagicMock()
+        with pytest.raises(AcpRuntimeDead):
+            await asyncio.wait_for(
+                rt.send_request("session/prompt", {"sessionId": "sub"}), timeout=_OUTER_GUARD
+            )
+        # Lock released by the stalled writer; the runtime is dead, so a peer's
+        # write is refused at once (not blocked forever behind the lock).
+        assert not rt._stdin_write_lock().locked()
+        with pytest.raises(AcpRuntimeDead):
+            await asyncio.wait_for(
+                rt.send_response("parent-req", {"outcome": {"outcome": "selected"}}),
+                timeout=_OUTER_GUARD,
+            )
 
 
 class TestQueuedWriterAfterDeath:
@@ -1117,6 +1250,7 @@ class TestEveryBackendIdLogSiteIsSanitized:
     SITES = {
         "src/kiro_crew/acp/client.py": [
             "to req=%s; treating the backend as dead",
+            "sending request method=%s req=%s; treating the backend as dead",
             "reject_tool: no deny option advertised for req=%s",
             "ACP: rejecting unknown server request: method=%s id=%s",
             "Deferring inbound server request: method=%s id=%s (waiting for %d)",
@@ -1137,6 +1271,7 @@ class TestEveryBackendIdLogSiteIsSanitized:
             "send_notification method=%s: %s; activity clock not refreshed",
             "Dropped %d unroutable frame(s) for session %s (method=%s)",
             "response to req=%s; marking runtime dead",
+            "while sending request method=%s req=%s; marking runtime dead",
             "Ownerless server request answered -32601 — method=%s id=%s",
             "answer-task cap (%d) reached at %s request id=%s%s and no ",
             "auto-rejected permission request id=%s for session %s ",
