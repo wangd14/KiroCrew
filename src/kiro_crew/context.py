@@ -25,6 +25,7 @@ from kiro_crew import model_registry, resource_status
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent import _prompt_path, is_managed_prompt
 from kiro_crew.agent_discovery import agent_skill_globs
+from kiro_crew.agent_files import ASSISTANT_MEMBER_NAME, ASSISTANT_TEMPLATE_NAME
 from kiro_crew.agent_sdk.drivers import acp as acp_driver
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, is_claude_code
 from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
@@ -3500,6 +3501,7 @@ class ContextBuilder:
         strict: bool = False,
         include_briefing: bool = True,
         desk_withheld: bool = False,
+        template_selected: bool = False,
     ) -> str:
         """Assemble the four-layer identity for a member's bound execution.
 
@@ -3611,11 +3613,35 @@ class ContextBuilder:
         rules = _scrub_member_payload(rules)
         briefing = _scrub_member_payload(briefing)
 
-        identity = [
-            f"[MEMBER IDENTITY]\nYou are {member}. Not a generic assistant, and not an "
-            f"extension of the user: {member} is an identity of your own — your name, "
-            "your role, your memory of this thread, and your track record belong to you."
-        ]
+        # The Assistant identity belongs to the separate built-in ``assistant``
+        # member only, on Global memory and its own template. The reserved
+        # ``default`` member keeps the ordinary identity whatever it is bound to.
+        assistant = (
+            member == ASSISTANT_MEMBER_NAME
+            and not strict
+            and not template_selected
+            and crew is not None
+            and getattr(crew, "kiro_agent", "") == ASSISTANT_TEMPLATE_NAME
+            and not getattr(crew, "member_id", "")
+            and getattr(crew, "memory_store", "") == "default"
+        )
+        display_name = getattr(crew, "display_name", "") if assistant else ""
+        spoken_name = (
+            _scrub_member_payload(display_name.strip())
+            if isinstance(display_name, str) and display_name.strip()
+            else "Assistant"
+        )
+        identity = (
+            [
+                f"[MEMBER IDENTITY]\nYou are {spoken_name}. Your member key is {member}.",
+            ]
+            if assistant
+            else [
+                f"[MEMBER IDENTITY]\nYou are {member}. Not a generic assistant, and not an "
+                f"extension of the user: {member} is an identity of your own — your name, "
+                "your role, your memory of this thread, and your track record belong to you."
+            ]
+        )
         if description:
             identity.append(f"Your role: {description}")
         if triggers:
@@ -4179,7 +4205,9 @@ class ContextBuilder:
         # [PERMANENT RULES] fresh and fails closed on an unreadable file.
         if member_turn_context(member, MemberLifecycle.FRESH).deliver_section and not essentials:
             _member_section = self._build_member_section(
-                member, desk_withheld=_desk_withheld(execution_context, desk_member)
+                member,
+                desk_withheld=_desk_withheld(execution_context, desk_member),
+                template_selected=_template_selected_on_member_store(execution_context),
             )
             if _member_section:
                 append_required(_member_section)
@@ -5126,7 +5154,9 @@ class ContextBuilder:
                     _resume_member = ""
                     if _member_turn.deliver_section:
                         _member_section = self._build_member_section(
-                            member, desk_withheld=_desk_withheld(execution_context, desk_member)
+                            member,
+                            desk_withheld=_desk_withheld(execution_context, desk_member),
+                            template_selected=_template_selected_on_member_store(execution_context),
                         )
                         if _member_section:
                             _resume_member = (
@@ -5358,7 +5388,9 @@ class ContextBuilder:
             # chokepoint consult above).
             if _member_turn.deliver_section:
                 _member_section = self._build_member_section(
-                    member, desk_withheld=_desk_withheld(execution_context, desk_member)
+                    member,
+                    desk_withheld=_desk_withheld(execution_context, desk_member),
+                    template_selected=_template_selected_on_member_store(execution_context),
                 )
                 if _member_section:
                     parts.append(_neutralize_structural_markers(_member_section))

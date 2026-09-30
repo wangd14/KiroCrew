@@ -2470,7 +2470,12 @@ class TestKiroHooksFiltering:
 
     def test_sanitize_agent_hooks_repairs_owned_files_subtractively(self, tmp_path: Path):
         """The repair removes only Kiro Crew's legacy key from every owned spec."""
-        from kiro_crew.agent import _hooks_sanitized_mtimes, _sanitize_agent_hooks
+        from kiro_crew.agent import (
+            _ASSISTANT_AGENT_FILENAME,
+            _ASSISTANT_PROMPT_HEADER,
+            _hooks_sanitized_mtimes,
+            _sanitize_agent_hooks,
+        )
         from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
 
         kiro_dir = tmp_path / "agents"
@@ -2484,7 +2489,12 @@ class TestKiroHooksFiltering:
             },
         }
         for filename in OWNED_KIRO_AGENT_FILES:
-            (kiro_dir / filename).write_text(json.dumps(broken_config))
+            config = dict(broken_config)
+            if filename == _ASSISTANT_AGENT_FILENAME:
+                # Only an installer-written Assistant spec is Kiro Crew's to repair.
+                config["name"] = "kirocrew-assistant"
+                config["prompt"] = _ASSISTANT_PROMPT_HEADER + "\nbody"
+            (kiro_dir / filename).write_text(json.dumps(config))
 
         _hooks_sanitized_mtimes.clear()
         with patch("kiro_crew.agent.KIRO_AGENTS_DIR", kiro_dir):
@@ -2516,6 +2526,33 @@ class TestKiroHooksFiltering:
             indent=2,
         )
         path = kiro_dir / filename
+        path.write_text(original, encoding="utf-8")
+
+        _hooks_sanitized_mtimes.clear()
+        with patch("kiro_crew.agent.KIRO_AGENTS_DIR", kiro_dir):
+            _sanitize_agent_hooks()
+
+        assert path.read_text(encoding="utf-8") == original
+
+    def test_sanitize_agent_hooks_leaves_hand_authored_assistant_spec(self, tmp_path: Path):
+        """An Assistant-named spec without installer provenance stays byte-identical."""
+        from kiro_crew.agent import (
+            _ASSISTANT_AGENT_FILENAME,
+            _hooks_sanitized_mtimes,
+            _sanitize_agent_hooks,
+        )
+
+        kiro_dir = tmp_path / "agents"
+        kiro_dir.mkdir()
+        original = json.dumps(
+            {
+                "name": "kirocrew-assistant",
+                "prompt": "My own assistant.",
+                "hooks": {"auto_approve_tools": ["my tool"]},
+            },
+            indent=2,
+        )
+        path = kiro_dir / _ASSISTANT_AGENT_FILENAME
         path.write_text(original, encoding="utf-8")
 
         _hooks_sanitized_mtimes.clear()

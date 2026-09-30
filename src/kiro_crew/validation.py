@@ -4111,6 +4111,38 @@ MCP_PANEL_SCHEMAS: dict[str, ToolSchema] = {
     "panel_templates": PANEL_TEMPLATES_SCHEMA,
 }
 
+
+# ── Tool Schemas (MCP Guide — server ``kirocrew-guide``) ──
+#
+# Its own registry because the guide tools ship in an opt-in server. The shape
+# checked here is the envelope only: which action ids exist and what their params
+# mean is the gateway's catalog (``guide_catalog.validate_actions``), which is the
+# one place that can resolve a setting id against the packaged registry.
+_GUIDE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+GUIDE_LIST_ACTIONS_SCHEMA = ToolSchema(tool_name="guide_list_actions")
+GUIDE_START_SCHEMA = ToolSchema(
+    tool_name="guide_start",
+    fields=[
+        FieldSpec("actions", list, required=True, item_type=dict, max_items=8),
+    ],
+)
+GUIDE_STATUS_SCHEMA = ToolSchema(
+    tool_name="guide_status",
+    fields=[FieldSpec("guide_id", str, max_len=64, pattern=_GUIDE_ID_PATTERN)],
+)
+GUIDE_CANCEL_SCHEMA = ToolSchema(
+    tool_name="guide_cancel",
+    fields=[FieldSpec("guide_id", str, required=True, max_len=64, pattern=_GUIDE_ID_PATTERN)],
+)
+
+MCP_GUIDE_SCHEMAS: dict[str, ToolSchema] = {
+    "guide_list_actions": GUIDE_LIST_ACTIONS_SCHEMA,
+    "guide_start": GUIDE_START_SCHEMA,
+    "guide_status": GUIDE_STATUS_SCHEMA,
+    "guide_cancel": GUIDE_CANCEL_SCHEMA,
+}
+
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
     _cu_types.TOOL_LIST_APPS: ToolSchema(tool_name=_cu_types.TOOL_LIST_APPS, fields=[]),
     _cu_types.TOOL_LAUNCH_APP: ToolSchema(

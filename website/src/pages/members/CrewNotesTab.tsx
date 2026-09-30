@@ -34,6 +34,9 @@ interface CrewNotesTabProps {
   slug: string
   /** The exact crew name — slugs are lossy, so the read is keyed by both. */
   member: string
+  /** What the user calls this crewmate (e.g. "Assistant" for the built-in `assistant`).
+   *  Prose only; the read stays keyed by `member`. Defaults to `member`. */
+  displayName?: string
   /** The identity row (avatar + name + live status) the three panel tabs share. */
   header: ReactNode
   /** Whether this tab body is on screen — gates the briefing read, so a panel
@@ -48,7 +51,7 @@ function isSlugCollision(error: unknown): boolean {
   return error instanceof ApiError && error.status === 409
 }
 
-export default function CrewNotesTab({ slug, member, header, visible }: CrewNotesTabProps) {
+export default function CrewNotesTab({ slug, member, displayName, header, visible }: CrewNotesTabProps) {
   const { t } = useTranslation()
   const query = useQuery({
     queryKey: memberBriefingQueryKey(slug, member),
@@ -126,7 +129,7 @@ export default function CrewNotesTab({ slug, member, header, visible }: CrewNote
               </p>
             ) : !data?.text ? (
               <div className="space-y-1.5" data-testid="member-notes-empty">
-                <p className="text-[12px] text-text">{t('pages.membersPage.notes_empty', { name: member })}</p>
+                <p className="text-[12px] text-text">{t('pages.membersPage.notes_empty', { name: displayName ?? member })}</p>
                 <p className="text-[11.5px] text-muted">{t('pages.membersPage.notes_empty_hint')}</p>
               </div>
             ) : (

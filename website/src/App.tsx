@@ -56,8 +56,7 @@ import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCir
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Btn, Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
-import MeetCrewmatesFlow from './components/MeetCrewmatesFlow'
-import { useMeetCrewmatesGate } from './hooks/useMeetCrewmatesGate'
+import { GuideProvider } from './guide/GuideContext'
 import AgentImportFlow from './components/AgentImportFlow'
 import ErrorNotice from './components/ErrorNotice'
 import PrivacyChapter from './components/PrivacyChapter'
@@ -195,6 +194,8 @@ const UpdateFoundModal = lazy(() => import('./components/UpdateFoundModal'))
 // it. The policy that decides whether this chunk is ever fetched lives in
 // `startupVideoGate`, which is eagerly imported and tiny.
 const StartupVideoModal = lazy(() => import('./components/StartupVideoModal'))
+// The guide pill renders only once a guide is offered; keep it off the entry chunk.
+const GuideLayer = lazy(() => import('./guide/GuideLayer'))
 // The dialog is lazy; the renderer registry it consults is NOT (imported at the
 // top of this file). The nav rail decides whether to show the "Connect your
 // phone" row before this chunk is ever fetched, so a predicate hiding inside it
@@ -1967,9 +1968,6 @@ export default function App() {
     window.addEventListener('mc-start-import', replay)
     return () => window.removeEventListener('mc-start-import', replay)
   }, [])
-  // Meet CrewMates: the crewmate first-run chapter, gated on zero crewmates +
-  // zero custom agents (see the hook).
-  const meetCrewmates = useMeetCrewmatesGate()
   // Capture Electron update lifecycle events app-wide so UpdateModal fires on
   // any page, not just after the user has opened Settings > About.
   useUpdateSubscription()
@@ -4814,10 +4812,6 @@ export default function App() {
           onComplete={endFirstRun}
           onSkipAll={endFirstRun}
         />
-        {/* First-run chapter 4 — Meet CrewMates. Fires once per workspace:
-            after the tour for a new user, or on the first Crewmates page
-            visit; also reopened from that page (mc-start-meet-crewmates). */}
-        <MeetCrewmatesFlow open={meetCrewmates.open} onDone={meetCrewmates.onDone} onCreated={meetCrewmates.onCreated} persistFailed={meetCrewmates.persistFailed} />
       </OnboardingShellHost>
 
       {/* Mobile backdrop — opacity is animated by animateDrawer in lockstep
@@ -5367,6 +5361,11 @@ export default function App() {
           {/* The rail renderer reaches the chat page through context rather than
               a prop: the route element is shared with the popout/embed frames. */}
           <MobileNavRailContext.Provider value={mobileNavRail}>
+          {/* Registered-action guide: offered in the chat it came from, driven
+              only after the human presses Start; the pages it walks through
+              read their draft and request-header seams from this provider. */}
+          <GuideProvider>
+          <Suspense fallback={null}><GuideLayer /></Suspense>
           <Routes>
             <Route path="/chat/:slug?" element={<ErrorBoundary><ChatPage /></ErrorBoundary>} />
             <Route path="/orchestrated/:slug?" element={<OrchestratedRedirect />} />
@@ -5428,6 +5427,7 @@ export default function App() {
             <Route path="/:builtinApp/*" element={<BuiltinAppRoute />} />
             <Route path="*" element={<ChatRedirect />} />
           </Routes>
+          </GuideProvider>
           </MobileNavRailContext.Provider>
         </main>
         {/* App-wide docked terminal panel — renders beside <main> (right) or
