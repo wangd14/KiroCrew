@@ -125,6 +125,11 @@ class CancellationCoordinator(ManagerComponent):
                 info._rss_generation += 1
                 info._rss_samples = 0
                 info.last_rss_gb = 0.0
+                # The settled-runtime reading (the cost the auto cap is sized
+                # from) belongs to the dead process; clear it so the fresh one
+                # captures its own once it leaves startup (``run.py`` resets
+                # ``_first_stream_started`` to None for the respawn).
+                info.settled_rss_gb = 0.0
                 self._manager._tasks[info.id] = asyncio.create_task(self._manager._run(info))
                 try:
                     await self._manager._fire_event("subagent_recovering", info, {"attempt": 1})

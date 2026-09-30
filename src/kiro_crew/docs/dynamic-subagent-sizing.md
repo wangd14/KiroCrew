@@ -83,11 +83,23 @@ cap      = clamp( mem_term, 3, hard_cap )
 Kiro Crew doesn't hard-code how much an agent costs — it measures it:
 
 - While an agent runs, the reaper loop periodically samples its process-tree
-  RSS (memory) and CPU, keeping the **high-water** mark for that run (a single
-  reading at exit would miss a mid-run peak that has already declined).
+  RSS (memory) and CPU. For CPU it keeps the **high-water** mark for the run
+  (telemetry only). For the memory figure that sizes the cap it takes a
+  **settled-runtime** reading instead: the FIRST subtree RSS sample after the
+  runtime has left startup (its own session has answered), captured once and
+  held. At that moment the agent's own runtime — kiro-cli plus its MCP servers —
+  is up, but it has not yet grown the tree with a build or test subprocess, so
+  the reading is the agent's own footprint rather than whatever workload it
+  later launches. The whole-run RSS high-water mark is still tracked, but only
+  for the live task-manager surface; it is deliberately **not** what the cap is
+  sized from, because a single run that launched a 132 GB test/build subtree
+  would otherwise price every slot at that peak and pin the cap at the floor of
+  3 ([#15298](https://github.com/kirodotdev/KiroCrew/issues/15298)).
 - At exit, one sample `{agent, mem_gb, cpu_cores, ts}` is appended to
-  `~/.kiro/crew/subagents/cost_samples.jsonl`. The CPU figure is telemetry
-  only; sizing reads `mem_gb`.
+  `~/.kiro/crew/subagents/cost_samples.jsonl`, where `mem_gb` is that
+  settled reading. The CPU figure is telemetry only; sizing reads `mem_gb`. A
+  run that finished before any post-startup sweep took a settled reading records
+  its peak instead — a short run whose peak is its own runtime anyway.
 - At the next startup, Kiro Crew takes the **p90 of the last N memory samples
   per agent name** (robust to the occasional outlier run), then the worst case
   across agent types, as the divisor.

@@ -2453,14 +2453,29 @@ class SubagentInfo:
     # acquisition, which also restarts the clock.
     _gate_wait_started: float | None = None
     # Learned-cost high-water marks (dynamic-subagent-sizing.md §4.1), sampled
-    # periodically by the reaper loop and folded into the cost store at exit.
+    # periodically by the reaper loop. These describe the WHOLE process subtree,
+    # so once an agent launches a test suite or a build they climb to that
+    # workload's peak, not the agent's own runtime cost. They answer "how big
+    # did this run's tree get" for the live task-manager surface; the AUTO CAP
+    # is NOT sized from them (see ``settled_rss_gb``).
     peak_rss_gb: float = 0.0
     peak_cpu_cores: float = 0.0
-    # Most-recent sample of the same two signals. The peaks answer "how big can
-    # this agent get" (what sizing needs); a live task-manager surface needs "how
-    # big is it right now", which a high-water mark cannot express — it never
-    # comes back down. Both are written by the same sweep, so exposing the last
-    # sample costs no extra syscalls.
+    # The agent's OWN runtime memory (kiro-cli plus its MCP servers), captured
+    # from the FIRST subtree sample taken once the runtime has left startup
+    # (``_first_stream_started`` set) and then held — a settled-runtime reading,
+    # before the agent has grown the tree with a build/test subprocess. This is
+    # what the learned-cost store records and what sizes the auto cap
+    # (dynamic-subagent-sizing.md §4.1): the whole-subtree ``peak_rss_gb`` counted
+    # every test suite and build a run launched, so a single 132 GB run pinned the
+    # cap at the floor (#15298). 0.0 until the first post-startup sweep observes
+    # this run; ``_record_cost`` falls back to ``peak_rss_gb`` only when a run
+    # finished before any settled reading was taken.
+    settled_rss_gb: float = 0.0
+    # Most-recent sample of the two high-water signals. The peaks answer "how big
+    # can this run's tree get"; a live task-manager surface needs "how big is it
+    # right now", which a high-water mark cannot express — it never comes back
+    # down. Both are written by the same sweep, so exposing the last sample costs
+    # no extra syscalls.
     last_rss_gb: float = 0.0
     last_cpu_cores: float = 0.0
     # Live process/MCP-stub counts of this run's subtree, from the same sweep.

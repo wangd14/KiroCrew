@@ -805,6 +805,19 @@ class OrphanStallMonitor(ManagerComponent):
                 info._rss_samples += 1
                 if gb > info.peak_rss_gb:
                     info.peak_rss_gb = gb
+                # Settled-runtime cost (dynamic-subagent-sizing.md §4.1): the
+                # FIRST reading taken once this run has left startup
+                # (``_first_stream_started`` set — its own session has answered),
+                # captured once and held. At that moment the agent's own runtime
+                # (kiro-cli plus its MCP servers) is up but it has not yet grown
+                # the tree with a build/test subprocess, so this is the per-agent
+                # cost the auto cap must be sized from — not ``peak_rss_gb``,
+                # which climbs to whatever workload the run later launched
+                # (#15298). A run still in startup records nothing here; if it
+                # finishes before any post-startup sweep, ``_record_cost`` falls
+                # back to the peak.
+                if info.settled_rss_gb <= 0.0 and info._first_stream_started is not None:
+                    info.settled_rss_gb = gb
             info.last_procs = _attributed_count(sample.procs, shared_n, info.last_procs)
             info.last_stubs = _attributed_count(sample.matched, shared_n, info.last_stubs)
             jiffies = sample.jiffies
@@ -819,13 +832,25 @@ class OrphanStallMonitor(ManagerComponent):
             info._cpu_sample_ts = now
 
     def _record_cost_impl(self, info: SubagentInfo) -> None:
-        """Persist this run's high-water RSS/CPU to the learned-cost store."""
-        if info.peak_rss_gb <= 0 and info.peak_cpu_cores <= 0:
+        """Persist this run's memory/CPU to the learned-cost store.
+
+        The recorded ``mem_gb`` is the SETTLED-runtime reading
+        (``settled_rss_gb``: the agent's own kiro-cli + MCP-server footprint,
+        sampled once after startup), NOT the whole-subtree ``peak_rss_gb``. The
+        cap divides available memory by ``read_learned_cost("mem_gb")``, so a run
+        that launched a build/test suite priced the whole workload as the agent's
+        cost and pinned the cap at the floor (#15298). The peak stays the divisor
+        only when a run finished before any post-startup sweep took a settled
+        reading — a short run whose peak is its own runtime anyway. CPU is
+        telemetry only and keeps its whole-run peak.
+        """
+        mem_gb = info.settled_rss_gb if info.settled_rss_gb > 0.0 else info.peak_rss_gb
+        if mem_gb <= 0 and info.peak_cpu_cores <= 0:
             return  # never sampled (e.g. finished before the first reaper sweep)
         try:
             append_cost_sample(
                 _cost_bucket(info.agent, info.execution_context),
-                info.peak_rss_gb,
+                mem_gb,
                 info.peak_cpu_cores,
                 shared=bool(info._session_sharing),
             )

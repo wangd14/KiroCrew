@@ -928,6 +928,131 @@ class TestSampleLiveCosts:
 
 
 # ---------------------------------------------------------------------------
+# Settled-runtime cost sample (#15298): the auto cap is sized from the agent's
+# OWN runtime (kiro-cli + MCP servers), not the whole-subtree peak.
+# ---------------------------------------------------------------------------
+
+
+class TestSettledRuntimeCost:
+    """The learned ``mem_gb`` is a settled-runtime reading, not the peak.
+
+    ``_host_mem_term`` divides available memory by ``read_learned_cost("mem_gb")``
+    (the max per-bucket p90 of the recorded ``mem_gb``). Recording the whole
+    process-subtree peak counted every test suite and build a run launched, so a
+    single 132.3 GB run pinned the cap at the floor of 3 on a host with 93 GB
+    free. The recorded figure is now the FIRST subtree reading taken once the run
+    has left startup (its own runtime is up, no workload yet) — its own footprint.
+    """
+
+    def _agent(self, **kw):
+        from kiro_crew.subagent import SubagentInfo
+
+        info = SubagentInfo(id=kw.pop("id", "a1"), task="t", agent="kirocrew")
+        info._pid = 4242
+        for k, v in kw.items():
+            setattr(info, k, v)
+        return info
+
+    @staticmethod
+    def _sample(rss_kb: int = -1, jiffies: int = 0):
+        from kiro_crew.platform_compat import SubtreeSample
+
+        return SubtreeSample(rss_kb, jiffies, None, None)
+
+    def test_settled_capture_holds_the_first_post_startup_reading(self, monkeypatch) -> None:
+        """The settled reading is captured ONCE, after startup, and then held —
+        it must not climb to a later build/test peak the way ``peak_rss_gb`` does."""
+        import kiro_crew.subagent as sub
+
+        m = _mgr(running=1, max_concurrent=16, last_ts=0.0)
+        # Left startup: its own session has answered, so a sample counts as settled.
+        info = self._agent(_first_stream_started=1.0)
+        m._agents = {"a1": info}
+        # 0.5 GB own runtime, then 132.3 GB once it launches a test/build subtree.
+        rss_seq = iter([int(0.5 * 1024 * 1024), int(132.3 * 1024 * 1024)])
+        monkeypatch.setattr(
+            sub, "_proc_subtree_sample", lambda pid, **kw: self._sample(rss_kb=next(rss_seq))
+        )
+        m._sample_live_costs()
+        m._sample_live_costs()
+
+        # Peak climbs to the whole-tree workload (task-manager surface only)...
+        assert info.peak_rss_gb == pytest.approx(132.3, abs=0.1)
+        # ...but the settled figure stays the agent's own runtime.
+        assert info.settled_rss_gb == pytest.approx(0.5, abs=0.01)
+
+    def test_settled_not_captured_while_still_in_startup(self, monkeypatch) -> None:
+        """A run whose own session has not answered yet (_first_stream_started
+        None) records no settled reading — the sample would be startup noise."""
+        import kiro_crew.subagent as sub
+
+        m = _mgr(running=1, max_concurrent=16, last_ts=0.0)
+        info = self._agent()  # _first_stream_started is None → still in startup
+        m._agents = {"a1": info}
+        monkeypatch.setattr(
+            sub,
+            "_proc_subtree_sample",
+            lambda pid, **kw: self._sample(rss_kb=int(0.5 * 1024 * 1024)),
+        )
+        m._sample_live_costs()
+        assert info.settled_rss_gb == 0.0
+        assert info.peak_rss_gb == pytest.approx(0.5, abs=0.01)
+
+    def test_record_cost_writes_settled_not_peak(self, monkeypatch) -> None:
+        """A 132.3 GB whole-tree peak with a 0.5 GB settled runtime records 0.5 GB
+        as ``mem_gb`` — the divisor the auto cap is sized from."""
+        import kiro_crew.subagent as sub
+
+        m = _mgr(running=1, max_concurrent=16, last_ts=0.0)
+        info = self._agent(peak_rss_gb=132.3, settled_rss_gb=0.5, peak_cpu_cores=4.0)
+        captured: dict = {}
+        monkeypatch.setattr(
+            sub,
+            "append_cost_sample",
+            lambda agent, mem_gb, cpu_cores, shared=False: captured.update(
+                agent=agent, mem_gb=mem_gb, cpu_cores=cpu_cores, shared=shared
+            ),
+        )
+        m._record_cost(info)
+        assert captured["mem_gb"] == pytest.approx(0.5, abs=0.01)
+        # CPU is telemetry only and keeps its whole-run peak.
+        assert captured["cpu_cores"] == pytest.approx(4.0, abs=0.01)
+
+    def test_record_cost_falls_back_to_peak_when_never_settled(self, monkeypatch) -> None:
+        """A run that finished before any post-startup sweep (settled == 0)
+        records its peak — a short run whose peak is its own runtime anyway."""
+        import kiro_crew.subagent as sub
+
+        m = _mgr(running=1, max_concurrent=16, last_ts=0.0)
+        info = self._agent(peak_rss_gb=0.42, settled_rss_gb=0.0)
+        captured: dict = {}
+        monkeypatch.setattr(
+            sub,
+            "append_cost_sample",
+            lambda agent, mem_gb, cpu_cores, shared=False: captured.update(mem_gb=mem_gb),
+        )
+        m._record_cost(info)
+        assert captured["mem_gb"] == pytest.approx(0.42, abs=0.01)
+
+    def test_settled_runtime_cost_no_longer_floors_the_cap(self, patch_host, monkeypatch) -> None:
+        """End-to-end (#15298): a 0.5 GB per-agent cost on a 93 GB host sizes the
+        cap up, where the whole-tree 132.3 GB it replaced pinned it at the floor.
+
+        With mem_cost 132.3 GB: floor((93*0.8 - 0)/132.3) < 0 → clamp to 3.
+        With the settled 0.5 GB: floor((93*0.8)/0.5) = 148 → clamp to hard_cap.
+        """
+        # The learned lookup now returns the settled figure this run recorded.
+        monkeypatch.setattr(subagent, "read_learned_cost", lambda *a, **k: 0.5)
+        patch_host(93.0, 48)
+        cfg = _cfg(buffer_pct=20, hard_cap=32, pool_size=0)
+        assert compute_max_subagents(cfg) == 32
+
+        # And the whole-tree peak it replaced is exactly the floor bug it fixes.
+        monkeypatch.setattr(subagent, "read_learned_cost", lambda *a, **k: 132.3)
+        assert compute_max_subagents(cfg) == 3
+
+
+# ---------------------------------------------------------------------------
 # Container / cgroup hardening (Stage 8, dynamic-subagent-sizing.md §9)
 # ---------------------------------------------------------------------------
 
