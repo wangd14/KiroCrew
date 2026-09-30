@@ -23,6 +23,11 @@ export function missingSourcesNotice(missing: readonly (keyof typeof MISSING_SOU
   return i18nT('commandCenter.partial_sources', { sources: fmtList(missing.map(name => i18nT(MISSING_SOURCE_KEYS[name]))) })
 }
 const EMPTY_AGENTS: Record<string, SubagentActivity> = {}
+const settledLatches = new Map<string, boolean>()
+
+export function __resetSettledLatchesForTests() {
+  settledLatches.clear()
+}
 
 /** Shared query keys let the dock and panel observe one read, not one per worker.
  * Nothing here polls: every source is refreshed by the frame that announces its
@@ -111,23 +116,55 @@ export function useCommandCenter(root: string | null, enabled = true, scope: 'ta
   // An optional source failing (workflows answer 503 while their service starts)
   // must not hide fresh decisions behind a stale notice.
   const required = [questions, approvals]
+  const loading = canRead && sources.some(q => q.isPending)
+  const stale = canRead && (!connected || required.some(q => q.isError))
+  // Which optional source failed while decisions are fresh, so the notice can
+  // name what is missing rather than hand the person a vague uncertainty. Only
+  // once both decision reads have answered, since the notice vouches for them.
+  const missing = canRead && connected && required.every(q => q.isSuccess)
+    ? ([['runs', workflows], ['work', work], ['views', artifacts]] as const)
+      .filter(([, q]) => q.isEnabled && q.isError).map(([name]) => name)
+    : []
+  // Only a complete, current read OF A READABLE SCOPE may declare the task
+  // over: a half-loaded or disconnected inventory looks settled because it is
+  // empty, and so does a scope with no slots yet — before the first slot list
+  // lands nothing is loading, nothing is stale and an empty model is vacuously
+  // settled, so an ungated verdict would arm on the first render, before any
+  // read. A read with an optional source missing is not complete either: the
+  // runs it could not see may be the ones still working. The verdict is then
+  // LATCHED for this root: a websocket drop, a transient source error or a
+  // remount's loading window must not bring the dock back for a task that is
+  // over. Only evidence of new work releases it — a complete read that shows
+  // something running, blocked or asking, or a live slot state that already
+  // says someone is waiting on the user (`attention` reads the slot flags, so
+  // it needs no completed read to be current). The release half is gated the
+  // same way: with no readable scope the model is built from an empty slot
+  // list plus whatever work-board data the query cache still holds, and that
+  // must not count as a read that shows new work.
+  const complete = canRead && !loading && !stale && missing.length === 0
+  const [, rerenderSettledLatch] = useState(0)
+  const latched = settledLatches.get(draftScope) || false
+  const unsettledNow = (complete && !model.settled) || model.attention.length > 0
+  const finished = latched ? !unsettledNow : complete && model.settled
+  if (finished !== latched) {
+    if (finished) settledLatches.set(draftScope, true)
+    else settledLatches.delete(draftScope)
+    rerenderSettledLatch(version => version + 1)
+  }
   return {
     ...model, dashboards, connected, onQuestionDraftChange,
     approvalMode: effectiveApprovalMode(approvalMode, slots.find(s => s.key === root)),
-    loading: canRead && sources.some(q => q.isPending),
-    stale: canRead && (!connected || required.some(q => q.isError)),
-    // Which optional source failed while decisions are fresh, so the notice can
-    // name what is missing rather than hand the person a vague uncertainty. Only
-    // once both decision reads have answered, since the notice vouches for them.
-    missing: canRead && connected && required.every(q => q.isSuccess)
-      ? ([['runs', workflows], ['work', work], ['views', artifacts]] as const)
-        .filter(([, q]) => q.isEnabled && q.isError).map(([name]) => name)
-      : [],
+    loading, stale, missing,
     // Real clock from completed reads. A websocket connection alone doesn't
     // establish that a server-side question/approval inventory is up to date.
     updatedAt: Math.min(...required.map(q => q.dataUpdatedAt)),
     approvalCount: model.attention.filter(a => a.kind === 'approval').length,
-    relevant: scoped.length > 1 || model.nodes.some(n => n.kind !== 'session') || model.workItems.length > 0 || dashboards.length > 0 || model.attention.some(a => a.kind === 'approval'),
+    // Anything waiting on the user makes the dock relevant, whatever its kind: the
+    // Needs you tile is the dock's reason to exist. A lone session's TODO list is
+    // deliberately NOT enough: TaskProgressBar already shows that plan above the
+    // composer, and a second readout of the same numbers would only repeat it.
+    relevant: scoped.length > 1 || model.nodes.some(n => n.kind !== 'session') || model.workItems.length > 0 || dashboards.length > 0 || model.attention.length > 0,
+    finished,
   }
 }
 
