@@ -7362,6 +7362,10 @@
     "membersPage": {
       "details": "Details",
       "edit_member": "Edit crewmate",
+      "delete_member": "Delete crewmate",
+      "delete_member_body": "Deleting “{{name}}” removes it from the roster and its team, and deletes its work log, picture and any private template copy. Its chat history, memory and workspace files are kept. This cannot be undone here.",
+      "delete_member_failed": "Could not delete the crewmate.",
+      "delete_member_named": "Delete “{{name}}”",
       "empty_roster": "No crew members yet.",
       "member_count_one": "{{count}} crewmate",
       "member_count_other": "{{count}} crewmates",

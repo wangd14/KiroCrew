@@ -370,3 +370,54 @@ describe('MembersPage star', () => {
     await waitFor(() => expect(screen.queryByTestId('member-star-error')).toBeNull())
   })
 })
+
+/* The default roster lists a row when its DM thread holds a message, or when
+ * it was created on the dashboard (`dashboard_created`: source kirocrew AND a
+ * member id). Everything else is hidden until the search reaches it; the
+ * default crew is listed whatever its record says. Every fixture above omits
+ * both fields, as an older gateway does, and those rows stay listed. */
+describe('MembersPage hides unlisted crewmates', () => {
+  const NO = { dashboard_created: false, has_dm_message: false }
+  const MIXED = [
+    row('kirocrew', { source: 'builtin', ...NO }),
+    row('radar', { source: 'kirocrew', ...NO, dashboard_created: true, display_name: 'Issue Radar' }),
+    row('oncall', { source: 'radar-app', ...NO, has_dm_message: true, starred: true }),
+    row('legacy-aim', { source: 'aim', ...NO }),
+    row('pkg-tool', { ...NO }),
+  ]
+  beforeEach(() => {
+    ;(api.defaultAgent as ReturnType<typeof vi.fn>).mockResolvedValue({ default_agent: 'kirocrew' })
+  })
+
+  it('lists dashboard-created and chatted rows and the default crew; the count says how many are listed', async () => {
+    await renderPage(MIXED)
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    expect(screen.getByTestId('member-count')).toHaveTextContent('3 crewmates')
+    // Not "filtered out": hidden rows are unlisted, so no chip and no notice.
+    expect(screen.queryByTestId('member-filter-chips')).toBeNull()
+    expect(screen.queryByTestId('member-filtered-out')).toBeNull()
+  })
+
+  it('the search reaches a hidden row, and the count grows to include it', async () => {
+    await renderPage(MIXED)
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    fireEvent.change(screen.getByTestId('member-search'), { target: { value: 'pkg' } })
+    expect(names()).toEqual(['pkg-tool'])
+    expect(screen.getByTestId('member-count')).toHaveTextContent('4 crewmates')
+    fireEvent.click(screen.getByTestId('member-search-clear'))
+    expect(names()).toEqual(['radar', 'kirocrew', 'oncall'])
+  })
+
+  it('filter tallies count listed rows only, and "N of M" reads M from them', async () => {
+    await renderPage(MIXED)
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    await openFilters()
+    // Three package-bucket rows exist; only the chatted app row is listed, so
+    // the tally says 1, and the built-in default crew is the one built-in row.
+    expect(within(screen.getByTestId('member-filter-source-package')).getByText('1')).toBeInTheDocument()
+    expect(within(screen.getByTestId('member-filter-source-builtin')).getByText('1')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('member-filter-starred'))
+    expect(names()).toEqual(['oncall'])
+    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 3 crewmates')
+  })
+})

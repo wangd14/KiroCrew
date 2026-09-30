@@ -768,6 +768,30 @@ is gone falls back the same way, under the existing swap notice. The page's copy
 says crewmate / Crewmates and "Built from"; the crew record, its API and its
 identifiers are unchanged.
 
+The roster lists a row unasked when EITHER its Crewmates-page DM thread already
+holds a message (any origin) OR it was created on the dashboard (`source` is
+`kirocrew` AND the record carries a `member_id`, which covers a greeting that
+never landed); the default crew is always listed. Every other row (an app's own
+source stamp, a sync-generated row, a legacy `kirocrew` row without a member id,
+none of them chatted with) is hidden and appears when the search text matches
+it. `GET /api/members` carries the two facts as booleans, `dashboard_created`
+and `has_dm_message` (`ConversationLog.has_messages` on the bound thread, which
+stops at the first non-metadata row, or rows held by the live slot; an
+unreadable transcript counts as a message); the member id itself is not on the
+wire. The client also treats a non-empty live `last_message` as a message, so a
+row the user just chatted with stays listed before the next roster read. A row
+from an older gateway carrying neither field is listed. The header count and
+the filter tallies count the listed rows plus any hidden row the search
+reaches; the landing fallback opens listed rows only.
+
+The thread header carries **Delete crewmate** as a side control beside the
+panel opener, withheld from the default crew (the route refuses it with 409). It
+opens a confirmation and then calls `DELETE /api/agents/{name}`, whose effects
+the dialog states: the crew record, its team membership, its crew log, avatar
+and private template copy go; the DM transcript, memory store files and
+workspace stay. On success the page invalidates the registry and config
+queries, and the landing rule above handles the crewmate that is gone.
+
 Reopening a running Member DM, including a turn awaiting tool approval,
 reuses its captured execution record. The canonical session key, selected
 member, live slot store and execution record must agree. This read does

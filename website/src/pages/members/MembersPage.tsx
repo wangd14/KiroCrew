@@ -46,7 +46,7 @@
  */
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { AlarmClock, ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Plus, RotateCw, Route, Sparkles, Square, Star, Users, Zap } from 'lucide-react'
+import { AlarmClock, ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Plus, RotateCw, Route, Sparkles, Square, Star, Trash2, Users, Zap } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { Btn } from '../../components/ui'
 import { CrewMemberMark } from '../../components/CrewMemberMark'
@@ -104,10 +104,13 @@ import { sessionTitleRoster } from '../../utils/sessionRoster'
 import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FilterMenuLabel, FilterMenuContent } from '../../components/SearchFilterBar'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '../../components/ui/dropdown-menu'
 import {
-  countByFilter, narrowRoster, parseSort, parseSourceFilter, parseStatusFilters, queryNarrows, sortRoster,
+  countByFilter, listedByDefault, narrowRoster, parseSort, parseSourceFilter, parseStatusFilters, queryNarrows,
+  rosterPopulation, sortRoster,
   SORT_OPTIONS, SOURCE_FILTERS, STATUS_FILTERS,
   type MemberSignals, type MemberSort, type MemberSourceFilter, type MemberStatusFilter, type RosterQuery,
 } from './rosterFilter'
+import { defaultAgentQuery } from '../../api/defaultAgentQuery'
+import DeleteCrewmateDialog from './DeleteCrewmateDialog'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { isSidePanelHidden, shouldMountSidePanel, sidePanelDockMotion } from '../chat/sidePanelMount'
 import SidePanel, { SIDE_PANEL_MIN_W, SIDE_PANEL_RESERVED_W, type SidePanelLeadingTab, type SidePanelWithholdable } from '../chat/SidePanel'
@@ -846,6 +849,8 @@ export default function MembersPage() {
   // The New team / Edit team dialog. `team` set = edit. Mounted only while
   // open, so its fields start from the team it was opened for.
   const [teamDialog, setTeamDialog] = useState<{ team?: CrewTeam } | null>(null)
+  // The crewmate the delete confirmation is open for; null closes the dialog.
+  const [deleteTarget, setDeleteTarget] = useState<MemberRosterRow | null>(null)
   // Set when a URL NAMED a member that is gone: the user asked for someone
   // specific, so the outcome is said out loud — above the fallback thread on
   // md+ (`shown` = who opened instead), above the roster below md (`shown` is
@@ -1299,11 +1304,33 @@ export default function MembersPage() {
     committedOrderRef.current = { sort, names }
     return names.map((n) => byName.get(n)).filter((m): m is MemberRosterRow => !!m)
   }, [members, rows, sort])
+  // The default crew, through the shared ['default-agent'] query (the crew
+  // manager's promotion write and every `refresh` frame invalidate it). Two
+  // readers on this page: the hide rule lists the default crew whatever its
+  // record says, and the delete control is withheld from it -- the server
+  // refuses that delete with 409, so the control is not offered. `''` while
+  // unknown: the hide rule then treats an uncreated default row like any other
+  // until the answer lands, and the delete control waits for the answer.
+  const defaultAgentQ = useQuery(defaultAgentQuery)
+  const defaultAgent = defaultAgentQ.data ?? ''
   // Named apart from `rosterQuery` above: that one is the React Query READ of
   // the roster, this one is the user's filter/sort question asked of it.
   const rosterFilterQuery = useMemo<RosterQuery>(
-    () => ({ search: filter, starredOnly, source: sourceFilter, status: statusFilter, sort }),
-    [filter, starredOnly, sourceFilter, statusFilter, sort],
+    () => ({ search: filter, starredOnly, source: sourceFilter, status: statusFilter, sort, defaultAgent }),
+    [filter, starredOnly, sourceFilter, statusFilter, sort, defaultAgent],
+  )
+  // The rows the roster is about right now: created crewmates and the default
+  // crew, or -- with a search typed -- whatever the search reaches, hidden rows
+  // included. The header count, the "N of M" and the filter menu's tallies read
+  // THIS list, never `members`, so no count includes a row the user cannot see.
+  const shownMembers = useMemo(() => rosterPopulation(members, rosterFilterQuery), [members, rosterFilterQuery])
+  // The auto-open's candidates: only rows the roster lists unasked. A hidden
+  // row can still be opened by name (a deep link, the search), but must not be
+  // what the page opens on its own -- a thread standing over a roster that does
+  // not show its row reads as a misroute.
+  const listedMembers = useMemo(
+    () => orderedMembers.filter((m) => listedByDefault(m, defaultAgent)),
+    [orderedMembers, defaultAgent],
   )
   const activeSlot = active ? threadOutcome?.slot_key ?? '' : ''
   // Two distinct verdicts with two different sentences: a collision is a
@@ -2217,7 +2244,8 @@ export default function MembersPage() {
   )
   // Per-row counts in the filter menu: the one-word labels do not explain
   // themselves and a zero-count row is exactly the one that blanks the list.
-  const filterCounts = useMemo(() => countByFilter(members, signalsOf), [members, signalsOf])
+  // Over the shown population, so a tally never counts a hidden row.
+  const filterCounts = useMemo(() => countByFilter(shownMembers, signalsOf), [shownMembers, signalsOf])
   const narrowed = queryNarrows(rosterFilterQuery)
   // What the aggregate chip says: each active filter's menu label with its
   // count (Starred (2), In progress (1), Mine (6)) — and the bare names for
@@ -2237,9 +2265,10 @@ export default function MembersPage() {
     return out
   }, [t, starredOnly, statusFilter, sourceFilter, filterCounts])
   // True when the filters (not the search) hid everything — the empty-roster
-  // copy would be wrong then, since the roster is not empty.
+  // copy would be wrong then, since the roster is not empty. Judged against
+  // the shown population: hidden rows are not "filtered out", they are unlisted.
   const filteredOut =
-    loaded && !loadError && members.length > 0 && sortedMembers.length === 0 && !filter.trim()
+    loaded && !loadError && shownMembers.length > 0 && sortedMembers.length === 0 && !filter.trim()
   // Which of the block's three verdicts to render. Two sources, two roles:
   // the live loop registry is PRESENCE — a loop it holds as active is active,
   // full stop — while the pushed `wake` projection is the DURABLE record, so
@@ -2540,10 +2569,11 @@ export default function MembersPage() {
       return
     }
     // Desktop, URL names no crewmate (or names a gone one): restore the
-    // remembered crewmate if it is still on the roster, else open the most
-    // recently used one. `undefined` here means the roster is EMPTY — the
-    // chat column shows the New crewmate hero instead.
-    const target = resolveDefaultMember(safeGetItem(LAST_MEMBER_KEY), orderedMembers)
+    // remembered crewmate if it is still listed, else open the most recently
+    // used listed one. `undefined` here means nothing is listed — the chat
+    // column shows the New crewmate hero instead (or, with only hidden rows,
+    // stays empty until a search or a link names one).
+    const target = resolveDefaultMember(safeGetItem(LAST_MEMBER_KEY), listedMembers)
     if (!target) {
       // Named a gone crewmate on an empty roster: say where they went above
       // the roster (shown: '' marks the roster variant of the notice, as
@@ -2575,7 +2605,7 @@ export default function MembersPage() {
       goneStandInRef.current = target.name
     }
     setSearchParams({ [MEMBER_PARAM]: target.name }, { replace: true })
-  }, [loaded, loadError, urlMember, urlTeam, teamsQ.data, members, orderedMembers, activeName, isMobile, activate, setSearchParams, rosterQuery.isFetching])
+  }, [loaded, loadError, urlMember, urlTeam, teamsQ.data, members, listedMembers, activeName, isMobile, activate, setSearchParams, rosterQuery.isFetching])
 
   // Team open: the header row's click. Same history rule as openMember -- one
   // entry above md or while something is already open, a PUSHED step from the
@@ -2834,9 +2864,9 @@ export default function MembersPage() {
             : narrowed
               ? t('pages.membersPage.member_count_filtered', {
                   shown: sortedMembers.length,
-                  count: members.length,
+                  count: shownMembers.length,
                 })
-              : t('pages.membersPage.member_count', { count: members.length })}
+              : t('pages.membersPage.member_count', { count: shownMembers.length })}
         </div>
         {greetingNoticeInRoster && postCreateNotice}
         {/* A failed registry read blanks EVERY roster badge at once. That is
@@ -3371,7 +3401,26 @@ export default function MembersPage() {
                   announcing it taught the user a term for a thing that can
                   never be otherwise. The member's edit entry is not a peer of
                   this toggle: it is the identity pill in the middle. */}
-              <div className="flex items-center justify-end min-w-0">
+              <div className="flex items-center justify-end gap-1 min-w-0">
+                {/* The crewmate's delete entry, a bare side control beside the
+                    panel opener. It only OPENS a confirmation: the write
+                    happens in `DeleteCrewmateDialog`. Withheld from the
+                    default crew -- the server refuses that delete with 409
+                    (`api_kirocrew_agent_delete`) -- and until the default is
+                    KNOWN, since a control the server would refuse is worse
+                    than one that appears a moment late. */}
+                {defaultAgentQ.data !== undefined && active.name !== defaultAgent && (
+                  <button
+                    type="button"
+                    onClick={() => setDeleteTarget(active)}
+                    className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-danger hover:bg-bg-hover cursor-pointer focus-ring"
+                    aria-label={t('pages.membersPage.delete_member')}
+                    title={t('pages.membersPage.delete_member')}
+                    data-testid="member-delete-button"
+                  >
+                    <Trash2 size={15} className="lucide-inline" />
+                  </button>
+                )}
                 {showOpener && (
                   <button
                     onClick={togglePanel}
@@ -4339,6 +4388,19 @@ export default function MembersPage() {
           the section's collapse toggle, so it must sit outside the panel subtree the
           answer may unmount. */}
       {schedConfirmDialog}
+      {/* Delete crewmate. The dialog owns the write and the roster
+          invalidation; once the re-read lands without the row, the URL names
+          a crewmate the roster no longer lists and the landing effect above
+          takes over -- the same fallback and swap notice a crewmate deleted
+          from the crew manager gets. Nothing here navigates. */}
+      {deleteTarget && (
+        <DeleteCrewmateDialog
+          open
+          member={deleteTarget}
+          onClose={() => setDeleteTarget(null)}
+          onDeleted={() => setDeleteTarget(null)}
+        />
+      )}
     </div>
   )
 }
