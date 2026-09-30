@@ -38,7 +38,8 @@ const COARSE_STEP = 64
  * already try to drag, but nothing about a plain header cell says its boundary
  * moves, and lighting only the hovered cell's rule reads as one decoration
  * rather than as a row of boundaries. It keys off the `thead` ancestor so a
- * caller has no row-level class to remember.
+ * caller has no row-level class to remember; a markdown table's grips sit in an
+ * overlay outside its `thead`, so they key off the table's header hover too.
  *
  * It is the ARIA window-splitter widget: focusable, arrow-key operable, and it
  * reports its position. Enter and a double-click both return the column to its
@@ -121,7 +122,7 @@ export default function ColumnResizer({
     >
       <div
         aria-hidden="true"
-        className="h-[60%] w-[2px] rounded-full bg-transparent transition-colors duration-200 resize-accent [thead:hover_&]:bg-border-strong group-hover/drag:bg-accent group-focus-visible/drag:bg-accent group-active/drag:bg-accent-hover"
+        className="h-[60%] w-[2px] rounded-full bg-transparent transition-colors duration-200 resize-accent [thead:hover_&]:bg-border-strong [.markdown-table:has(thead:hover)_&]:bg-border-strong group-hover/drag:bg-accent group-focus-visible/drag:bg-accent group-active/drag:bg-accent-hover"
       />
     </div>
   )

@@ -1,0 +1,136 @@
+import React, { useCallback, useLayoutEffect, useState } from 'react'
+import ColumnResizer from '../ColumnResizer'
+
+/** Narrowest a column may be dragged to: the grip plus a couple of glyphs. */
+const MIN_COL = 48
+/** Widest a single column may be dragged to, so its grip stays findable. */
+const MAX_COL = 720
+/** The grip's hit strip (ColumnResizer's `w-1.5`). */
+const GRIP_PX = 6
+
+interface HeaderEdge { right: number; top: number; height: number; width: number; label: string }
+
+/** A column's drag bounds always contain its laid-out width, so auto layout
+ *  handing a column more than MAX_COL (or less than MIN_COL) can never make a
+ *  widen gesture narrow it, or a narrow gesture widen it. */
+const boundsFor = (laidOut: number) => ({
+  min: Math.min(MIN_COL, laidOut),
+  max: Math.max(MAX_COL, laidOut),
+})
+
+const clamp = (w: number, laidOut: number) => {
+  const { min, max } = boundsFor(laidOut)
+  return Math.round(Math.min(max, Math.max(min, w)))
+}
+
+function headerCells(table: HTMLTableElement): HTMLTableCellElement[] {
+  return Array.from(table.querySelectorAll<HTMLTableCellElement>(':scope > thead > tr:first-child > th'))
+}
+
+/** Where each header cell's right edge sits inside the table's scroll wrapper.
+ *  A cell's offsetParent is its table, so the table's own offset is added. */
+function measureEdges(table: HTMLTableElement): HeaderEdge[] {
+  const thead = table.tHead
+  if (!thead) return []
+  const top = table.offsetTop + thead.offsetTop
+  return headerCells(table).map(th => ({
+    right: table.offsetLeft + th.offsetLeft + th.offsetWidth,
+    top,
+    height: thead.offsetHeight,
+    // The laid-out width, rounded UP: offsetWidth rounds, and freezing a
+    // column even a fraction narrower than auto layout gave it clips (and
+    // ellipsizes) a header label that fitted exactly.
+    width: Math.ceil(th.getBoundingClientRect().width) || th.offsetWidth,
+    label: th.textContent?.trim() ?? '',
+  }))
+}
+
+/**
+ * User-resizable columns for an auto-layout markdown table.
+ *
+ * `useTableColumnWidths` assumes columns with declared px defaults; a markdown
+ * table has none, its widths come out of auto layout. So nothing changes until
+ * the first drag: that drag snapshots the widths the browser laid out as the
+ * baseline, and from then on the table is `table-layout: fixed` with one
+ * `<col>` per column. Widening a column widens the table (the wrapper's own
+ * horizontal scroll absorbs it) instead of taking pixels from a neighbour.
+ *
+ * The grips are an overlay inside the scroll wrapper, one per header cell at
+ * its right edge, rather than children of the `th` override: the header cell
+ * markup (and every renderer golden that pins it) stays as it was. They render
+ * only once real layout exists, so server output, jsdom and a zero-width host
+ * carry no grips at all.
+ *
+ * Widths live in component state only: they last as long as the rendered
+ * message, not across reloads. Enter or a double-click on a grip returns that
+ * column to its laid-out width; when every column is back, the table returns
+ * to auto layout.
+ */
+export function useMarkdownTableColumns(tableRef: React.RefObject<HTMLTableElement | null>) {
+  const [edges, setEdges] = useState<HeaderEdge[]>([])
+  const [baseline, setBaseline] = useState<number[] | null>(null)
+  const [cols, setCols] = useState<number[] | null>(null)
+
+  useLayoutEffect(() => {
+    const table = tableRef.current
+    if (!table) return
+    const measure = () => {
+      const next = measureEdges(table)
+      setEdges(prev => (prev.length === next.length && prev.every((e, i) =>
+        e.right === next[i].right && e.top === next[i].top && e.height === next[i].height && e.label === next[i].label)
+        ? prev : next))
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(measure)
+    observer.observe(table)
+    for (const th of headerCells(table)) observer.observe(th)
+    return () => observer.disconnect()
+  }, [tableRef])
+
+  // A table whose header changed shape (a streamed reply) drops stale widths.
+  const active = cols && cols.length === edges.length ? cols : null
+
+  const resize = useCallback((index: number, width: number) => {
+    const base = baseline && baseline.length === edges.length ? baseline : edges.map(e => e.width)
+    if (!baseline || baseline.length !== edges.length) setBaseline(base)
+    setCols(prev => {
+      const next = (prev && prev.length === base.length ? prev : base).slice()
+      next[index] = clamp(width, base[index])
+      return next
+    })
+  }, [baseline, edges])
+
+  const reset = useCallback((index: number) => {
+    if (!baseline) return
+    setCols(prev => {
+      if (!prev) return prev
+      const next = prev.slice()
+      next[index] = baseline[index]
+      return next.every((w, i) => w === baseline[i]) ? null : next
+    })
+  }, [baseline])
+
+  const tableStyle: React.CSSProperties | undefined = active
+    ? { tableLayout: 'fixed', width: active.reduce((a, b) => a + b, 0), minWidth: 0 }
+    : undefined
+
+  const colgroup = active
+    ? <colgroup>{active.map((w, i) => <col key={i} style={{ width: w }} />)}</colgroup>
+    : null
+
+  const grips = edges.length > 0 && edges.every(e => e.width > 0)
+    ? edges.map((e, i) => {
+      const { min, max } = boundsFor(baseline?.[i] ?? e.width)
+      return (
+      <div key={i} className="absolute" data-testid="table-column-grip"
+        style={{ left: e.right - GRIP_PX, top: e.top, width: GRIP_PX, height: e.height }}>
+        <ColumnResizer column={e.label} value={active?.[i] ?? e.width} min={min} max={max}
+          onResize={w => resize(i, w)} onReset={() => reset(i)} />
+      </div>
+      )
+    })
+    : null
+
+  return { resized: active !== null, tableStyle, colgroup, grips }
+}

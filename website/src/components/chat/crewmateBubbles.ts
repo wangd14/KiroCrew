@@ -199,9 +199,11 @@ const CORNERS: Record<CrewmateRunPosition, string> = {
 /** Surface + padding + measure, every bubble alike. Tokens only (`bg-card`,
  *  `border-border`), so light and dark each pick their own palette. The
  *  markdown's outermost first/last block margins are zeroed so the bubble's own
- *  padding is the whole inset. */
+ *  padding is the whole inset. `crewmate-bubble` marks the surface so the
+ *  transcript's table breakout (index.css) leaves its tables inside it: a
+ *  table painted past a filled bubble shows the bubble's fill as a band. */
 const BUBBLE_BASE =
-  'bg-card border border-border px-3.5 py-1.5 max-w-[72ch] [&>.group>:first-child]:mt-0 [&>.group>:last-child]:mb-0'
+  'crewmate-bubble bg-card border border-border px-3.5 py-1.5 max-w-[72ch] [&>.group>:first-child]:mt-0 [&>.group>:last-child]:mb-0'
 
 /** Classes for the crewmate's message bubble at `pos`. */
 export function crewmateBubbleClass(pos: CrewmateRunPosition): string {

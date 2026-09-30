@@ -7,12 +7,13 @@ import { act, render } from '@testing-library/react'
 import ChatMessageList from '../app-sdk/ChatMessageList'
 import AssistantMessage from '../pages/chat/AssistantMessage'
 import MarkdownRenderer from '../components/MarkdownRenderer'
+import { crewmateBubbleClass } from '../components/chat/crewmateBubbles'
 import TranscriptScrollShell, { PANE_WIDTH_PROPERTY } from '../pages/chat/TranscriptScrollShell'
 
 const TABLE = '| Signal | Value |\n| --- | --- |\n| `sample.daily.messages` | 42 |'
 // The CSS matches the renderer's stable root wrapper, not all descendant
 // tables: nested list/quote tables and formatted code cards must stay local.
-const TABLE_SELECTOR = '[data-role="assistant"] > .message-bubble > [data-image-scope] > div > .markdown-table'
+const TABLE_SELECTOR = '[data-role="assistant"] > .message-bubble:not(.crewmate-bubble) > [data-image-scope] > div > .markdown-table'
 const here = dirname(fileURLToPath(import.meta.url))
 const css = readFileSync(resolve(here, '../index.css'), 'utf8')
 
@@ -83,6 +84,17 @@ describe('transcript table breakout contract', () => {
       { role: 'user', content: TABLE },
     ]} running={false} />)
     expect(container.querySelectorAll('table')).toHaveLength(3)
+    expect(container.querySelector(TABLE_SELECTOR)).toBeNull()
+  })
+
+  it('keeps a crewmate bubble\'s table inside its filled surface', () => {
+    // A table painted past a filled bubble shows the fill as a band behind it.
+    const { container } = render(
+      <div className="chat-message-body">
+        <AssistantMessage content={TABLE} isStreaming={false} bubbleClassName={crewmateBubbleClass('single')} />
+      </div>,
+    )
+    expect(container.querySelector('.crewmate-bubble .markdown-table')).not.toBeNull()
     expect(container.querySelector(TABLE_SELECTOR)).toBeNull()
   })
 

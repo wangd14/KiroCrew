@@ -7,6 +7,7 @@ import McpAppFrame from '../src/components/McpAppFrame'
 import { ThemeProvider } from '../src/hooks/useTheme'
 import type { ChatSection } from '../src/hooks/useChatNavigation'
 import AssistantMessage from '../src/pages/chat/AssistantMessage'
+import { crewmateBubbleClass } from '../src/components/chat/crewmateBubbles'
 import TranscriptScrollShell from '../src/pages/chat/TranscriptScrollShell'
 import TurnNavigationMinimap from '../src/pages/chat/TurnNavigationMinimap'
 import { initI18n } from '../src/i18n/all'
@@ -64,6 +65,13 @@ function Message() {
     return <MainColumn>
       <AssistantMessage content={source} isStreaming={false} />
       {params.has('mcp') && <McpApp />}
+    </MainColumn>
+  }
+  // A crewmate DM row: the same message inside a crewmate's filled bubble,
+  // whose table must stay inside the bubble and scroll there.
+  if (params.get('host') === 'crewmate') {
+    return <MainColumn>
+      <AssistantMessage content={source} isStreaming={false} bubbleClassName={crewmateBubbleClass('single')} />
     </MainColumn>
   }
   return <ChatMessageList messages={[{ role: 'assistant', content: source, ts: '2026-09-18T17:00:00Z' }]} running={false} />
