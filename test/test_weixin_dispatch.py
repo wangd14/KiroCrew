@@ -960,6 +960,17 @@ def test_stop_cancels_a_live_turn_cooperatively(tmp_path):
     assert any("正在停止" in m["text"] for m in client.sent)
 
 
+def test_stop_is_declined_while_the_session_compacts(tmp_path):
+    provider = FakeProvider()
+    d, client, sessions = _make(tmp_path, provider=provider, busy=True)
+    sessions.is_compacting = lambda key: True
+
+    asyncio.run(d.handle_message(_msg("/stop")))
+
+    assert provider.cancelled == []
+    assert any("nothing was stopped" in m["text"] for m in client.sent)
+
+
 def test_stop_with_nothing_running_says_so(tmp_path):
     provider = FakeProvider()
     d, client, sessions = _make(tmp_path, provider=provider, busy=False)

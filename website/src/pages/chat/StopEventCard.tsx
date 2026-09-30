@@ -1,6 +1,6 @@
 import { memo } from 'react'
 import { motion } from 'framer-motion'
-import { Loader2, Square, XOctagon } from 'lucide-react'
+import { Hourglass, Square, XOctagon } from 'lucide-react'
 import type { ChatMessage } from '../../types'
 
 import { i18nT } from '../../i18n/t'
@@ -31,10 +31,12 @@ export default memo(function StopEventCard({ message }: { message: ChatMessage }
   if (state === 'stop_declined_compacting') {
     // The press landed while the session's own automatic /compact held it, and
     // the backend declined the Stop rather than fail the compaction and restart
-    // the session (#14841). Nothing was stopped, so this is a status row in
-    // the muted palette, not a danger row: the user did nothing wrong and the
-    // session is fine. Same shape as the other states so the chip the press
-    // opened settles in place instead of being replaced.
+    // the session. Nothing was stopped, so this is a status row in the muted
+    // palette, not a danger row: the user did nothing wrong and the session is
+    // fine. A SETTLED row, so the glyph is static: a spinner on a history row
+    // claims live activity long after the compaction ended and reads as a
+    // twin of the composer's live indicator. The text carries the reassurance
+    // the channel surfaces give, since the row outlives the compaction.
     return (
       <div
         role="status"
@@ -43,7 +45,7 @@ export default memo(function StopEventCard({ message }: { message: ChatMessage }
         data-testid="stop-event-card"
         data-state={state}
       >
-        <Loader2 size={13} className="lucide-inline animate-spin" aria-hidden="true" />
+        <Hourglass size={13} className="lucide-inline" aria-hidden="true" />
         {i18nT('pages.chat.stopEventCard.stop_declined_compacting_2')}
       </div>
     )

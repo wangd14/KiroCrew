@@ -43,7 +43,12 @@ from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
 from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import build_dm_session_key, seed_generation
 from kiro_crew.messaging.transport import InboundMessage
-from kiro_crew.session_lifecycle import STOP_DECLINED_COMPACTING_TEXT
+from kiro_crew.session_lifecycle import (
+    STOP_DECLINED_COMPACTING_TEXT,
+    compaction_in_flight,
+    consume_stop_declined,
+    note_stop_declined,
+)
 from kiro_crew.whatsapp.commands import (
     COMPACT_AUTO_TEXT,
     COMPACT_BUSY_TEXT,
@@ -294,13 +299,24 @@ class WhatsAppDispatcher:
         is still coming.
         """
         session_key = self._live_session_key(scope)
+        # A repeat within the window after a declined stop is the second press
+        # and forces; the first decline records the marker below. Only the
+        # operator reaches a command, so the conversation names the presser.
+        force = consume_stop_declined(session_key, scope) and compaction_in_flight(
+            self.sessions, session_key
+        )
         try:
-            outcome = await self.sessions.stop_turn(session_key)
+            outcome = await (
+                self.sessions.stop_turn(session_key, force=True)
+                if force
+                else self.sessions.stop_turn(session_key)
+            )
         except Exception:  # noqa: BLE001: the queue clear below still applies
             logger.warning("whatsapp: stop_turn failed", exc_info=True)
             outcome = None
         kind = str(getattr(outcome, "kind", outcome) or "")
         if kind == "compacting":
+            note_stop_declined(session_key, scope)
             await self._say(scope, STOP_DECLINED_COMPACTING_TEXT)
             return
         stopped = kind in ("soft", "hard")

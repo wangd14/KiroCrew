@@ -57,6 +57,12 @@ from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import build_dm_session_key, seed_generation
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.safety_override import safety_override
+from kiro_crew.session_lifecycle import (
+    STOP_DECLINED_COMPACTING_TEXT,
+    compaction_in_flight,
+    consume_stop_declined,
+    note_stop_declined,
+)
 from kiro_crew.weixin.attachments import process_weixin_attachments
 from kiro_crew.weixin.commands import ConversationState, build_help, parse_command
 from kiro_crew.weixin.transport import WEIXIN_CAPABILITIES
@@ -470,6 +476,25 @@ class WeixinDispatcher:
         the session while its turn is still unwinding.
         """
         session_key = self._session_key(user_id)
+        # Before the Stop record and the queue clear: a Stop the session's own
+        # automatic compaction declines ends nothing and must destroy nothing.
+        if compaction_in_flight(self.sessions, session_key):
+            # A repeat within the window is the second press and forces. Keyed
+            # by the presser too: under a unified ``dm_scope`` one session key
+            # is every user's, and another user's declined Stop must not arm
+            # this user's first press.
+            if not consume_stop_declined(session_key, user_id):
+                note_stop_declined(session_key, user_id)
+                await self._say(user_id, STOP_DECLINED_COMPACTING_TEXT)
+                return
+            note_user_stop(self.sessions, session_key)
+            try:
+                forced = (await self.sessions.stop_turn(session_key, force=True)) == "hard"
+            except Exception:
+                logger.warning("weixin /stop: force stop failed for %s", session_key, exc_info=True)
+                forced = False
+            await self._say(user_id, _STOPPING if forced else _STOP_FAILED)
+            return
         # Recorded before the busy check, so a Stop landing while the session is
         # between an abandoned attempt and its replay still counts (see
         # ``note_user_stop``).

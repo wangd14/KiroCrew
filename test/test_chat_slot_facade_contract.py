@@ -44,6 +44,7 @@ _TO_DICT_KEYS = (
     "messages",
     "running",
     "compacting",
+    "stop_declined",
     "orchestrating",
     "queue_depth",
     "stopping",

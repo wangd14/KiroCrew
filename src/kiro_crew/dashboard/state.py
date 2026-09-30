@@ -1298,9 +1298,9 @@ _AUTO_COMPACT_NOTICE = "🔄 Auto-compacted at {pct:.0f}%."
 #: this -- is answerable only if the notice said what actually occurred.
 #: Both restart notices end in ``_RESTART_MEMORY_TAIL`` because that sentence is
 #: what the successor actually does: its first turn is built from a recent excerpt
-#: of this transcript (``ContextBuilder`` thread history), so "no longer remembers
-#: it" was false in the direction that hurt -- a user who believes the context is
-#: gone for good has no reason to ask the agent to pick the work back up (#14841).
+#: of this transcript (``ContextBuilder`` thread history). Naming the excerpt is
+#: the point: a user who believes the context is gone for good has no reason to
+#: ask the agent to pick the work back up.
 _RESTART_MEMORY_TAIL = (
     "The conversation above is still here, and the agent's next reply starts from a "
     "recent excerpt of it rather than the whole thing."
@@ -1317,13 +1317,15 @@ _AUTO_RESTART_UNCOMPACTABLE_NOTICE = (
     "♻️ Context reached {pct:.0f}% and this backend cannot compact at all, so "
     "the session was restarted. " + _RESTART_MEMORY_TAIL
 )
-#: A user Stop ended the compaction turn. Says what happened and what happens
-#: next, and claims nothing about the session's memory: after a soft stop the
-#: process is intact, after a hard stop the stop card has already said it was
-#: reset. Neither is "compaction didn't succeed, so the session was restarted".
+#: A user Stop ended the compaction turn. The only Stop that reaches a compacting
+#: session is the FORCED one, and a forced stop restarts the session, so the
+#: notice says so with the restart notices' own verb and memory tail; what tells
+#: it apart from them is the actor it leads with: nothing failed, the user ended
+#: it.
 _AUTO_COMPACT_CANCELLED_NOTICE = (
-    "⏹ Compaction at {pct:.0f}% was ended by Stop. The session was not restarted "
-    "for it; compaction retries after a cooldown, or run `/compact` yourself."
+    "⏹ Your forced Stop ended the compaction (condensing the conversation to free space) "
+    "that started at {pct:.0f}% of the context limit, so the session was restarted. "
+    + _RESTART_MEMORY_TAIL
 )
 _AUTO_COMPACT_WAITING_NOTICE = (
     "⏸ Auto-compact failed at {pct:.0f}%. The session is waiting for its sub-agents "
@@ -2748,6 +2750,7 @@ class _ChatSlot:
         "_coordinator_approvals",
         "_has_reader_flag",
         "_compacting",
+        "_stop_declined_at",
         "_stop_state_raw",
         "_stop_generation",
         "_stop_event_id",
@@ -3360,9 +3363,17 @@ class _ChatSlot:
         # slot's session. Written by the compacting observer wired in
         # ``wire_session_compact_callback`` and read by the slot projection, so
         # the composer can show the compaction while it runs and the Stop button
-        # can warn before a press that would fail it (#14841). Not persisted:
+        # can warn before a press that would fail it. Not persisted:
         # a compaction never outlives the gateway process.
         self._compacting: bool = False
+        # Monotonic time of the last cooperative Stop this slot DECLINED because
+        # its session was compacting; 0.0 when none. Kept apart from
+        # ``_stop_state`` on purpose: that machine is read by the queue drain as
+        # "a stop is in progress" and persists a "Session reset" row on it, and a
+        # declined Stop stopped nothing. What the marker buys is the escape
+        # hatch: a press that lands within ``STOP_DECLINED_ESCALATION_SECS`` of
+        # a decline is the user's second press and escalates to the force stop.
+        self._stop_declined_at: float = 0.0
         self._stop_state_raw: str = "idle"  # 'idle' | 'soft_pending' | 'killing'
         # Monotonic count of stop INITIATIONS (idle → active edges of
         # _stop_state). Teardown resets _stop_state back to "idle" but never
@@ -6384,7 +6395,7 @@ class DashboardState:
 
         def _on_compacting_changed(key: str, on: bool) -> None:
             # The slot learns the compaction is RUNNING, not only how it ended:
-            # the composer shows it and the Stop button warns on it (#14841).
+            # the composer shows it and the Stop button warns on it.
             # Synchronous, from the tick that committed the membership change,
             # so the broadcast that follows agrees with ``is_compacting``.
             from kiro_crew.dashboard.chat_utils import dashboard_slot_key
@@ -6394,6 +6405,10 @@ class DashboardState:
             if slot is None or slot._compacting == on:
                 return
             slot._compacting = on
+            if not on:
+                # The decline marker was this compaction's; the next one, even
+                # inside the window, owes its own first refusal.
+                slot._stop_declined_at = 0.0
             self.push_slots_update()
 
         setter = getattr(self.sessions, "set_compacting_callback", None)

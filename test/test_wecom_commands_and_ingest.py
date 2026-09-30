@@ -481,6 +481,19 @@ class TestStop:
         assert any("已停止" in s for s in client.said)
 
     @pytest.mark.asyncio
+    async def test_stop_is_declined_while_the_session_compacts(self) -> None:
+        provider = FakeProvider()
+        client = FakeClient()
+        sessions = FakeSessions(provider, busy=True)
+        sessions.is_compacting = lambda key: True
+        d = _dispatcher(sessions, client)
+
+        await d.handle_message(_inbound("/stop"))
+
+        assert provider.cancelled is False
+        assert any("nothing was stopped" in s for s in client.said)
+
+    @pytest.mark.asyncio
     async def test_stop_with_nothing_running_says_so(self) -> None:
         client = FakeClient()
         d = _dispatcher(FakeSessions(FakeProvider(), busy=False), client)

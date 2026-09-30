@@ -727,7 +727,7 @@ class TestABackendNothingCompactsIsRecycled:
             assert "restarted" in restart, restart
             # What the successor actually does: its first turn carries a recent
             # excerpt of the transcript, so the notice may not claim total loss
-            # (#14841) and may not stay silent about the loss either.
+            # and may not stay silent about the loss either.
             assert "recent excerpt" in restart, restart
             assert "no longer remembers" not in restart, restart
 
@@ -763,7 +763,7 @@ class TestABackendNothingCompactsIsRecycled:
             # cannot answer.
             assert "auto-compacted" not in restart.lower(), restart
             assert "restarted" in restart, restart
-            # Same rule as the channel leg (#14841): name the excerpt, not a total loss.
+            # Same rule as the channel leg: name the excerpt, not a total loss.
             assert "recent excerpt" in restart, restart
             assert "no longer remembers" not in restart, restart
 

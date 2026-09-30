@@ -47,7 +47,12 @@ from kiro_crew.security import (
     redact_exfiltration_urls,
 )
 from kiro_crew.sel import sel
-from kiro_crew.session_lifecycle import STOP_DECLINED_COMPACTING_TEXT
+from kiro_crew.session_lifecycle import (
+    STOP_DECLINED_COMPACTING_TEXT,
+    compaction_in_flight,
+    consume_stop_declined,
+    note_stop_declined,
+)
 from kiro_crew.slack.allowlist import (
     ACTION_ALLOWLIST_APPROVE,
     ACTION_ALLOWLIST_DENY,
@@ -2494,7 +2499,8 @@ async def _handle_stop_confirm(payload: dict, channel: str, msg_ts: str, user_id
     # Find the active session in this channel/thread
     thread_ts = payload.get("message", {}).get("thread_ts") or msg_ts
     has_session = _orch.sessions.has_session(thread_ts)
-    active_task = _orch._session_tasks.pop(thread_ts, None)
+    # READ, not popped: removed below only once the cancel went through.
+    active_task = _orch._session_tasks.get(thread_ts)
 
     if has_session or active_task:
         response_url = payload.get("response_url", "")
@@ -2526,15 +2532,36 @@ async def _handle_stop_confirm(payload: dict, channel: str, msg_ts: str, user_id
                     channel, "⛔ Execution stopped — session reset.", thread_ts
                 )
 
-        outcome = await _orch.sessions.stop_turn(thread_ts, on_soft=_on_soft, on_hard=_on_hard)
-        if active_task and not active_task.done():
-            active_task.cancel()
+        # A repeat press within the window by the same presser, while the
+        # compaction still holds the session, is the forcing second press the
+        # decline reply promised; the marker is spent either way.
+        _force = consume_stop_declined(thread_ts, user_id) and compaction_in_flight(
+            _orch.sessions, thread_ts
+        )
+        _kw = {"force": True} if _force else {}
+        outcome = await _orch.sessions.stop_turn(
+            thread_ts, on_soft=_on_soft, on_hard=_on_hard, **_kw
+        )
+        if outcome == "compacting":
+            # Nothing was stopped: the task stays tracked and nothing is cancelled.
+            # The reply promises that a repeat forces, so arm the marker for this
+            # presser; Kill Now stays the other route.
+            note_stop_declined(thread_ts, user_id)
+            await _update_ephemeral([], STOP_DECLINED_COMPACTING_TEXT)
+        else:
+            # Pop only the task this Stop ended; a successor dispatched during
+            # the await from pending work is cancelled with it (see the same
+            # guard on the !stop command path in slack/events.py).
+            # A successor dispatched from a message admitted mid-await is the
+            # user's newer intent: left running and tracked.
+            if _orch._session_tasks.get(thread_ts) is active_task:
+                _orch._session_tasks.pop(thread_ts, None)
+            if active_task and not active_task.done():
+                active_task.cancel()
         # If stop_turn returned "idle" (no active turn), neither callback
         # fired — dismiss the stale ephemeral with a "Nothing running" message.
         if outcome == "idle":
             await _update_ephemeral([], "Nothing running.")
-        elif outcome == "compacting":
-            await _update_ephemeral([], STOP_DECLINED_COMPACTING_TEXT)
         sel().log_tool_invocation(
             session_key=thread_ts,
             source="slack",
@@ -3226,7 +3253,16 @@ async def _handle_inline_stop(
             except Exception:
                 pass
 
-    outcome = await _orch.sessions.stop_turn(session_key, on_soft=_on_soft, on_hard=_on_hard)
+    # A repeat press within the window by the same presser, while the compaction
+    # still holds the session, is the forcing second press the decline promised.
+    _force = consume_stop_declined(session_key, user_id) and compaction_in_flight(
+        _orch.sessions, session_key
+    )
+    _kw = {"force": True} if _force else {}
+    outcome = await _orch.sessions.stop_turn(session_key, on_soft=_on_soft, on_hard=_on_hard, **_kw)
+    if outcome == "compacting":
+        # The reply promises that a repeat forces, so arm the marker.
+        note_stop_declined(session_key, user_id)
     if outcome in ("idle", "compacting") and _orch.slack and channel and msg_ts:
         text = "⏹ Nothing running." if outcome == "idle" else STOP_DECLINED_COMPACTING_TEXT
         try:

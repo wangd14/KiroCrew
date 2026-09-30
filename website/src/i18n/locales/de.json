@@ -6222,8 +6222,8 @@
       "session_control_ready": "Bereit",
       "session_control_chip_label": "{{label}} — {{detail}}",
       "agent_inherited_default": "Diese Sitzung folgt dem Standard-Agenten ({{name}}). Sie hat keinen eigenen Agenten, ändert sich also mit dem Standard. Zum Anheften klicken.",
-      "compacting_context": "Kontext wird komprimiert…",
       "compacting_context_stop_unavailable": "Kontext wird komprimiert — Stoppen ist erst nach Abschluss möglich",
+      "click_again_to_force_stop_resets_session": "Erneut klicken, um den Stopp zu erzwingen (startet die Sitzung neu; deine Nachrichten bleiben, der Agent behält einen aktuellen Auszug)",
       "model_inherited_default": "Diese Sitzung läuft auf dem Standardmodell ({{name}}). Sie hat kein eigenes Modell, ändert sich also, wenn sich der Standard ändert. Klicken, um eines festzulegen."
     },
     "chatPane": {
@@ -10619,8 +10619,8 @@
         "menu_crewlog_desc": "Was diese Sitzung getan und gekostet hat: Status, Verbrauch, Verlauf, Tools, Freigaben"
       },
       "stopEventCard": {
-        "stop_declined_compacting": "Stopp abgelehnt, Komprimierung läuft",
-        "stop_declined_compacting_2": "[Komprimierung — Stopp abgelehnt]",
+        "stop_declined_compacting": "Stopp abgelehnt: der Kontext wurde komprimiert",
+        "stop_declined_compacting_2": "[Komprimierung: ein Stopp wurde abgelehnt, während der Kontext komprimiert wurde; nichts wurde gestoppt, die Komprimierung ist von selbst abgeschlossen]",
         "stop_failed_session_reset": "Stoppen fehlgeschlagen, Sitzung zurückgesetzt",
         "stop_failed_session_reset_2": "[Stoppen fehlgeschlagen, Sitzung zurückgesetzt]",
         "stopped": "Gestoppt",

@@ -66,6 +66,13 @@ from kiro_crew.messaging.queue_receipt import ReceiptQueue, ReceiptSurface
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
+from kiro_crew.session_lifecycle import (
+    STOP_DECLINED_COMPACTING_TEXT,
+    compaction_in_flight,
+    consume_stop_declined,
+    force_stop_keeping_others,
+    note_stop_declined,
+)
 from kiro_crew.subagent_wait_reasons import DEFERRED_QUEUED_REASONS
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import edge
@@ -85,6 +92,11 @@ STOP_REPLY_CANCELLED = "🛑 Stopped."
 #: cleared, and saying so is what distinguishes "nothing to stop" from "the stop did
 #: not work".
 STOP_REPLY_IDLE = "🛑 Nothing was running — queue cleared."
+#: The Stop was declined: the session's own automatic ``/compact`` turn holds it,
+#: and cancelling that turn would fail the compaction and restart the session.
+#: Nothing is cancelled and the queue is KEPT -- the caller's messages run after
+#: the compaction, which is what they were waiting for anyway.
+STOP_REPLY_COMPACTING = STOP_DECLINED_COMPACTING_TEXT
 
 
 def note_user_stop(sessions: Any, session_key: str) -> None:
@@ -154,9 +166,37 @@ async def stop_running_turn(
     queue is still cleared, so claiming a stop that did not happen would be the
     worse lie.
     """
+    force = False
+    if compaction_in_flight(sessions, session_key):
+        # Before the Stop record and before the queue clear: a Stop the
+        # compaction declines ends nothing, so it must destroy nothing either.
+        # A repeat within the window is the user's second press and FORCES,
+        # so a live turn sharing the session with a compaction stays stoppable
+        # from a channel that has no force button.
+        # Keyed by ``owner`` as well as the session: on a shared key another
+        # person's declined Stop must not arm THIS person's first press.
+        if not consume_stop_declined(session_key, owner):
+            note_stop_declined(session_key, owner)
+            return STOP_REPLY_COMPACTING
+        force = True
     note_user_stop(sessions, session_key)
     cancelled_turn = False
-    if sessions.is_busy(session_key):
+    if force:
+        if getattr(sessions, "stop_turn", None) is not None:
+            try:
+                # The reset is the caller's, the queue is everyone's: the hard
+                # stop pops the session and its queue, so the other people's
+                # entries are carried across to the successor and only the
+                # caller's are dropped (``force_stop_keeping_others``), which is
+                # what the docstring above requires of a shared key.
+                cancelled_turn = await force_stop_keeping_others(
+                    sessions, session_key, entries_queued_by(owner)
+                )
+            except Exception:
+                logger.warning(
+                    "%s: force stop failed for %s", surface.label, session_key, exc_info=True
+                )
+    elif sessions.is_busy(session_key):
         provider = sessions.get_provider(session_key)
         cancel = getattr(provider, "cancel", None)
         if cancel is not None:

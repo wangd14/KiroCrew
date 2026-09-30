@@ -35,6 +35,7 @@ from kiro_crew.metrics.sessions import (
     record_session_ended,
     record_session_started,
 )
+from kiro_crew.session_lifecycle import clear_stop_declined
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
@@ -187,6 +188,8 @@ class _CompactionOwner(Protocol):
     def mark_needs_reinjection(self, key: str) -> None: ...
 
     def stop_generation(self, key: str) -> int: ...
+
+    def absorb_orphaned_release(self, key: str) -> bool: ...
 
     def _lifecycle_boundary(self) -> Any: ...
 
@@ -383,6 +386,11 @@ class CompactionCoordinator:
             self.state.compacting.add(key)
         else:
             self.state.compacting.discard(key)
+            # The markers this compaction's declines armed die with it, under
+            # every spelling of the key a channel may have pressed with: the
+            # next compaction, even one starting inside the window, owes its
+            # own first refusal rather than inheriting a force from this one.
+            clear_stop_declined(key, fold=self._owner._fold_key)
         if was == on:
             return
         cb = self.state.on_compacting_changed
@@ -685,12 +693,30 @@ class CompactionCoordinator:
                 # boundary, so the durable mapping remains untouched.
                 claude_session = session
 
+                # Read once before the wait, so a timeout spent parked behind a
+                # live turn compares against the session's real count and is a
+                # failure, not a cancel; refreshed once the semaphore is held,
+                # so a Stop that ended THAT turn is not this compaction's cancel.
+                stop_gen = self._stop_generation(key)
+
                 async def _run_compact() -> None:
-                    async with claude_session.semaphore:
+                    nonlocal stop_gen
+                    # Manual acquire/release, not ``async with``: a hard Stop
+                    # that lands on this compaction pops the session and hands
+                    # the permit to a woken claimant, and a context manager
+                    # would release it a second time under that claimant. Same
+                    # ownership record as ``_compact_in_place``'s ``finally``:
+                    # this task names itself the holder, ``reset`` orphans it.
+                    await claude_session.semaphore.acquire()
+                    claude_session.turn_owner = asyncio.current_task()
+                    try:
+                        stop_gen = self._stop_generation(key)
                         await claude_session.provider.compact()
+                    finally:
+                        if not owner.absorb_orphaned_release(key):
+                            claude_session.semaphore.release()
 
                 timeout = self._deps.compact_wait_timeout_secs()
-                stop_gen = self._stop_generation(key)
                 try:
                     # One budget covers both waiting for a live turn and the
                     # compact call itself.
@@ -1003,6 +1029,11 @@ class CompactionCoordinator:
         # Read AFTER the semaphore is held: a Stop that landed while this waited
         # for the turn ended THAT turn, not this compaction.
         stop_gen = self._stop_generation(key)
+        # This task holds the permit now, and says so where ``reset`` looks
+        # (``_orphan_turn_holder``): a hard Stop that pops the session records
+        # this task as the holder whose permit it handed on, and the ``finally``
+        # reads that record back rather than inferring it.
+        session.turn_owner = asyncio.current_task()
         try:
 
             async def _run() -> None:
@@ -1043,10 +1074,10 @@ class CompactionCoordinator:
         except (Exception, asyncio.TimeoutError):
             if self._stop_generation(key) > stop_gen:
                 # A user Stop ended the ``/compact`` turn. That is not the harness
-                # failing to compact, and answering it with the recycle below is
-                # the bug this arm used to have: the user pressed Stop on what
-                # looked like a stalled turn and lost the session's memory to a
-                # restart the notice then blamed on compaction (#14841).
+                # failing to compact, and the recycle below must not answer it: a
+                # user who presses Stop on what looks like a stalled turn would
+                # lose the session's memory to a restart the notice then blames
+                # on compaction.
                 return await self._settle_cancelled(key, pct)
             self._deps.logger.warning(
                 "Session %s in-place /compact failed after %.0fs — recycling "
@@ -1059,11 +1090,20 @@ class CompactionCoordinator:
             await self._await_cotenants(key, pct)
             return await self._restart_held(key, session, pct)
         finally:
-            # A hard Stop that landed on this compaction's turn already popped
-            # the session and released its permit to wake waiters
-            # (``_wake_turn_waiters``); this permit was that one. Releasing again
-            # raises out of the compaction and hides the cancelled verdict.
-            if session.semaphore.locked():
+            # Release ONLY the permit this task still owns. The one path that
+            # takes it away is a hard Stop landing during this hold -- on the
+            # ``/compact`` turn, or in the cotenant wait or successor start of
+            # the recycle path: ``reset`` pops the session, records this task
+            # as the orphaned holder and releases the permit to wake waiters
+            # (``_wake_turn_waiters``), and from that tick the permit belongs
+            # to whichever claimant woke. A second release here would surface
+            # as a ``ValueError`` on THAT task's own release. ``locked()``
+            # cannot tell the two apart (the claimant re-locks it), so the
+            # record ``reset`` wrote is what decides, the same one a turn's
+            # key-only release consults. The recycle path pops the session
+            # itself and writes no record, so its release goes through and a
+            # claimant parked on the permit wakes.
+            if not self._owner.absorb_orphaned_release(key):
                 session.semaphore.release()
 
         escalate = self._owner._settle_compact_cooldown(key, session.provider, pct)

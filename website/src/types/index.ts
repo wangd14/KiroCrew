@@ -1165,6 +1165,9 @@ export interface ChatSlot {
    * like a stall worth pressing Stop on (#14841). The composer shows it and
    * the Stop button becomes a warning while it is set. */
   compacting?: boolean
+  /** A cooperative Stop was declined moments ago (compaction); the next press
+   * escalates to the force stop. Read from the same window the backend uses. */
+  stop_declined?: boolean
   /** In-flight `wait` tool sleep, absent when nothing is sleeping. `deadline_ts`
    * is absolute seconds on the BACKEND clock (Date.now() / 1000 territory), so
    * the transcript can count down against it and survive a page reload;

@@ -13,6 +13,7 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
+from kiro_crew.session_lifecycle import compaction_in_flight
 
 from .parsers import _SLOT_KEY_RE, _redact, _redact_and_truncate, _usable_name
 from .repository import APP_NAME, _audit, _load_settings, _safe_dir, _slot_key
@@ -220,6 +221,37 @@ async def _ensure_worker_slot(
 _UNPINNED: Any = object()
 
 
+def _snapshot_queued_work(slot: Any) -> dict[str, Any]:
+    """The three relaunch sources ``_discard_queued_work`` drops, copied."""
+    kept: dict[str, Any] = {}
+    for attr in ("_queue", "_pending_steers"):
+        seq = getattr(slot, attr, None)
+        if seq is not None:
+            kept[attr] = list(seq)
+    if hasattr(slot, "_pending_synthesis"):
+        kept["_pending_synthesis"] = getattr(slot, "_pending_synthesis")
+    return kept
+
+
+def _restore_queued_work(slot: Any, kept: dict[str, Any]) -> None:
+    """Put a snapshot back, for a stop that ended up halting nothing."""
+    for attr in ("_queue", "_pending_steers"):
+        if attr not in kept:
+            continue
+        seq = getattr(slot, attr, None)
+        if seq is None:
+            continue
+        try:
+            seq.extend(kept[attr])
+        except Exception:
+            logger.debug("could not restore %s on %s", attr, getattr(slot, "key", "?"))
+    if "_pending_synthesis" in kept:
+        try:
+            setattr(slot, "_pending_synthesis", kept["_pending_synthesis"])
+        except Exception:
+            logger.debug("could not restore _pending_synthesis on %s", getattr(slot, "key", "?"))
+
+
 def _discard_queued_work(slot: Any) -> None:
     """Drop everything that would start a SUCCESSOR turn on this slot.
 
@@ -363,17 +395,33 @@ async def _halt_active_turn(state: Any, name: str, *, only_slot: Any = _UNPINNED
     # this app's Stop button, losing that turn's response.
     if getattr(slot, "_app", None) != APP_NAME:
         return False
+    # circular import (see module header): dashboard.server imports us.
+    from kiro_crew.dashboard.chat_utils import _history_key_for
+
+    session_key = _history_key_for(slot.key)
+    # An automatic compaction holds the session: the cooperative stop below
+    # would be declined, and a Pause that halts nothing must discard nothing.
+    # Probed BEFORE the discard, for the same reason the discard sits before
+    # the stop: order is the whole protection here.
+    if compaction_in_flight(state.sessions, session_key):
+        return False
     # Before BOTH stops below. The cooperative stop_turn also ends the turn, so
     # clearing after it would race _run_chat's end-of-turn block into starting
     # the next queued prompt -- Pause would return ok while the agent carried on.
+    # Snapshotted first so the one outcome that halts nothing can hand it back.
+    kept = _snapshot_queued_work(slot)
     _discard_queued_work(slot)
     try:
-        # circular import (see module header): dashboard.server imports us.
-        from kiro_crew.dashboard.chat_utils import _history_key_for
-
-        await state.sessions.stop_turn(_history_key_for(slot.key), force=False)
+        outcome = await state.sessions.stop_turn(session_key, force=False)
     except Exception:
         logger.debug("cooperative stop failed for %s", name, exc_info=True)
+        outcome = None
+    if outcome == "compacting":
+        # The race the probe cannot close: a compaction committed between it
+        # and the cancel. Nothing was halted, so nothing may be lost: the queued
+        # work goes back and the turn is left running.
+        _restore_queued_work(slot, kept)
+        return False
     task = getattr(slot, "task", None)
     if task is not None and not task.done():
         task.cancel()

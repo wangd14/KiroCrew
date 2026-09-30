@@ -223,7 +223,13 @@ export const CHUNK_BUDGETS = {
   // Route-only pages (settings, capabilities, schedule, artifacts, apps, ...) load
   // through React.lazy in their own chunks, so this chunk holds the shell and the
   // chat route; the ceiling keeps the ~5% margin the lines above prescribe.
-  App: 1978 * KB, // measured 1,929,378 B with route-only pages lazy (~5% headroom)
+  // The composer's compacting state (spinner + "Stop is unavailable" hint), the
+  // armed-Stop "click again" hint with its client-side timer
+  // (useStopDeclinedHint) and the stop card's declined state add ~2 KB of
+  // chat-route code; they live in the composer, which is the App chunk by
+  // design, so there is no lazy boundary to put them behind. The chunk had
+  // already grown to within 1 KB of the previous ceiling on main.
+  App: 1990 * KB, // measured 2,026,152 B in CI with route-only pages lazy (~0.5% headroom)
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)
   // -- one deliberate `codeSplitting` group, see vite.config.ts.

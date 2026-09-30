@@ -61,22 +61,22 @@ CHANNEL_COMPACT_FAILED_NOTICE = (
     "Context reached {pct:.0f}% but auto-compact failed. It retries after a "
     "cooldown — send {cmd} to compact now, or {new_cmd} to start fresh."
 )
-#: A user Stop ended the compaction turn. Claims nothing about the session's
-#: memory: after a soft stop the process is intact, after a hard stop the stop
-#: already said the session was reset.
-CHANNEL_COMPACT_CANCELLED_NOTICE = (
-    "Compaction at {pct:.0f}% was ended by a stop. The session was not restarted for "
-    "it; compaction retries after a cooldown, or send {cmd} to compact now."
-)
 #: Shared tail of both restart notices. The successor's first turn IS built from a
-#: recent excerpt of the transcript (``ContextBuilder`` thread history), so "no
-#: longer remembers them" was false in the direction that hurt: a user who believes
-#: the context is gone has no reason to ask the agent to pick the work back up
-#: (#14841).
+#: recent excerpt of the transcript (``ContextBuilder`` thread history), so the
+#: notice names that excerpt: a user who believes the context is gone for good has
+#: no reason to ask the agent to pick the work back up.
 _CHANNEL_RESTART_MEMORY_TAIL = (
     "The messages above are still here, and the agent's next reply starts from a "
     "recent excerpt of them rather than the whole thing. Send {new_cmd} any time to "
     "start fresh yourself."
+)
+#: A user Stop ended the compaction turn. The only Stop that reaches a compacting
+#: session is the FORCED one, and a forced stop restarts the session, so the
+#: notice uses the restart notices' verb and memory tail and leads with the actor.
+CHANNEL_COMPACT_CANCELLED_NOTICE = (
+    "Your forced stop ended the compaction (condensing the conversation to free space) "
+    "that started at {pct:.0f}% of the context limit, so this session was restarted. "
+    + _CHANNEL_RESTART_MEMORY_TAIL
 )
 #: The session was REPLACED after a compaction that could have worked failed. Says
 #: what happened rather than claiming a summary, and names the loss the user would
@@ -127,8 +127,8 @@ def notice_text(
     if outcome == COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS:
         return CHANNEL_COMPACT_WAITING_NOTICE.format(pct=pct)
     if outcome == COMPACT_OUTCOME_CANCELLED:
-        compact_cmd, _ = _MANUAL_COMMANDS.get(namespace, _DEFAULT_COMMANDS)
-        return CHANNEL_COMPACT_CANCELLED_NOTICE.format(pct=pct, cmd=compact_cmd)
+        _, new_cmd = _MANUAL_COMMANDS.get(namespace, _DEFAULT_COMMANDS)
+        return CHANNEL_COMPACT_CANCELLED_NOTICE.format(pct=pct, new_cmd=new_cmd)
     if not success:
         compact_cmd, new_cmd = _MANUAL_COMMANDS.get(namespace, _DEFAULT_COMMANDS)
         return CHANNEL_COMPACT_FAILED_NOTICE.format(pct=pct, cmd=compact_cmd, new_cmd=new_cmd)

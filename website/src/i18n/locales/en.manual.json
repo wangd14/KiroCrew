@@ -2010,8 +2010,8 @@
       "auto_compact_at": "Auto-compact at",
       "auto_compact_threshold": "Auto-compact threshold",
       "auto_compact_load_failed": "Couldn't load the auto-compact setting",
-      "compacting_context": "Compacting context…",
       "compacting_context_stop_unavailable": "Compacting context — Stop is unavailable until it finishes",
+      "click_again_to_force_stop_resets_session": "Click again to force stop (restarts the session; your messages stay, the agent keeps a recent excerpt)",
       "reset_to_global": "Reset to global ({{pct}}%)",
       "following_global": "Following global ({{pct}}%)",
       "optimize_failed": "Couldn't optimize the prompt. Your original text was restored.",
@@ -4827,8 +4827,8 @@
         "not_scored": "(+{{count}} not scored)"
       },
       "stopEventCard": {
-        "stop_declined_compacting": "Stop declined, compaction in progress",
-        "stop_declined_compacting_2": "[Compacting — Stop declined]"
+        "stop_declined_compacting": "Stop declined: the context was compacting",
+        "stop_declined_compacting_2": "[Compacting: a Stop was declined while the context compacted; nothing was stopped and the compaction finished on its own]"
       }
     },
     "chatPage": {
