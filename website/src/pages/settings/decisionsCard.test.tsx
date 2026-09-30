@@ -419,8 +419,7 @@ describe('Decisions (Jev) preview card', () => {
       p95_secs: 0.51, timeout_ms: 2000, setup_doc: 'https://example.invalid/doc', serve_command: 'laya-serve',
     }
     const provider = (active: string) => ({
-      presets: [preset], active, configured_endpoint: 'http://127.0.0.1:8104/v1/systemone',
-      configured_timeout_ms: 2000,
+      presets: [preset], active, configured_endpoint: 'http://127.0.0.1:8104/v1/systemone', loopback: true,
     })
     vi.spyOn(api, 'system').mockResolvedValue({ mem_total_gb: 16 } as never)
     const read = vi.spyOn(api, 'getDecisionsProvider').mockResolvedValue(provider('laya'))
@@ -429,6 +428,7 @@ describe('Decisions (Jev) preview card', () => {
       expect(screen.getByText(/sent to the model server at the address below, on this machine/i)).toBeInTheDocument()
     })
     expect(screen.queryByText(/sent over the internet to Jev/i)).toBeNull()
+    expect(screen.queryByText(/no Jev API key is sent to it/i)).toBeNull()
 
     cleanup()
     read.mockResolvedValue(provider('custom'))
@@ -436,6 +436,8 @@ describe('Decisions (Jev) preview card', () => {
     await waitFor(() => {
       expect(screen.getByText(/sent over the internet to Jev/i)).toBeInTheDocument()
     })
+    // A hand-written loopback address gets no key; the card says so, not only the log.
+    expect(screen.getByText(/no Jev API key is sent to it/i)).toBeInTheDocument()
   })
 
   it('lists one row per point the GATEWAY projects, never a list of its own', async () => {

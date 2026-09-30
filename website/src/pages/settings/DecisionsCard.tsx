@@ -28,7 +28,7 @@ import {
   type DecisionPointRow,
 } from './decisionsPreview'
 import { fmtPercent } from '../../i18n/format'
-import { DECISIONS_PROVIDER_QUERY_KEY, DecisionsProviderPicker } from './DecisionsProviderPicker'
+import { DECISIONS_PROVIDER_QUERY_KEY } from './decisionsProviderQuery'
 import { i18nT } from '../../i18n/t'
 
 /**
@@ -46,6 +46,14 @@ import { i18nT } from '../../i18n/t'
  */
 const DecisionsPointPanel = lazy(async () => ({
   default: (await import('./DecisionsPointPanel')).DecisionsPointPanel,
+}))
+
+/**
+ * The decision-model picker, on the same kind of boundary: none of its controls is
+ * in the settings registry, so search never probes for it.
+ */
+const DecisionsProviderPicker = lazy(async () => ({
+  default: (await import('./DecisionsProviderPicker')).DecisionsProviderPicker,
 }))
 
 /**
@@ -543,7 +551,19 @@ export function DecisionsCard() {
           {i18nT('pages.developer.featurePreviewsTab.decisions_endpoint_pointer')}
         </p>
       )}
-      {view.supported && <DecisionsProviderPicker frozen={frozen} />}
+      {/* A hand-written loopback address is sent no Jev key; a tunnel to hosted Jev
+          would then fail with 401 and decisions would quietly stop, so say it here,
+          where the owner is looking, not only in the gateway log. */}
+      {view.supported && providerQ.data?.active === 'custom' && providerQ.data.loopback === true && (
+        <p className="text-[12px] text-warn">
+          {i18nT('pages.developer.featurePreviewsTab.decisions_custom_loopback_no_key')}
+        </p>
+      )}
+      {view.supported && (
+        <Suspense fallback={<div className="h-24" aria-hidden />}>
+          <DecisionsProviderPicker frozen={frozen} cardReadFailed={readFailed} />
+        </Suspense>
+      )}
       {/* The redirected-config state: consent stands for one address, config.json now
           names another, so nothing is sent. A WARNING, not a paragraph: it is the one
           state where the switch reads "on" and the truth is "off". */}
