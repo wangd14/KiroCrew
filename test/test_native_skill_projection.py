@@ -252,6 +252,38 @@ def test_explicit_search_exclusion_fails_only_that_agent(native_tree):
         prepared.agent("custom")
 
 
+def test_spawn_agent_keeps_the_authored_name_when_no_view_is_prepared():
+    """A spawn of an agent the projection never prepared uses its own name.
+
+    ``prepare_native_skill_projection`` returns a projection even when it mapped
+    no agents (a work_dir carrying no matching spec), so the spawn path asks
+    ``spawn_agent`` rather than the strict ``agent``: an unprojected agent keeps
+    its authored transport name -- the same answer a ``None`` projection gives --
+    instead of aborting the spawn. The strict ``agent`` still rejects it, because
+    that resolver guards ``session/set_mode``.
+    """
+    prepared = projection.NativeSkillProjection({"custom": "native-alias"})
+    assert prepared.spawn_agent("custom") == "native-alias"
+    assert prepared.spawn_agent("kirocrew") == "kirocrew"
+    with pytest.raises(ValueError, match="no prepared"):
+        prepared.agent("kirocrew")
+
+
+def test_spawn_agent_still_raises_an_authored_restriction():
+    """An authored refusal is a user-facing spawn refusal, not a silent skip.
+
+    A ``kirocrew-core`` exclusion or a disabled ``skill_search`` records an
+    ``errors`` entry naming the spec and the remedy; ``spawn_agent`` raises it so
+    the runtime can wrap it as ``AcpRuntimeError`` and the startup paths can
+    translate the sentence, exactly as the strict ``agent`` does.
+    """
+    prepared = projection.NativeSkillProjection(
+        {}, errors={"custom": "skill_search is explicitly excluded; ..."}
+    )
+    with pytest.raises(ValueError, match="explicitly excluded"):
+        prepared.spawn_agent("custom")
+
+
 def test_unmapped_custom_agent_does_not_gain_tools_or_servers(native_tree):
     _home, agents, project = native_tree
     spec = {"name": "custom", "tools": ["read"], "excludedTools": ["@kirocrew-core/skill_search"]}

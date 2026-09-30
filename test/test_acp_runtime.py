@@ -2074,7 +2074,7 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
         await runtime.spawn()
 
     if project_skills:
-        native_agent = runtime._native_skill_projection.agent(runtime._agent)
+        native_agent = runtime._native_skill_projection.spawn_agent(runtime._agent)
     else:
         assert runtime._native_skill_projection is None
         native_agent = runtime._agent

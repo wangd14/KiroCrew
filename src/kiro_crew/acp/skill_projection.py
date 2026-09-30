@@ -397,6 +397,26 @@ class NativeSkillProjection:
             raise ValueError(f"Agent {name!r} has no prepared skill discovery view")
         return self.aliases[name]
 
+    def spawn_agent(self, name: str) -> str:
+        """Resolve the ``--agent`` transport name for a spawn, tolerating no view.
+
+        The strict :meth:`agent` guards ``session/set_mode``: a mid-session
+        switch to a mode this projection never prepared must be rejected, so an
+        agent cannot escape the scope it was launched under. Spawn selection asks
+        a softer question. An agent whose spec an authored restriction refused --
+        a ``kirocrew-core`` exclusion, a disabled ``skill_search`` -- is a
+        user-facing spawn refusal that still raises (the callers wrap it as
+        ``AcpRuntimeError`` and the startup paths translate the sentence). An
+        agent that simply has no prepared view -- its spec is not among the
+        projected agents, as in a work_dir that carries no such spec -- keeps its
+        authored transport name, the same answer a ``None`` projection gives: the
+        agent spawns under its own name rather than aborting an otherwise valid
+        spawn over a skill view it never asked for.
+        """
+        if is_skill_view_name(name) or name in self.aliases or name in self.errors:
+            return self.agent(name)
+        return name
+
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "session/set_mode":
             return {**params, "modeId": self.agent(str(params.get("modeId", "")))}

@@ -7553,7 +7553,7 @@ class AcpClient:
                 KIRO_CLI_SUBCMD,
                 "--agent",
                 (
-                    self._native_skill_projection.agent(self._agent)
+                    self._native_skill_projection.spawn_agent(self._agent)
                     if self._native_skill_projection is not None
                     else self._agent
                 ),

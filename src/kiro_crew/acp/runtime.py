@@ -1874,7 +1874,9 @@ class AcpRuntime:
                     argv = list(argv)
                     agent_position = argv.index("--agent") + 1
                     try:
-                        argv[agent_position] = self._native_skill_projection.agent(self._agent)
+                        argv[agent_position] = self._native_skill_projection.spawn_agent(
+                            self._agent
+                        )
                     except ValueError as exc:
                         # The projection refused this agent's view -- a
                         # ``kirocrew-core`` restriction authored in its spec, a
@@ -1884,7 +1886,10 @@ class AcpRuntime:
                         # paths translate (``providers/acp.py`` handles
                         # ``AcpRuntimeError`` around ``spawn()``); a bare
                         # ``ValueError`` would leave ``spawn()`` as an internal
-                        # failure with the actionable text unread.
+                        # failure with the actionable text unread. ``spawn_agent``
+                        # raises only for that authored refusal; an agent with no
+                        # prepared view keeps its authored name and never lands
+                        # here.
                         raise AcpRuntimeError(str(exc)) from exc
         except _KiroExecutableTrustError as exc:
             raise AcpRuntimeError(str(exc)) from exc
