@@ -793,7 +793,11 @@ fabricated recommendations.
 
 The primary New crewmate action and Assistant proposals open the same embedded
 `MeetCrewmatesFlow`: goal, name, schedule and confirmation in the chapter shell's
-split-panel layout. No modal, viewport scrim or focus trap is added. The current
+split-panel layout. The embedded shell retains the original 760px height and
+6xl width caps and the same four-mascot composition. From `xl` its aside takes the
+original shell's widest 415px and shows all four mascots; narrower asides show
+none, since the page navigation leaves no room for them beside the copy.
+No modal, viewport scrim or focus trap is added. The current
 chat stays mounted while hidden, preserving its draft and reading position.
 Back returns to it and retains the unfinished creation draft; navigation away
 warns before losing that draft. A proposal cannot replace an edited draft.

@@ -17,6 +17,9 @@ try {
   browser = await chromium.launch()
   for (const { width, lang, theme } of [
     { width: 1440, lang: 'en', theme: 'light' },
+    { width: 1280, lang: 'en', theme: 'light' },
+    { width: 1024, lang: 'en', theme: 'light' },
+    { width: 1800, lang: 'en', theme: 'light' },
     { width: 390, lang: 'en', theme: 'light' },
     { width: 320, lang: 'en', theme: 'light' },
     { width: 390, lang: 'de', theme: 'dark' },
@@ -27,8 +30,8 @@ try {
     const page = await ctx.newPage()
     await ctx.route('**/*', route => new URL(route.request().url()).origin === base ? route.continue() : route.abort())
     const shot = async (name) => {
-      // The layout animation lasts 380ms; capture its settled landing, not an intermediate frame.
-      await page.waitForTimeout(600)
+      // Capture after both the layout transition and the final mascot entrance.
+      await page.waitForTimeout(1600)
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false, `${name}: horizontal overflow`)
       await page.screenshot({ path: resolve(output, `${name}-${suffix}.png`) })
     }
@@ -122,9 +125,32 @@ try {
     await openCreation()
     assert.equal(await page.getByTestId('meet-crewmates-goal').inputValue(), 'Prepare a weekly progress update for my review.')
     await shot('assistant-create')
+    const panel = page.getByTestId('onboarding-chapter-embedded')
+    const visibleGhosts = panel.locator('aside .pointer-events-none:visible')
+    assert.equal(await visibleGhosts.count(), width < 1280 ? 0 : 4, 'four original ghosts on wide screens only')
+    if (width >= 1280) {
+      const brand = await panel.locator('aside span').first().boundingBox()
+      const right = await panel.locator('aside .pointer-events-none').nth(1).boundingBox()
+      assert.ok(right.x >= brand.x + brand.width, 'right ghost clears the brand lockup')
+    }
+    if (width >= 1280) {
+      const brand = await panel.locator('aside span').first().boundingBox()
+      const top = await panel.locator('aside .pointer-events-none').nth(3).boundingBox()
+      assert.ok(top.x >= brand.x + brand.width, 'top ghost clears the brand lockup')
+    }
+    if (width >= 640) {
+      const [box, pane] = [await panel.boundingBox(), await page.getByTestId('member-create-guided').boundingBox()]
+      assert.ok(Math.abs(box.width - pane.width) <= 1 && Math.abs(box.height - pane.height) <= 1, 'embedded panel fills its pane')
+    }
     await page.getByTestId('meet-crewmates-next').click()
     await page.getByTestId('meet-crewmates-name').fill('Scout')
     await page.getByTestId('meet-crewmates-next').click()
+    // The footer can enter before the preceding chapter has finished exiting.
+    await page.getByTestId('meet-crewmates-step-3').waitFor()
+    await page.waitForFunction(() => {
+      const step = document.querySelector('[data-testid="meet-crewmates-step-3"]')
+      return step && getComputedStyle(step).opacity === '1'
+    })
     await page.getByTestId('meet-crewmates-create').click()
     await page.getByTestId('meet-crewmates-ready').waitFor()
     assert.equal(creates, 1)

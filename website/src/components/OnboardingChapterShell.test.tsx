@@ -109,6 +109,20 @@ describe('OnboardingChapterShell embedded', () => {
     expect(screen.getByRole('button', { name: 'Next' }).closest('footer')!.className).toContain('sticky')
   })
 
+  it('keeps the original four-ghost composition and fills its host region', () => {
+    renderEmbedded()
+    const region = screen.getByRole('region', { name: 'Chapter' })
+    expect(region).toHaveClass('flex-1', 'sm:h-full')
+    expect(region).not.toHaveClass('sm:max-h-[760px]', 'sm:max-w-6xl')
+    const ghosts = Array.from(region.querySelectorAll('aside .pointer-events-none'))
+    expect(ghosts).toHaveLength(4)
+    expect(ghosts[0]).toHaveClass('-left-8', 'top-[24%]', 'xl:block')
+    expect(ghosts[1]).toHaveClass('-right-5', 'top-5', 'xl:block')
+    expect(ghosts[2]).toHaveClass('bottom-[-6.5rem]', 'right-[-10rem]', 'xl:block')
+    expect(ghosts[3]).toHaveClass('-top-20', 'left-[40%]', 'xl:block')
+    expect(region.querySelector('aside')).toHaveClass('xl:w-[415px]')
+  })
+
   it('ignores an enclosing modal host', () => {
     const { container } = renderEmbedded(node => <OnboardingShellHost>{node}</OnboardingShellHost>)
     expect(screen.queryByRole('dialog')).toBeNull()

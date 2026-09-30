@@ -62,16 +62,19 @@ function FloatingGhost({
 // copy that drifts.
 export function ShellAside({ copy, compact = false }: { copy: ShellAsideCopy; compact?: boolean }) {
   return (
-    <aside className={`relative flex ${compact ? 'min-h-[160px]' : 'min-h-[248px]'} w-full shrink-0 overflow-hidden bg-accent text-accent-fg sm:min-h-0 sm:w-[36%]`}>
-      <FloatingGhost className="-left-8 top-[24%] hidden h-24 w-20 rotate-90 sm:block lg:h-28 lg:w-24" delay={0.15} rotate={90} />
-      <FloatingGhost className="-right-5 top-5 hidden h-28 w-20 -rotate-12 sm:block lg:h-36 lg:w-28" delay={0.35} rotate={-12} />
+    <aside className={`relative flex ${compact ? 'min-h-[160px] sm:w-[36%] xl:w-[415px]' : 'min-h-[248px] sm:w-[36%]'} w-full shrink-0 overflow-hidden bg-accent text-accent-fg sm:min-h-0`}>
+      <FloatingGhost className={`-left-8 top-[24%] hidden h-24 w-20 rotate-90 ${compact ? 'xl:block xl:-left-3 xl:h-28 xl:w-24' : 'sm:block lg:h-28 lg:w-24'}`} delay={0.15} rotate={90} />
+      <FloatingGhost className={`-right-5 top-5 hidden h-28 w-20 -rotate-12 ${compact ? 'xl:block xl:h-36 xl:w-28' : 'sm:block lg:h-36 lg:w-28'}`} delay={0.35} rotate={-12} />
       {/* Peeks in 2rem from the panel edge: the mascot is near-white and the
           copy column paints in near-white too, so any overlap renders text
           white-on-white. The visible sliver stays inside the panel's own
           padding gutter, so no text in any of the shell's consumers can run
           under it, at any width or copy length. */}
-      <FloatingGhost className="bottom-[-6.5rem] right-[-10rem] hidden h-64 w-48 lg:block" delay={0.55} />
-      <FloatingGhost className="-top-20 left-[40%] hidden h-48 w-36 rotate-180 lg:block" delay={0.75} rotate={180} />
+      {/* Embedded: the page's own navigation narrows this aside well below the
+          modal's. The original four-mascot set needs its 415px aside, reached
+          from xl; a narrower aside would run mascots over the brand and copy. */}
+      <FloatingGhost className={`bottom-[-6.5rem] right-[-10rem] hidden h-64 w-48 ${compact ? 'xl:block xl:bottom-[-4rem] xl:right-[-4.5rem]' : 'lg:block'}`} delay={0.55} />
+      <FloatingGhost className={`-top-20 left-[40%] hidden h-48 w-36 rotate-180 ${compact ? 'xl:block xl:-top-10' : 'lg:block'}`} delay={0.75} rotate={180} />
       <div className={`relative z-10 flex w-full flex-col ${compact ? 'p-5' : 'p-7'} sm:p-10`}>
         <div className="flex items-center gap-3">
           <KiroGhost size={28} className="h-8 w-7" />
@@ -124,7 +127,7 @@ export const PINNED_FOOTER_CLASS = 'sticky bottom-0 z-10 bg-card sm:static'
 // to that scrollport's bottom (`overflow-clip`, never `overflow-hidden`, so the
 // panel does not become the sticky footer's scrollport).
 export const EMBEDDED_PANEL_CLASS =
-  'relative flex w-full min-h-0 flex-col overflow-clip bg-card sm:h-full sm:flex-row sm:rounded-2xl sm:border sm:border-border'
+  'relative flex w-full min-h-0 flex-1 flex-col overflow-clip bg-card sm:h-full sm:flex-row sm:rounded-2xl sm:border sm:border-border'
 export const EMBEDDED_SECTION_CLASS = 'flex min-w-0 flex-1 flex-col bg-card sm:min-h-0'
 
 export interface ShellAsideCopy {
