@@ -83,6 +83,12 @@ MAX_INFO_PLIST_BYTES = 512 * 1024
 IDENTITY_CACHE_TTL_SECS = 60.0
 MAX_CACHED_IDENTITIES = 64
 
+# The ``kCGWindowOwnerName`` of the Dock process. Its full-screen backing window
+# is a transparent, click-through backstop that ``pid_owns_point`` must look past
+# (see ``_is_dock_backstop``); the string is the only signal in the window list
+# that ties a window to the Dock rather than to a target application.
+_DOCK_OWNER_NAME = "Dock"
+
 
 @dataclass(frozen=True)
 class AppIdentity:
@@ -486,14 +492,27 @@ def pid_owns_point(pid: int, x: float, y: float) -> bool:
             left, top, width, height = bounds
             if not (left <= x < left + width and top <= y < top + height):
                 continue
-            # FIRST containing window in z-order wins, whatever its layer. A
-            # non-normal window is NOT skipped here, which is the opposite of what
-            # ``list_apps`` does and deliberately so: this function answers "what
-            # would a physical click at this pixel hit?", and a notification banner,
-            # a menu-bar extra or an open menu sitting above the authorized app
-            # really would receive that click. Skipping those layers let the app
-            # UNDERNEATH grant permission for a click the operator's own overlay was
-            # about to swallow — the very confinement this function exists to
+            if _is_dock_backstop(info, left, top):
+                # The Dock keeps a full-screen backing window anchored at the
+                # screen's top-left corner, above every layer-0 app window. It is
+                # transparent and click-THROUGH everywhere except the Dock strip,
+                # so a physical click at this pixel passes STRAIGHT through it to
+                # the window underneath — the window server's hit test ignores it.
+                # "rectangle contains point" is only a stand-in for that hit test,
+                # and this backstop is exactly where the two diverge: honouring it
+                # refuses every point on the display for every app. The Dock STRIP
+                # is a separate, smaller Dock window that is NOT anchored at the
+                # top-left corner, so it is not matched here and still blocks a
+                # click that would really land on it.
+                continue
+            # FIRST remaining containing window in z-order wins, whatever its
+            # layer. A non-normal window is NOT skipped here, which is the opposite
+            # of what ``list_apps`` does and deliberately so: this function answers
+            # "what would a physical click at this pixel hit?", and a notification
+            # banner, a menu-bar extra or an open menu sitting above the authorized
+            # app really would receive that click. Skipping those layers let the
+            # app UNDERNEATH grant permission for a click the operator's own overlay
+            # was about to swallow — the very confinement this function exists to
             # provide. ``list_apps`` skips them for the unrelated reason that they
             # are not addressable TARGETS.
             return info.pid == pid and info.layer == macos_ffi.CG_WINDOW_LAYER_NORMAL
@@ -501,6 +520,32 @@ def pid_owns_point(pid: int, x: float, y: float) -> bool:
     except Exception:
         logger.debug("point ownership check failed; refusing", exc_info=True)
         return False
+
+
+def _is_dock_backstop(info: "macos_ffi.WindowInfo", left: float, top: float) -> bool:
+    """Is *info* the Dock's transparent, click-through, full-screen backstop?
+
+    The only window this passes through in ``pid_owns_point``. It is bound tightly
+    to the Dock so it can never match a real application window or an interactive
+    overlay:
+
+    * ``owner_name == "Dock"`` — owned by the Dock process, not any target app.
+    * a NON-normal layer — a layer-0 window is a real app window and is never
+      skipped, whatever its owner.
+    * anchored at the screen's top-left corner (``left <= 0`` and ``top <= 0``) —
+      the backstop spans the whole display from the origin, while the Dock STRIP
+      (the icons the operator can click) sits at the bottom or a side edge and is
+      never anchored at the top-left, so the strip still blocks a click over it.
+
+    Failing this predicate keeps the guard fully closed, which is the safe default:
+    a window that is not provably this backstop is treated as a real overlay.
+    """
+    return (
+        info.owner_name == _DOCK_OWNER_NAME
+        and info.layer != macos_ffi.CG_WINDOW_LAYER_NORMAL
+        and left <= 0
+        and top <= 0
+    )
 
 
 __all__ = [

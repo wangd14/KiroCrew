@@ -736,3 +736,122 @@ class TestMultiWindowHostPrefersTheDeniedTitle:
     def test_a_browser_with_no_dashboard_window_is_untouched(self, monkeypatch):
         app = self._resolved(monkeypatch, ("Hacker News", "GitHub"))
         assert policy.check_app(app, PolicyConfig()) is None
+
+
+# ── the Dock full-screen backstop (pid_owns_point) ──
+
+
+class TestPidOwnsPointDockBackstop:
+    """``pid_owns_point`` must look past the Dock's full-screen backing window.
+
+    The live finding, reconstructed from the reporter's on-screen window list.
+    The Dock keeps a transparent, click-THROUGH window at a non-normal layer whose
+    bounds are the whole display, anchored at the top-left corner and sitting above
+    every layer-0 app window. A physical click passes straight through it, but the
+    "first rectangle that contains the point" walk returned ON it, so the guard
+    refused every point of every app. These cases pin both the fix and the
+    confinement it must NOT relax.
+    """
+
+    _TARGET_PID = 9590  # 微信 (WeChat), the authorized app
+    _DOCK_PID = 2071
+    _DISPLAY_W = 3440.0
+    _DISPLAY_H = 1440.0
+
+    def _dock_backstop(self) -> macos_ffi.WindowInfo:
+        # z=1 layer=20, x=0 y=0 3440x1440, alpha 1.0, full display.
+        return macos_ffi.WindowInfo(
+            window_id=1,
+            pid=self._DOCK_PID,
+            owner_name="Dock",
+            title="Dock",
+            layer=20,
+            bounds=(0.0, 0.0, self._DISPLAY_W, self._DISPLAY_H),
+        )
+
+    def _target_window(self) -> macos_ffi.WindowInfo:
+        # z=3 layer=0, x=1772 y=329 1222x920, the authorized app's window.
+        return macos_ffi.WindowInfo(
+            window_id=3,
+            pid=self._TARGET_PID,
+            owner_name="微信",
+            title="微信",
+            layer=macos_ffi.CG_WINDOW_LAYER_NORMAL,
+            bounds=(1772.0, 329.0, 1222.0, 920.0),
+        )
+
+    def test_point_inside_the_app_is_owned_despite_the_dock_backstop(self, monkeypatch):
+        # (1953, 1107): inside WeChat, under the Dock backstop, nothing else.
+        _stub_windows(monkeypatch, [self._dock_backstop(), self._target_window()])
+        assert apps_macos.pid_owns_point(self._TARGET_PID, 1953.0, 1107.0) is True
+
+    def test_the_window_geometric_centre_is_owned(self, monkeypatch):
+        # (2383, 789): the window's own centre — refused before the fix.
+        _stub_windows(monkeypatch, [self._dock_backstop(), self._target_window()])
+        assert apps_macos.pid_owns_point(self._TARGET_PID, 2383.0, 789.0) is True
+
+    def test_a_point_over_no_app_is_still_unowned(self, monkeypatch):
+        # Over only the backstop, no layer-0 window beneath: nobody owns it, so
+        # the guard still fails closed rather than granting the click.
+        _stub_windows(monkeypatch, [self._dock_backstop(), self._target_window()])
+        assert apps_macos.pid_owns_point(self._TARGET_PID, 100.0, 100.0) is False
+
+    def test_a_different_apps_window_above_the_target_still_blocks(self, monkeypatch):
+        # Confinement preserved: a real layer-0 window of ANOTHER app above the
+        # target owns the pixel, and the click would land on it — refuse.
+        other = macos_ffi.WindowInfo(
+            window_id=2,
+            pid=24040,
+            owner_name="iTerm2",
+            title="",
+            layer=macos_ffi.CG_WINDOW_LAYER_NORMAL,
+            bounds=(1900.0, 1000.0, 400.0, 300.0),
+        )
+        _stub_windows(monkeypatch, [self._dock_backstop(), other, self._target_window()])
+        # (2000, 1100): inside iTerm2 (above) and inside WeChat (below).
+        assert apps_macos.pid_owns_point(self._TARGET_PID, 2000.0, 1100.0) is False
+
+    def test_the_dock_strip_itself_still_blocks(self, monkeypatch):
+        # The Dock STRIP is a separate, smaller Dock window at the bottom edge,
+        # NOT anchored at the top-left, so it is not the backstop and a click over
+        # the icons is still refused — a real click there hits the Dock.
+        strip = macos_ffi.WindowInfo(
+            window_id=4,
+            pid=self._DOCK_PID,
+            owner_name="Dock",
+            title="",
+            layer=20,
+            bounds=(1420.0, 1360.0, 600.0, 80.0),
+        )
+        _stub_windows(monkeypatch, [strip, self._dock_backstop(), self._target_window()])
+        # A point inside the strip's rect.
+        assert apps_macos.pid_owns_point(self._TARGET_PID, 1720.0, 1400.0) is False
+
+    def test_a_full_screen_NON_dock_overlay_still_blocks(self, monkeypatch):
+        # Only the Dock is passed through. A full-screen window owned by any other
+        # process (a real overlay) is not the backstop and still confines.
+        overlay = macos_ffi.WindowInfo(
+            window_id=5,
+            pid=7777,
+            owner_name="Some Overlay",
+            title="",
+            layer=20,
+            bounds=(0.0, 0.0, self._DISPLAY_W, self._DISPLAY_H),
+        )
+        _stub_windows(monkeypatch, [overlay, self._target_window()])
+        assert apps_macos.pid_owns_point(self._TARGET_PID, 1953.0, 1107.0) is False
+
+    def test_a_layer_zero_window_named_dock_is_never_passed_through(self, monkeypatch):
+        # The layer guard comes first: a real (layer-0) window is never treated as
+        # the backstop, whatever its owner name, so a spoofed owner cannot unlock a
+        # click on an app the target does not own.
+        impostor = macos_ffi.WindowInfo(
+            window_id=6,
+            pid=8888,
+            owner_name="Dock",
+            title="",
+            layer=macos_ffi.CG_WINDOW_LAYER_NORMAL,
+            bounds=(0.0, 0.0, self._DISPLAY_W, self._DISPLAY_H),
+        )
+        _stub_windows(monkeypatch, [impostor, self._target_window()])
+        assert apps_macos.pid_owns_point(self._TARGET_PID, 1953.0, 1107.0) is False
