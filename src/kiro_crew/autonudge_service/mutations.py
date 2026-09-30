@@ -804,9 +804,10 @@ async def _update_unserialized(
                     # silence this stop exists to end.
                     if not was_active:
                         loop.approval_stalled = False
-                        # Same rule, same reason: the streak is evidence
+                        # Same rule, same reason: the streaks are evidence
                         # about a PAST run, and a revival starts a fresh one.
                         loop.consecutive_start_failures = 0
+                        loop.consecutive_failed_cycles = 0
                 else:
                     loop.stopped_reason = stopped_reason or MANUAL_STOP_REASON
         revived = loop.active and not was_active

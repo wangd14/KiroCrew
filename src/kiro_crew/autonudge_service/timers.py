@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew import shutdown_event
 from kiro_crew.autonudge_service.model import (
+    _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
     _START_FAILURE_BACKOFF_AFTER,
     _START_FAILURE_STANDDOWN_AFTER,
     NudgeLoop,
@@ -151,18 +152,53 @@ def notify_cycle_start_failed(self: AutoNudgeService, slot_key: str) -> None:
     self._persist_soon()
 
 
-def notify_cycle_landed(self: AutoNudgeService, slot_key: str) -> None:
-    """Clear *slot_key*'s start-failure streak: a turn on it completed.
+def notify_cycle_failed(self: AutoNudgeService, slot_key: str) -> None:
+    """Record that this loop's own delivered cycle in *slot_key* ended in a fault.
 
-    Any landed turn counts, a human's as much as a cycle's -- the streak is a
-    reading of whether this session can start at all, and a turn that reached
-    completion proves it can. That is the conservative direction: it can only
-    let a loop keep running, never stop one.
+    Called from the chat runner's turn-complete path when the completed turn was
+    THIS loop's own nudge cycle and its outcome was ``error`` or ``timeout`` -- a
+    turn that reached a model session and dispatched, then died. Evidence, not
+    inference: the loop spent a turn and it failed, which is the one thing that
+    distinguishes a loop making no progress from a quiet one.
+
+    Only the loop's OWN cycle counts (the chat runner passes the self-wake +
+    landed test before calling this), so a human turn that happened to error on a
+    slot carrying a loop cannot spend the loop's stand-down budget. That is the
+    same guard ``notify_cycle_start_failed`` relies on, and for the same reason.
+
+    Records and returns. Like ``notify_approval_stalled`` and
+    ``notify_cycle_start_failed``, the decision is left to ``_timer``, which owns
+    every terminal and scheduling decision and evaluates them serialized before a
+    fire -- deciding here would mean touching a timer that may be mid-fire.
     """
     loop = self._find_by_slot(slot_key)
-    if not loop or not loop.consecutive_start_failures:
+    if not loop or not loop.active:
+        return
+    loop.consecutive_failed_cycles += 1
+    logger.warning(
+        "AutoNudge: loop %s's cycle failed (%d consecutive); it will stand down "
+        "at %d unless a turn lands first",
+        loop.id,
+        loop.consecutive_failed_cycles,
+        _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
+    )
+    self._persist_soon()
+
+
+def notify_cycle_landed(self: AutoNudgeService, slot_key: str) -> None:
+    """Clear *slot_key*'s failure streaks: a turn on it completed.
+
+    Any landed turn counts, a human's as much as a cycle's -- the streaks are a
+    reading of whether this session can start (``consecutive_start_failures``)
+    and make progress (``consecutive_failed_cycles``) at all, and a turn that
+    reached completion proves both. That is the conservative direction: it can
+    only let a loop keep running, never stop one.
+    """
+    loop = self._find_by_slot(slot_key)
+    if not loop or not (loop.consecutive_start_failures or loop.consecutive_failed_cycles):
         return
     loop.consecutive_start_failures = 0
+    loop.consecutive_failed_cycles = 0
     # Drop the paid-deferral marker with the streak it belonged to: a streak
     # that climbs back to the same value must pay its own deferral again.
     self._start_failure_deferred.pop(loop.id, None)

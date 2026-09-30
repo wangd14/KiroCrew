@@ -84,6 +84,7 @@ from kiro_crew.autonudge_service.maintenance import (  # noqa: F401 -- re-export
 )
 from kiro_crew.autonudge_service.model import (  # noqa: F401 -- re-exported
     _CHANNEL_KEY_PREFIXES,
+    _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
     _MAX_IDLE_SECS,
     _MIN_IDLE_SECS,
     _REPLACEABLE_LOOP_STOP_REASONS,
@@ -92,6 +93,7 @@ from kiro_crew.autonudge_service.model import (  # noqa: F401 -- re-exported
     _TERMINAL_BOUND_REASONS,
     APPROVAL_STALL_REASON,
     AUTONUDGE_STOP_REASON,
+    CONSECUTIVE_FAILURE_REASON,
     MANUAL_STOP_REASON,
     MONITOR_TERMINAL_REASON,
     NUDGE_RENEW_DUE_SHARE,
@@ -1211,6 +1213,15 @@ class AutoNudgeService:
                 loop.consecutive_start_failures = int(streak_num)
                 if streak_repaired:
                     self._store_dirty = True
+                # ``consecutive_failed_cycles`` is compared with ``>=`` on every
+                # wake too, for the same agent-writable-store reason, so it is
+                # normalised at the boundary alongside its sibling above.
+                failed_num, failed_repaired = _repair_number(
+                    loop.consecutive_failed_cycles, lo=0.0, fallback=0.0
+                )
+                loop.consecutive_failed_cycles = int(failed_num)
+                if failed_repaired:
+                    self._store_dirty = True
                 if (
                     loop.monitor is not None
                     and loop.monitor.version == MONITOR_STATE_VERSION
@@ -1656,6 +1667,7 @@ class AutoNudgeService:
     # autonudge_service.timers
     notify_approval_stalled = _timers.notify_approval_stalled
     notify_cycle_start_failed = _timers.notify_cycle_start_failed
+    notify_cycle_failed = _timers.notify_cycle_failed
     notify_cycle_landed = _timers.notify_cycle_landed
     notify_turn_complete = _timers.notify_turn_complete
     notify_user_input = _timers.notify_user_input

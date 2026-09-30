@@ -20370,6 +20370,35 @@ async def _run_chat(
                 # that can only fail the same way. Read with getattr: the two ACP
                 # exception families tag this fact independently and share no base.
                 _note_cycle_start_failure(slot.key, exc, self_wake=_directive_self_wake)
+                # A cycle that DID reach a model session and dispatched but then
+                # died terminally here -- a backend error after retries were spent,
+                # a persistent tool error, a prompt timeout. Same scope rule as the
+                # two verdicts above (only a self-driven nudge fire counts, never a
+                # human turn that happened to error on a slot carrying a loop), and
+                # EXCLUDING the two cases those already own: a structural rejection
+                # (its own stop) and a session-start failure (its own streak). What
+                # is left is the generic failed cycle the narrow bounds miss --
+                # recorded on the loop (``notify_cycle_failed``), which stands the
+                # loop down after enough in a row rather than letting it fire cycle
+                # after cycle that only fails the same way. A landed turn on the
+                # slot clears the streak, so a loop that recovers is never held
+                # back. getattr-guarded: only some exceptions carry the two tags,
+                # and this branch also catches plain errors.
+                if (
+                    _directive_self_wake
+                    and not getattr(exc, "structural_terminal", False)
+                    and getattr(exc, "session_start_failed", False) is not True
+                ):
+                    try:
+                        from kiro_crew.autonudge import (
+                            get_instance as _autonudge_failed_get,  # circular: autonudge -> dashboard.chat -> chat_runner
+                        )
+
+                        _failed_svc = _autonudge_failed_get()
+                        if _failed_svc is not None:
+                            _failed_svc.notify_cycle_failed(slot.key)
+                    except Exception:
+                        logger.debug("autonudge.notify_cycle_failed failed", exc_info=True)
                 # This branch ENDS the retry cycle: the error is terminal and
                 # nothing is re-queued. Refresh the transient-5xx budget now so the
                 # NEXT cycle — the Continue press this very error message invites
