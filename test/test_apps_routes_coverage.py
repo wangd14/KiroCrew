@@ -30,6 +30,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from dashboard_owner_helpers import as_owner
+from test_update_provider import _UNALLOCATABLE_PID
 
 import kiro_crew.apps.routes as routes_mod
 from conftest import requires_symlinks
@@ -2523,7 +2524,7 @@ class TestOpenApp:
 
         async def _spawn(*argv: str, **kwargs: Any) -> Any:
             spawned.append(argv)
-            return SimpleNamespace(pid=4321)
+            return SimpleNamespace(pid=_UNALLOCATABLE_PID)
 
         monkeypatch.setattr(routes_mod, "create_subprocess_limited", _spawn)
         app = _make_app(app_identity=app_identity, dashboard_user=dashboard_user)

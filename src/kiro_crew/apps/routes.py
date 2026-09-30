@@ -2281,9 +2281,9 @@ async def handle_open_app(request: web.Request) -> web.Response:
     # local import: avoids a circular import with dashboard.handlers
     from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 
-    denied = await require_owner_dashboard_request(request, "app_open")
-    if denied is not None:
-        return denied
+    owner_denied = await require_owner_dashboard_request(request, "app_open")
+    if owner_denied is not None:
+        return owner_denied
     name = request.match_info["name"]
     info = get_app(name)
     if not info:
