@@ -11,13 +11,14 @@ import asyncio
 import base64
 import errno
 import io
+import json
 import logging
 import os
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from kiro_crew import platform_compat
 
@@ -567,6 +568,107 @@ def _read_bytes(target: Path, max_bytes: int | None) -> bytes:
         return target.read_bytes()
     with target.open("rb") as handle:
         return handle.read(max_bytes)
+
+
+#: The default: emit the read-degrade warning at most once per (logger, path) in
+#: a process. A read that keeps losing to a concurrent writer would otherwise
+#: repeat the line every poll cycle; one line names the degrade, and a caller
+#: with a hot site that wants none opts its call out with ``rate_limit=False``.
+_READ_DEGRADE_SEEN: set[tuple[str, str]] = set()
+_READ_DEGRADE_SEEN_LOCK = threading.Lock()
+
+
+def read_json_or(
+    path: Path | str,
+    default: Any,
+    *,
+    logger: logging.Logger,
+    what: str | None = None,
+    rate_limit: bool = True,
+) -> Any:
+    """``json.loads`` a small file, returning ``default`` and SIGNALLING a degrade.
+
+    The read-side companion to the many hand-written
+    ``try: json.loads(path.read_text()) except (OSError, ...): return <fallback>``
+    guards in the tree. Those fold three distinct outcomes into one silent
+    fallback, so a genuinely absent file and a momentary read failure look
+    identical in ``kirocrew logs``. This helper keeps the tolerance and adds one
+    signal for the case that was mute:
+
+    * **Absent** (``FileNotFoundError``) -- return ``default`` silently. The
+      ordinary "no file yet" case; nothing has degraded.
+    * **Malformed / undecodable** (``json.JSONDecodeError``, a decode error, or
+      any other ``ValueError``) -- return ``default`` silently. Preserves the
+      deliberate decode-tolerance the callers already have: a damaged or
+      wrong-encoding file must not crash the reader, and sleeping cannot mend it.
+    * **A non-absent ``OSError`` / ``PermissionError``** -- emit exactly one
+      ``logger.warning`` and return ``default``. On Windows a read of a whole,
+      correct file raises ``PermissionError`` (``WinError 32``) while another
+      handle holds it open for a tmp-file-plus-``os.replace`` write, the read
+      twin of the window :func:`replace_with_retry` survives. POSIX permits the
+      read, so this leg fires only on a real fault there. This is the outcome the
+      hand-written guards were silent about.
+
+    The bytes are read through :func:`read_bytes_with_retry`, so the Windows
+    sharing-violation window is retried first (off the event loop) and only a
+    degrade that OUTLASTS the retry budget reaches the warning -- retry and
+    signal compose, they do not duplicate.
+
+    The warning carries only an exception-class name, a fixed outcome word, and
+    the caller's optional *what* label. It NEVER carries the path, the file
+    bytes, a slug, a URL, a secret, or any subject key -- a log line about a
+    degraded read must not become a channel for the content that failed to read.
+
+    *logger* is the caller's own module logger, so the line is attributed to the
+    site that degraded. *what* is a short, non-sensitive noun for the document
+    ("dev_fleet config", "issue signals") when the module logger name alone is
+    not enough to place it. *rate_limit* (on by default) bounds the warning to
+    one line per (logger, path) per process; a hot caller may pass ``False``.
+    """
+    target = Path(path)
+    try:
+        raw = read_bytes_with_retry(target)
+    except FileNotFoundError:
+        # Genuinely absent -- the ordinary "no file yet" case. Silent, as before.
+        return default
+    except OSError as exc:
+        # A file that EXISTS but could not be read: the Windows sharing-violation
+        # window that outlasted the retry, or a real access fault. This is the
+        # leg the hand-written guards folded into the absent case with no signal.
+        _warn_read_degrade(logger, target, exc, what, rate_limit)
+        return default
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        # Malformed JSON or undecodable bytes -- damaged or wrong-encoding file.
+        # Silent and tolerant exactly as before; a retry cannot repair content.
+        # ``json.JSONDecodeError`` is a ``ValueError``, so both are caught here.
+        return default
+
+
+def _warn_read_degrade(
+    logger: logging.Logger,
+    path: Path,
+    exc: OSError,
+    what: str | None,
+    rate_limit: bool,
+) -> None:
+    """Emit the single read-degrade WARNING, rate-limited by (logger, path).
+
+    The path is the rate-limit KEY only -- it is never part of the emitted line.
+    """
+    if rate_limit:
+        key = (logger.name, str(path))
+        with _READ_DEGRADE_SEEN_LOCK:
+            if key in _READ_DEGRADE_SEEN:
+                return
+            _READ_DEGRADE_SEEN.add(key)
+    suffix = f" what={what}" if what else ""
+    logger.warning(
+        "read degraded; returning default (error_type=%s outcome=default_returned%s)",
+        type(exc).__name__,
+        suffix,
+    )
 
 
 def _resolved_or_none(path: Path) -> Path | None:

@@ -9,16 +9,21 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+
+from kiro_crew.atomic_write import read_json_or
 
 from . import destination as _destination
 from . import pinned as _pinned
 from .contract import REPORT_VERSION, ExportRefused
 from .pinned import _NOFOLLOW_READ_FLAGS
 from .staging import _RUN_ID
+
+logger = logging.getLogger(__name__)
 
 
 def _refuse_unless_our_report(path: Path, out_dir: Path) -> None:
@@ -41,10 +46,7 @@ def _refuse_unless_our_report(path: Path, out_dir: Path) -> None:
         return
     if not path.is_file():
         return
-    try:
-        body = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        body = None
+    body = read_json_or(path, None, logger=logger, what="export report")
     # Both fields, not just the version. ``report_version`` is a generic key: any unrelated
     # JSON that happens to carry ``"report_version": 1`` was accepted as this tool's own
     # output and truncated. ``bundle_dir`` is the report's claim about WHICH bundle it

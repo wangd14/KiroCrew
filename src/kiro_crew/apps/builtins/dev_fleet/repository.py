@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import json
 import locale
+import logging
 import os
 import re
 import stat
@@ -13,7 +13,10 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 from kiro_crew.apps.builtins.dev_fleet import runtime
+from kiro_crew.atomic_write import read_json_or
 from kiro_crew.executors import subprocess_executor
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_primary_checkout(path: str) -> str:
@@ -1109,13 +1112,16 @@ def _load_dev_fleet_cfg_checked() -> tuple[dict, bool]:
     except Exception:  # noqa: BLE001
         return section, False
     whole = True
+    _unread = object()
     for fname in ("config.json", "config.local.json"):
         p = base / fname
-        try:
-            if not p.is_file():
-                continue
-            raw = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        if not p.is_file():
+            continue
+        raw = read_json_or(p, _unread, logger=logger, what=fname)
+        if raw is _unread:
+            # A file that is present but unreadable or unparseable contributes no
+            # keys and leaves the view partial -- the same signal ``whole=False``
+            # carried before, now with one log line naming which config file.
             whole = False
             continue
         if isinstance(raw, dict) and isinstance(raw.get("dev_fleet"), dict):
