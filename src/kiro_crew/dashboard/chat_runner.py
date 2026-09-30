@@ -506,6 +506,25 @@ def _folder_steering_turn(
     )
 
 
+def _slot_member_slug(slot_key: str) -> str:
+    """The slug a member DM slot key encodes, or ``""`` for a non-member key.
+
+    A member with a persisted identity gets an id-based slug, so its DM slot key
+    (``member-<member_id>``) carries that immutable id directly -- the one
+    identity source that survives BOTH a restart AND the removal of the original
+    member. The ``dm.json`` binding cannot serve this: ``read_dm_binding``
+    reports it absent once the encoded id no longer resolves in config (exactly
+    the reassignment case that matters). The transcript line is not consulted
+    either -- it is the operator-editable JSONL the pin must never re-derive
+    identity from. A legacy member's key carries a name-derived slug that equals
+    no member's id, so a caller comparing this against a resolved ``member_id``
+    only ever sees a divergence for a genuine stable-identity thread.
+    """
+    from kiro_crew import members as members_mod
+
+    return members_mod.slug_from_dm_slot_key(slot_key) or ""
+
+
 def _require_session_memory_assignment(session_key: str, memory_store: str | None) -> None:
     """A captured execution outranks a later mutable member declaration."""
     from kiro_crew.execution_context import read_session_execution
@@ -11717,6 +11736,32 @@ async def _run_chat(
                     app=slot._app or "",
                     validate_memory_files=False,
                 )
+                # A RESTRICTED session (incognito/temporary) persists no durable
+                # execution carrier -- its line names no ``execution_context`` and
+                # no ``memory_store`` -- so ``previous_execution`` is None and this
+                # branch re-selects the member from the ALIAS the restored slot
+                # carries. The alias is mutable: a member removed and a new one
+                # created under the same name reassigns it to a DIFFERENT immutable
+                # id, and an incognito session READS memory, so a bare alias
+                # re-selection would bind the new member's store and surface memory
+                # this chat never ran as. The DM slot key encodes the immutable
+                # ``member_id`` the thread belongs to (id-based for a member with a
+                # persisted identity, and durable across the original member's
+                # removal, unlike the config-dependent ``dm.json`` re-read); when
+                # the alias now resolves to a member whose id differs from that
+                # encoded id, refuse fail-closed -- the same "open a new
+                # conversation" answer the durable-carrier path above gives on a
+                # store mismatch. A legacy member has no persisted id, so
+                # ``bound_member_id`` is empty and the guard never fires; a
+                # persistent session reads its carrier above and never reaches
+                # this branch.
+                bound_member_id = execution_context.member_id or ""
+                slot_member_slug = _slot_member_slug(slot.key)
+                if bound_member_id and slot_member_slug and bound_member_id != slot_member_slug:
+                    raise _MemoryUnavailable(
+                        "memory_unavailable: this conversation's member binding changed; "
+                        "open a new conversation"
+                    )
             else:
                 execution_context = ExecutionContext(
                     None,

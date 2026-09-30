@@ -145,6 +145,127 @@ class TestDmBinding:
             member_slot_key("Bad Slug")
 
 
+class TestRestrictedRestartMemberIdentity:
+    """Issue #15294: a restricted chat must not re-select its member by a
+    reassigned alias after a restart.
+
+    A restricted (incognito/temporary) session persists no durable execution
+    carrier, so on restart it re-selects the member from the alias its slot
+    carries. The DM binding records the immutable ``member_id`` the thread
+    belongs to; when the alias is reassigned to a NEW member between the last
+    turn and the restart, the binding's id and the alias-resolved member's id
+    diverge, and the reopened chat must refuse (fail-closed) rather than bind
+    the new member's store and read memory it never ran as.
+    """
+
+    @staticmethod
+    def _member(cfg, tmp_path, alias, member_id, store):
+        from kiro_crew.config.sections import KiroCrewAgentConfig, MemoryStoreConfig
+        from kiro_crew.vector_memory import create_member_database
+
+        path = tmp_path / "memory_stores" / store / "memory.db"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        create_member_database(path, member_id=member_id, store_id=store)
+        cfg.agents[alias] = KiroCrewAgentConfig(
+            member_id=member_id, memory_store=store, kiro_agent="shared-template"
+        )
+        cfg.memory_stores[store] = MemoryStoreConfig(
+            owner_member=alias, owner_member_id=member_id, memory_version=2
+        )
+
+    def test_slot_slug_diverges_from_bound_id_after_alias_reassignment(self, tmp_path, monkeypatch):
+        from kiro_crew import execution_context as execution
+        from kiro_crew.config import loader
+        from kiro_crew.dashboard.chat_runner import _slot_member_slug
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        loader._invalidate_config_cache()
+        cfg = SimpleNamespace(agents={}, memory_stores={}, default_agent="kirocrew")
+        # The original member the incognito chat ran as. Its slug IS its id
+        # (a MemV2 member always gets an id-based slug), so the slot key encodes
+        # the immutable id.
+        self._member(cfg, tmp_path, "assistant", "id-alpha", "member-alpha")
+        monkeypatch.setattr(loader.KiroCrewConfig, "load", classmethod(lambda cls: cfg))
+
+        slug = "id-alpha"
+        slot_key = member_slot_key(slug)
+
+        # While the chat is restarting, the alias "assistant" is reassigned to a
+        # brand-new member (the original removed, a new one created under the
+        # same name), minting a different immutable id and store.
+        cfg.agents.clear()
+        cfg.memory_stores.clear()
+        self._member(cfg, tmp_path, "assistant", "id-beta", "member-beta")
+
+        # The slot key still encodes the ORIGINAL id -- durable across the
+        # original member's removal.
+        assert _slot_member_slug(slot_key) == "id-alpha"
+
+        # A bare alias re-selection (what the carrier-less branch does) resolves
+        # to the NEW member -- the divergence the guard refuses on.
+        resolved = execution.resolve_member_execution(
+            cfg, "assistant", memory_mode="incognito", validate_memory_files=False
+        )
+        assert resolved.member_id == "id-beta"
+        assert resolved.member_id != _slot_member_slug(slot_key)
+
+    def test_slot_slug_matches_bound_id_when_alias_is_unchanged(self, tmp_path, monkeypatch):
+        from kiro_crew import execution_context as execution
+        from kiro_crew.config import loader
+        from kiro_crew.dashboard.chat_runner import _slot_member_slug
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        loader._invalidate_config_cache()
+        cfg = SimpleNamespace(agents={}, memory_stores={}, default_agent="kirocrew")
+        self._member(cfg, tmp_path, "assistant", "id-alpha", "member-alpha")
+        monkeypatch.setattr(loader.KiroCrewConfig, "load", classmethod(lambda cls: cfg))
+
+        slot_key = member_slot_key("id-alpha")
+
+        # No reassignment: the alias still resolves to the same immutable id, so
+        # the slot slug and the bound id match and the reopened chat runs
+        # normally (no false refusal, no store change).
+        resolved = execution.resolve_member_execution(
+            cfg, "assistant", memory_mode="incognito", validate_memory_files=False
+        )
+        assert _slot_member_slug(slot_key) == "id-alpha"
+        assert resolved.member_id == "id-alpha"
+        assert resolved.member_id == _slot_member_slug(slot_key)
+
+    def test_legacy_member_without_persisted_id_leaves_bound_id_empty(self, tmp_path, monkeypatch):
+        from kiro_crew import execution_context as execution
+        from kiro_crew.config import loader
+        from kiro_crew.config.sections import KiroCrewAgentConfig
+        from kiro_crew.dashboard.chat_runner import _slot_member_slug
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        loader._invalidate_config_cache()
+        # A legacy (MemV1) member has a name-derived slug and no persisted id, so
+        # ``resolve_member_execution`` yields an empty ``member_id``; the guard
+        # treats an empty bound id as "nothing to compare" and never refuses.
+        slug = slug_for_name("legacy crew")
+        slot_key = member_slot_key(slug)
+        cfg = SimpleNamespace(
+            agents={"legacy crew": KiroCrewAgentConfig(kiro_agent="kirocrew")},
+            memory_stores={},
+            default_agent="kirocrew",
+        )
+        monkeypatch.setattr(loader.KiroCrewConfig, "load", classmethod(lambda cls: cfg))
+        resolved = execution.resolve_member_execution(
+            cfg, "legacy crew", memory_mode="incognito", validate_memory_files=False
+        )
+        assert resolved.member_id is None
+        # slot slug is a name hash, not an id; combined with an empty bound id
+        # the guard cannot fire.
+        assert _slot_member_slug(slot_key) == slug
+        assert slug != ""
+
+    def test_non_member_slot_key_has_no_slug(self):
+        from kiro_crew.dashboard.chat_runner import _slot_member_slug
+
+        assert _slot_member_slug("chat-1-abc") == ""
+
+
 def _make_members_app(state) -> web.Application:
     from kiro_crew.dashboard.handlers.members import (
         api_member_activity,
