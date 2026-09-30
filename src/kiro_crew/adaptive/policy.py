@@ -590,6 +590,7 @@ class AdaptivePolicy:
             )
             self._exec_success_base = sample.completions
             changed = True
+        exec_changed = changed
 
         gate = sample.spawn_gate
         gate_successes = gate.successes - self._gate_success_base
@@ -603,8 +604,10 @@ class AdaptivePolicy:
             self._gate_success_base = gate.successes
             changed = True
 
+        # Judged on the EXEC track alone: a gate step in the same window must
+        # not consume the window an idle exec step is due in.
         idle_step = False
-        if not changed and self._exec_cap < min(p.exec_start, exec_target):
+        if not exec_changed and self._exec_cap < min(p.exec_start, exec_target):
             idle_step = self._idle_recovery_due(sample, report)
             if idle_step:
                 self._exec_cap += 1
