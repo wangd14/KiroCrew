@@ -137,7 +137,13 @@ def _resolve_nvm_path(binary_name: str) -> str | None:
     """
     nvm_dir = os.environ.get("NVM_DIR", os.path.expanduser("~/.nvm"))
     nvm_sh = os.path.join(nvm_dir, "nvm.sh")
+    # This resolver sources a POSIX shell script (nvm.sh). On Windows the branch
+    # normally never runs — nvm.sh is absent, so it exits at the guard below —
+    # and nothing in the log said whether it was reached or which arm it took.
+    # Each outcome now names itself so a Windows log shows the branch was skipped
+    # rather than leaving its absence to inference.
     if not os.path.isfile(nvm_sh):
+        logger.debug("nvm resolver: no nvm.sh at %s; skipping nvm branch", nvm_sh)
         return None
     try:
         result = subprocess.run(
@@ -150,10 +156,18 @@ def _resolve_nvm_path(binary_name: str) -> str | None:
             nvm_node = result.stdout.strip()
             target = os.path.join(os.path.dirname(nvm_node), binary_name)
             if os.path.isfile(target):
+                logger.debug("nvm resolver: resolved %r to %s", binary_name, target)
                 return target
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return None
+            logger.debug("nvm resolver: nvm node at %s has no sibling %r", nvm_node, binary_name)
+            return None
+        logger.debug(
+            "nvm resolver: `nvm which current` returned no path (exit %s)",
+            result.returncode,
+        )
+        return None
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug("nvm resolver: shell invocation failed: %s", type(exc).__name__)
+        return None
 
 
 def _find_node_binary() -> str | None:
