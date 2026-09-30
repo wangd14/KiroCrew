@@ -308,13 +308,17 @@ class TestLeafOnlyPopulationIsRecorded:
     #:   stays sandbox read-write for SEL and would leave the record forgeable by
     #:   a runtime-built path. Same hold as those two, and the same reason it can
     #:   only be leaf-only.
+    #: * ``vouched-executions`` -- the gateway's restart-surviving vouches for
+    #:   member-store admission. A forged file would admit a session to a peer
+    #:   member's private memory, so it sits at the root, masked, rather than
+    #:   under the sandbox read-write ``trust/``. Leaf-only for the same reason.
     #:
     #: Two directories hold what the MCP gateway launches outside the sandbox,
     #: six entries per tier. ``mcp-launch-approvals`` holds the owner's approved
     #: launch fingerprints; ``mcp/resolved`` holds executables substituted for an
     #: approved launch. Each sits beside writable siblings, so no parent stand-in
     #: can hold it.
-    EXPECTED: dict[str, int] = {"standard": 253, "cc": 260, "strict": 261}
+    EXPECTED: dict[str, int] = {"standard": 256, "cc": 263, "strict": 264}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:
