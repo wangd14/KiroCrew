@@ -758,6 +758,18 @@ class TestIdleRecovery:
         d = pol.observe(_sample(t + 180.0))
         assert d.effective_exec_cap == 3
 
+    def test_a_gate_step_does_not_spend_the_idle_exec_step(self) -> None:
+        pol = AdaptivePolicy(_params(exec_ceiling=9, exec_initial=4, increase_successes=1))
+        t = self._cut_to_the_floor(pol)
+        gate_cap = pol.gate_cap
+        # Exec idle, while backend inits keep the gate busy and earning.
+        busy = SpawnGateStats(capacity=gate_cap, in_flight=gate_cap, queued=2, successes=0)
+        pol.observe(_sample(t + 5.0, spawn_gate=busy))
+        d = pol.observe(_sample(t + 60.0, spawn_gate=replace(busy, successes=5)))
+        assert d.action == ACTION_INCREASE
+        assert d.spawn_gate_capacity == gate_cap + 1
+        assert d.effective_exec_cap == 2  # the due idle step landed in the same window
+
     def test_work_below_the_cap_is_not_idle(self) -> None:
         pol = AdaptivePolicy(_params(exec_ceiling=9, exec_initial=4))
         pol.observe(_sample(0.0, loop_lag_ms=400.0, running=4))
