@@ -806,18 +806,27 @@ class OrphanStallMonitor(ManagerComponent):
                 if gb > info.peak_rss_gb:
                     info.peak_rss_gb = gb
                 # Settled-runtime cost (dynamic-subagent-sizing.md §4.1): the
-                # FIRST reading taken once this run has left startup
-                # (``_first_stream_started`` set — its own session has answered),
-                # captured once and held. At that moment the agent's own runtime
-                # (kiro-cli plus its MCP servers) is up but it has not yet grown
-                # the tree with a build/test subprocess, so this is the per-agent
-                # cost the auto cap must be sized from — not ``peak_rss_gb``,
-                # which climbs to whatever workload the run later launched
-                # (#15298). A run still in startup records nothing here; if it
-                # finishes before any post-startup sweep, ``_record_cost`` falls
-                # back to the peak.
-                if info.settled_rss_gb <= 0.0 and info._first_stream_started is not None:
+                # first CLEAN reading of THIS process (``_rss_generation``) taken
+                # once the run has left startup (``_first_stream_started`` set —
+                # its own session has answered) AND no tool is in flight, held
+                # until the next process replaces it. With no tool running, the
+                # subtree is the agent's own runtime alone — kiro-cli plus its
+                # MCP servers — so this is the per-agent cost the auto cap is
+                # sized from, rather than ``peak_rss_gb``, which follows the
+                # subtree up into whatever build or test subprocess a tool call
+                # spawns. Keyed on the generation, not on ``<= 0.0``, so a
+                # respawn re-captures for the fresh process without discarding
+                # the dead one's valid reading in the window before the fresh
+                # process is sampled. A run in startup, or one with a tool in
+                # flight at every post-startup sweep, records nothing and
+                # ``_record_cost`` falls back to the peak.
+                if (
+                    info._settled_rss_generation != info._rss_generation
+                    and info._first_stream_started is not None
+                    and info._inflight_tool is None
+                ):
                     info.settled_rss_gb = gb
+                    info._settled_rss_generation = info._rss_generation
             info.last_procs = _attributed_count(sample.procs, shared_n, info.last_procs)
             info.last_stubs = _attributed_count(sample.matched, shared_n, info.last_stubs)
             jiffies = sample.jiffies
@@ -836,13 +845,13 @@ class OrphanStallMonitor(ManagerComponent):
 
         The recorded ``mem_gb`` is the SETTLED-runtime reading
         (``settled_rss_gb``: the agent's own kiro-cli + MCP-server footprint,
-        sampled once after startup), NOT the whole-subtree ``peak_rss_gb``. The
-        cap divides available memory by ``read_learned_cost("mem_gb")``, so a run
-        that launched a build/test suite priced the whole workload as the agent's
-        cost and pinned the cap at the floor (#15298). The peak stays the divisor
-        only when a run finished before any post-startup sweep took a settled
-        reading — a short run whose peak is its own runtime anyway. CPU is
-        telemetry only and keeps its whole-run peak.
+        sampled once after startup with no tool in flight), NOT the whole-subtree
+        ``peak_rss_gb``. The cap divides available memory by
+        ``read_learned_cost("mem_gb")``, so recording the peak would price a run's
+        build or test subtree as the agent's own cost and hold the cap at the
+        floor. The peak is the divisor only when a run finished before any clean
+        post-startup sweep took a settled reading — a short run whose peak is its
+        own runtime anyway. CPU is telemetry only and keeps its whole-run peak.
         """
         mem_gb = info.settled_rss_gb if info.settled_rss_gb > 0.0 else info.peak_rss_gb
         if mem_gb <= 0 and info.peak_cpu_cores <= 0:

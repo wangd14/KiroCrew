@@ -2465,12 +2465,22 @@ class SubagentInfo:
     # (``_first_stream_started`` set) and then held — a settled-runtime reading,
     # before the agent has grown the tree with a build/test subprocess. This is
     # what the learned-cost store records and what sizes the auto cap
-    # (dynamic-subagent-sizing.md §4.1): the whole-subtree ``peak_rss_gb`` counted
-    # every test suite and build a run launched, so a single 132 GB run pinned the
-    # cap at the floor (#15298). 0.0 until the first post-startup sweep observes
-    # this run; ``_record_cost`` falls back to ``peak_rss_gb`` only when a run
-    # finished before any settled reading was taken.
+    # (dynamic-subagent-sizing.md §4.1): the whole-subtree ``peak_rss_gb`` follows
+    # the tree up into every test suite and build a run launches, so a run with a
+    # heavy tool subtree would hold the cap at the floor if it were the divisor.
+    # 0.0 until the first clean post-startup sweep observes this run;
+    # ``_record_cost`` falls back to ``peak_rss_gb`` only when no such reading was
+    # taken. A cancel-recovery respawn KEEPS this reading (it is the dead
+    # process's own runtime, a valid figure) until the fresh process captures its
+    # own — see ``_settled_rss_generation``.
     settled_rss_gb: float = 0.0
+    # The ``_rss_generation`` the held ``settled_rss_gb`` was captured under, or
+    # -1 when none has been. The sweep captures a fresh settled reading when this
+    # trails ``_rss_generation`` (a respawn bumped the latter), so the reading is
+    # re-taken per process WITHOUT discarding the prior one: the old value stands
+    # as the run's cost until a clean replacement lands, rather than reverting to
+    # the peak in the window before the fresh process is sampled.
+    _settled_rss_generation: int = -1
     # Most-recent sample of the two high-water signals. The peaks answer "how big
     # can this run's tree get"; a live task-manager surface needs "how big is it
     # right now", which a high-water mark cannot express — it never comes back

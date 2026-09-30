@@ -125,11 +125,14 @@ class CancellationCoordinator(ManagerComponent):
                 info._rss_generation += 1
                 info._rss_samples = 0
                 info.last_rss_gb = 0.0
-                # The settled-runtime reading (the cost the auto cap is sized
-                # from) belongs to the dead process; clear it so the fresh one
-                # captures its own once it leaves startup (``run.py`` resets
-                # ``_first_stream_started`` to None for the respawn).
-                info.settled_rss_gb = 0.0
+                # ``settled_rss_gb`` is NOT cleared: it is the dead process's own
+                # runtime footprint, a valid per-agent cost, and it must stand as
+                # the run's cost until the fresh process captures its own clean
+                # reading rather than reverting to the whole-subtree peak in the
+                # window before that sample lands. The generation bump above is
+                # what re-arms the capture: the settled sweep re-captures once
+                # ``_settled_rss_generation`` trails ``_rss_generation`` again
+                # (subagent_manager/monitoring.py).
                 self._manager._tasks[info.id] = asyncio.create_task(self._manager._run(info))
                 try:
                     await self._manager._fire_event("subagent_recovering", info, {"attempt": 1})
