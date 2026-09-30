@@ -79,6 +79,7 @@ from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
 )
+from kiro_crew.sel import sel
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.skills import PROJECT_SKILL_BODY_CAP, SkillsLoader
 
@@ -3090,6 +3091,14 @@ class ContextBuilder:
     # readings of it are held at once.
     _MAX_SUBAGENTS_TOKEN = "{{MAX_SUBAGENTS}}"
     _CAP_FIGURE_SESSIONS = 512
+    # Bounds for the sent-skill-body record. The session count matches the
+    # `_cap_figures` bound (one record per live session; the oldest evicts past
+    # it), and the per-session entry count bounds the inner dict so one session
+    # matching an unbounded set of distinct skills cannot grow without limit.
+    # Both evict oldest-first, and an eviction only costs a re-inject on the next
+    # match (the fail-safe direction), never a silent miss.
+    _SENT_SKILL_BODY_SESSIONS = _CAP_FIGURE_SESSIONS
+    _SENT_SKILL_BODY_ENTRIES = 64
 
     @staticmethod
     def get_memory_for(
@@ -3255,6 +3264,25 @@ class ContextBuilder:
         self.memory_mode_for_session: Callable[[str], Awaitable[str]] | None = None
         self.live_memory_mode_for_session: Callable[[str], str | None] | None = None
         self._session_memory_modes: dict[str, str] = {}
+        # Per-session record of triggered-skill BODIES injected, so a later match
+        # in the same provider window sends the cheap pointer line instead of the
+        # whole body again. Recorded at build time and keyed by a fixed-size
+        # digest of the session key (`_cap_memo_key`) -> {skill_key_digest:
+        # body_sha256}, both keys digested so the caps govern bytes, not just
+        # entries: `_SENT_SKILL_BODY_SESSIONS` bounds how many sessions are held,
+        # `_SENT_SKILL_BODY_ENTRIES` bounds the
+        # skills held per session, and both evict oldest-first. The hash lets an
+        # edited skill re-inject. One builder serves every session and runs on a
+        # thread executor, so the read-check-write is guarded, like `_cap_figures`.
+        # The record fails SAFE in both directions: a rare turn that never lands
+        # demotes the skill to its POINTER next turn (the agent still learns the
+        # skill applies), not to silence; and the record drops for a session whose
+        # provider window cannot hold the bodies — a fresh session and the first
+        # turn after a compaction — tracked alongside the agent last seen so an
+        # agent switch on the same key also resets.
+        self._sent_skill_bodies: dict[str, dict[str, str]] = {}
+        self._sent_skill_agents: dict[str, str | None] = {}
+        self._sent_skill_bodies_lock = threading.Lock()
         if bot_name:
             self._bot_name = bot_name
         else:
@@ -3266,6 +3294,75 @@ class ContextBuilder:
             self._bot_name = "KiroCrew" if is_claude_code(provider) else "Kiro"  # brand-ok
         # Register default memory in the workspace cache
         _memory_stores[_DEFAULT_KEY] = self.memory
+
+    def _dedup_triggered_bodies(
+        self,
+        session_key: str | None,
+        agent: str | None,
+        reset: bool,
+        candidates: list[tuple[str, str]],
+    ) -> set[str]:
+        """Return the subset of *candidates* to DEMOTE from body to pointer.
+
+        *candidates* is ``[(skill_key, body_sha256), ...]`` for the skills whose
+        body this turn would inject. A skill is demoted when the SAME body hash
+        was already recorded in this session — the provider replays native
+        history, so a second identical copy adds nothing. A skill whose hash
+        differs (an edited skill) is not demoted, so the new body arrives. The
+        record is written at build time and read on the next match, so the dedup
+        holds at EVERY ``build_message`` caller with no per-caller wiring. The
+        check-and-record is one guarded transaction.
+
+        *reset* True (a fresh session, or the first turn after a compaction, or
+        an agent switch on this key) drops the prior record first: those are the
+        turns whose provider window cannot hold the earlier bodies, so
+        everything sends again. A missing ``session_key`` (CLI, tests) keeps no
+        record and demotes nothing.
+
+        Fails SAFE in both directions. A rare turn that builds but never lands
+        records its body, so the next turn demotes it to the POINTER line — the
+        agent still learns the skill applies, which is today's behaviour for an
+        ``inject_on_trigger: false`` skill, not silence. And a missed reset
+        likewise demotes to a pointer, never to nothing.
+        """
+        if not session_key:
+            return set()
+        key = self._cap_memo_key(session_key)
+        demote: set[str] = set()
+        with self._sent_skill_bodies_lock:
+            if reset or self._sent_skill_agents.get(key) != agent:
+                self._sent_skill_bodies.pop(key, None)
+            # Move this session to the END of the LRU maps (pop + reinsert the
+            # SAME record object) so eviction drops the least-recently-touched
+            # session -- the insertion-ordered shape `_cap_figures` uses.
+            sent = self._sent_skill_bodies.pop(key, {})
+            self._sent_skill_bodies[key] = sent
+            self._sent_skill_agents.pop(key, None)
+            self._sent_skill_agents[key] = agent
+            for skill_key, digest in candidates:
+                # Store under a fixed-size digest of the skill key, not the key
+                # itself: a skill key reaches here from the caller at whatever
+                # length it likes and an inner entry leaves the record only by
+                # eviction, so an oversized key would stay retained. Digesting it
+                # makes `_SENT_SKILL_BODY_ENTRIES` govern bytes as well as count,
+                # the same reason `_cap_memo_key` digests the session key.
+                skey = self._cap_memo_key(skill_key)
+                if sent.get(skey) == digest:
+                    demote.add(skill_key)
+                    # Touch so the per-session cap keeps the still-matching skill.
+                    sent[skey] = sent.pop(skey)
+                else:
+                    sent.pop(skey, None)
+                    sent[skey] = digest
+            # Bound the inner dict: a session that matches an unbounded set of
+            # distinct skills over its life cannot grow the record without limit.
+            while len(sent) > self._SENT_SKILL_BODY_ENTRIES:
+                sent.pop(next(iter(sent)), None)
+            while len(self._sent_skill_bodies) > self._SENT_SKILL_BODY_SESSIONS:
+                oldest = next(iter(self._sent_skill_bodies))
+                self._sent_skill_bodies.pop(oldest, None)
+                self._sent_skill_agents.pop(oldest, None)
+        return demote
 
     def _substitute_bot_name(self, prompt: str) -> str:
         """Replace {bot_name} placeholder in prompt text.
@@ -5603,6 +5700,18 @@ class ContextBuilder:
             if not request_prefix_context.endswith("\n"):
                 parts.append("\n")
 
+        # Reset the per-session skill-body record on the turn that OWNS a
+        # window-rebuild flag, whether or not a skill matches this turn. The
+        # flag (a fresh session, or the first turn after a compaction) is
+        # one-shot: the provider window it names does not hold the earlier
+        # bodies. If the reset rode only the skill-match branch below, a flag
+        # consumed on a no-match turn (or a custom/minimal turn that skips
+        # skills entirely) is lost, and a later matching turn demotes a body the
+        # rebuilt window never received. Clearing the record here, under the
+        # same lock, keeps that impossible.
+        if session_key and (is_new_session or needs_reinjection):
+            self._dedup_triggered_bodies(session_key, agent, reset=True, candidates=[])
+
         # Triggered skills (on-demand, any message) — skip for custom agents.
         # A match injects the skill's full body by DEFAULT, unchanged. A skill
         # unconfined skill that declares itself an offer rather than a mandate
@@ -5685,6 +5794,11 @@ class ContextBuilder:
                     ", ".join(enforced) or "-",
                     ", ".join(pointer_only) or "-",
                 )
+                # (skill_key, stripped_body, body_sha256) for each enforced
+                # skill whose body loaded — collected first so the per-session
+                # dedup decision runs once, as a single guarded transaction,
+                # rather than per skill inside the emit loop.
+                loadable: list[tuple[str, str, str]] = []
                 for name in enforced:
                     # project_dir, not project-blind: get_triggered_skills and
                     # split_triggered above are both project-aware, so a trusted
@@ -5695,18 +5809,80 @@ class ContextBuilder:
                     content = self.skills.load_skill(name, project)
                     if content:
                         stripped = self.skills.strip_frontmatter(content)
-                        safe_name = _neutralize_structural_markers(name)
-                        safe_name = safe_name.replace("\r", " ").replace("\n", " ")
-                        safe_stripped = _neutralize_structural_markers(stripped)
-                        parts.append(f"[Skill: {safe_name}]\n{safe_stripped}\n[End of skill]\n\n")
-                        # Record use only when the body is actually delivered --
-                        # a trigger match that never reaches the prompt (false
-                        # positive, pointer-only, or undelivered) must not earn
-                        # ranking weight in the lazy-load hotness ledger.
-                        self.skills._record_use(name)
-                hint = self.skills.trigger_hint(pointer_only, project)
+                        # Key the session record by the body actually about to
+                        # be injected, so an edited skill (new hash) re-injects
+                        # while an unchanged one demotes to its pointer.
+                        digest = hashlib.sha256(stripped.encode("utf-8")).hexdigest()
+                        loadable.append((name, stripped, digest))
+                # One guarded transaction: decide which loadable bodies were
+                # already sent in this session (demote those to a pointer) and
+                # record the rest as sent. `is_new_session`/`needs_reinjection`
+                # are the turns whose provider window cannot hold the prior
+                # bodies, so they reset the record and everything re-injects.
+                # Confined project skills are never demotion candidates: they
+                # have no pointer form (trigger_hint omits them), so demoting
+                # one would drop it from the prompt entirely instead of falling
+                # back to a pointer -- they always re-inject their body.
+                confined = self.skills.confined_triggered(
+                    [name for name, _stripped, _digest in loadable], project
+                )
+                demote = self._dedup_triggered_bodies(
+                    session_key,
+                    agent,
+                    reset=is_new_session or needs_reinjection,
+                    candidates=[
+                        (name, digest)
+                        for name, _stripped, digest in loadable
+                        if name not in confined
+                    ],
+                )
+                demoted: list[str] = []
+                for name, stripped, _digest in loadable:
+                    if name in demote:
+                        # Already in the window this session. Fall through to
+                        # the pointer line rather than the body, and do NOT
+                        # record use — a demoted match delivered no body.
+                        demoted.append(name)
+                        continue
+                    safe_name = _neutralize_structural_markers(name)
+                    safe_name = safe_name.replace("\r", " ").replace("\n", " ")
+                    safe_stripped = _neutralize_structural_markers(stripped)
+                    parts.append(f"[Skill: {safe_name}]\n{safe_stripped}\n[End of skill]\n\n")
+                    # Record use only when the body is actually delivered --
+                    # a trigger match that never reaches the prompt (false
+                    # positive, pointer-only, demoted, or undelivered) must not
+                    # earn ranking weight in the lazy-load hotness ledger.
+                    self.skills._record_use(name)
+                # A demoted body still tells the agent the skill applies: hand
+                # it the same pointer line an `inject_on_trigger: false` skill
+                # gets, preserving match order (enforced before opted-out).
+                hint = self.skills.trigger_hint(demoted + pointer_only, project)
                 if hint:
                     parts.append(_neutralize_structural_markers(hint))
+                # Correct the delivery audit. The matcher's single `skill_trigger`
+                # row records the FRONTMATTER-level split (bodies vs opted-out
+                # pointers) it computes at match time -- but that runs before this
+                # dedup, so a body demoted here is still named as a delivered body
+                # in that row. Emit a delivery-truth row naming what the prompt
+                # ACTUALLY carries, so an auditor reconstructing "was this
+                # procedure in the prompt?" is not told a demoted body was sent.
+                # Only when a demotion diverged from the matcher's claim -- the
+                # common no-demotion turn keeps its one row and pays nothing here.
+                if demoted:
+                    delivered_bodies = [
+                        name for name, _stripped, _digest in loadable if name not in demote
+                    ]
+                    sel().log_tool_invocation(
+                        session_key="skills",
+                        tool_name="skill_delivery",
+                        tool_kind="permission",
+                        outcome="triggered",
+                        metadata={
+                            "bodies": ",".join(delivered_bodies),
+                            "pointers": ",".join(demoted + pointer_only),
+                            "demoted": ",".join(demoted),
+                        },
+                    )
 
         # Hook-injected context — apply to all agents. Declarative context can
         # echo user text, so scrub it before placing it beside trusted markers.
