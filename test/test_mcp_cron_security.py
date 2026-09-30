@@ -35,7 +35,10 @@ from kiro_crew.mcp_cron import (
     _call_tool_inner,
     _glob_could_reach_credentials,
     _has_bash_brace_expansion,
+    _is_credential_leaf,
+    _matched_sensitive_name,
     _not_found,
+    _protected_path_refusal,
     _quote_states,
     _substitute_local_assignments,
     _unidentified_caller_refusal,
@@ -979,6 +982,74 @@ def test_vet_script_contents_blocks_malicious(body):
 @pytest.mark.parametrize("body", BENIGN_SCRIPTS)
 def test_vet_script_contents_allows_benign(body):
     assert _vet_script_contents(body) is None
+
+
+# ── Issue #15460: the refusal must NAME the matched path and only call it a
+#    credential file when it actually is one (the old text always cited
+#    ".aws/.ssh/.netrc" and labelled every protected path a "credential file"). ──
+
+
+def test_matched_sensitive_name_reports_the_specific_dir():
+    assert _matched_sensitive_name("cat ~/.aws/credentials") == ".aws"
+    assert _matched_sensitive_name("cat ~/.kube/config") == ".kube/config"
+    assert _matched_sensitive_name("echo hi > /tmp/log") is None
+
+
+def test_credential_leaf_classification():
+    # Genuine credential stores.
+    assert _is_credential_leaf(".aws")
+    assert _is_credential_leaf(".ssh")
+    assert _is_credential_leaf(".netrc")
+    assert _is_credential_leaf(".git-credentials")
+    assert _is_credential_leaf(".docker/config.json")
+    # Protected for other reasons -- NOT credential files.
+    assert not _is_credential_leaf(".kube/config")
+    assert not _is_credential_leaf(".midway")
+
+
+def test_command_refusal_names_a_credential_path_correctly():
+    err = _vet_shell_command("cat ~/.aws/credentials")
+    assert err is not None
+    assert ".aws" in err
+    assert "credential" in err
+    # It must NOT fall back to always citing the example triple.
+    assert "e.g. .aws/.ssh/.netrc" not in err
+
+
+def test_command_refusal_names_a_non_credential_protected_path_without_mislabelling():
+    # .kube/config is protected but is NOT a credential file. The old text called
+    # it a "credential file"; the fix names it a "protected path" and cites it.
+    err = _vet_shell_command("cat ~/.kube/config")
+    assert err is not None
+    assert ".kube/config" in err
+    assert "protected path" in err
+    assert "credential file" not in err
+
+
+def test_script_refusal_names_the_matched_path():
+    err = _vet_script_contents("open('/home/u/.kube/config').read()\n")
+    assert err is not None
+    assert ".kube/config" in err
+    assert "credential file" not in err
+    cred = _vet_script_contents("open('/home/u/.aws/credentials').read()\n")
+    assert cred is not None
+    assert ".aws" in cred
+    assert "credential file" in cred
+
+
+def test_glob_reached_refusal_stays_generic_but_accurate():
+    # A glob match cannot carry back the specific name; the message stays
+    # illustrative but must not claim a bare credential file when it may be any
+    # fenced path, and must still start with Error:.
+    err = _vet_shell_command("cat ~/.??h/id_rsa")
+    assert err is not None and err.startswith("Error:")
+    assert "protected path" in err
+
+
+def test_protected_path_refusal_builder_is_pure():
+    assert "command" in _protected_path_refusal("command", ".aws")
+    assert "script" in _protected_path_refusal("script", ".kube/config")
+    assert _protected_path_refusal("command", None).startswith("Error:")
 
 
 # A cron script body is PYTHON SOURCE, not a shell command line. Each body below

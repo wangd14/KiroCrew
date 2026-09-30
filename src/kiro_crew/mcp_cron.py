@@ -133,12 +133,96 @@ def _sub_floor_timeout_note(timeout_secs_val: object) -> str:
 # is its path control) -- because tools such as ``curl -d @~/.aws/credentials`` or
 # ``wget --post-file=$HOME/.ssh/id_rsa`` read files via flags with no recognizable
 # read-command prefix.
+# The boundaries that anchor a sensitive-name match: a path/quote/flag lead-in
+# before the name, and a separator/quote/end after it. Shared so the whole-set
+# matcher and the per-name matcher below cannot drift apart on what counts as a
+# match.
+_CRON_CRED_PATH_PRE = r"(?:^|[\s'\"=@/~`]|\$\{?HOME\}?)"
+_CRON_CRED_PATH_POST = r"(?:/|\s|['\"]|$)"
 _CRON_CRED_PATH_RE = re.compile(
-    r"(?:^|[\s'\"=@/~`]|\$\{?HOME\}?)"
-    r"(?:" + "|".join(re.escape(d) for d in _SENSITIVE_HOME_DIRS) + r")"
-    r"(?:/|\s|['\"]|$)",
+    _CRON_CRED_PATH_PRE
+    + r"(?:"
+    + "|".join(re.escape(d) for d in _SENSITIVE_HOME_DIRS)
+    + r")"
+    + _CRON_CRED_PATH_POST,
     re.IGNORECASE,
 )
+# Per-name matchers, in the SAME list order as ``_SENSITIVE_HOME_DIRS``, so a
+# match can name the specific protected path it hit rather than always citing
+# ``.aws/.ssh/.netrc``. The set matcher stays the primary check (one pass); this
+# is consulted only after it fires, to report WHICH name matched.
+_CRON_CRED_PATH_NAME_RES: list[tuple[str, re.Pattern[str]]] = [
+    (
+        d,
+        re.compile(_CRON_CRED_PATH_PRE + re.escape(d) + _CRON_CRED_PATH_POST, re.IGNORECASE),
+    )
+    for d in _SENSITIVE_HOME_DIRS
+]
+# The subset of ``_SENSITIVE_HOME_DIRS`` that are genuinely credential stores, so
+# the refusal can say "credential file" only when that is accurate. Everything
+# else on the list -- a kubeconfig, an SSO cookie dir, kiro-cli's own data home,
+# the governance trust-root -- is protected for a different reason and is named
+# as a "protected path" instead. Matched case-insensitively against the leaf.
+_CRON_CREDENTIAL_LEAF_HINTS = (
+    ".aws",
+    ".ssh",
+    ".gnupg",
+    ".gpg",
+    ".azure",
+    "gcloud",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "config.json",  # .docker/config.json holds registry auth tokens
+    "auth",
+    "token",
+)
+
+
+def _matched_sensitive_name(text: str) -> str | None:
+    """Return the first ``_SENSITIVE_HOME_DIRS`` entry a literal reference in
+    *text* hits, or ``None``. Used only to NAME an already-detected match; the
+    set-wide ``_CRON_CRED_PATH_RE`` remains the detector."""
+    for name, pattern in _CRON_CRED_PATH_NAME_RES:
+        if pattern.search(text):
+            return name
+    return None
+
+
+def _is_credential_leaf(name: str) -> bool:
+    """True when *name* (a ``_SENSITIVE_HOME_DIRS`` entry) is a credential store,
+    so the refusal may call it a "credential file"; False for a path protected
+    for another reason (kubeconfig, SSO cookies, an agent's own data home)."""
+    leaf = name.rsplit("/", 1)[-1].lower()
+    return any(hint in leaf for hint in _CRON_CREDENTIAL_LEAF_HINTS)
+
+
+def _protected_path_refusal(surface: str, matched: str | None) -> str:
+    """Build the refusal for a cron ``surface`` ("command" or "script") that
+    referenced a protected path. Names the matched path when known, and only
+    calls it a credential file when it actually is one -- fixing the old text
+    that always cited ``.aws/.ssh/.netrc`` and labelled every protected path
+    (e.g. ``.kube/config``) a "credential file"."""
+    if matched is None:
+        # Detected via glob expansion, whose matched name is not carried back; keep
+        # the illustrative examples but describe the class accurately.
+        return (
+            f"Error: cron {surface} blocked: a glob could expand onto a protected "
+            f"path (credential stores such as .aws/.ssh/.netrc, and other fenced "
+            f"paths). Cron {surface}s may not reach these directly."
+        )
+    if _is_credential_leaf(matched):
+        return (
+            f"Error: cron {surface} blocked: references the credential path "
+            f"{matched!r}. Cron {surface}s may not read credential files directly."
+        )
+    return (
+        f"Error: cron {surface} blocked: references the protected path {matched!r}. "
+        f"Cron {surface}s may not read fenced paths directly."
+    )
+
+
 # Protected secret env vars a cron command must not read by name. Union of the
 # sandbox-scrubbed agent keys (Slack tokens, owner id) and well-known cloud /
 # source-control credential env vars. The sandbox strips _AGENT_DENIED_ENV_KEYS
@@ -1189,12 +1273,10 @@ def _vet_shell_command(command: str, *, governance_checked: bool = False) -> str
         _substitute_local_assignments(unescaped),
     )
     for variant in variants:
-        if _CRON_CRED_PATH_RE.search(variant) or _glob_could_reach_credentials(variant):
-            return (
-                "Error: cron command blocked: references a credential path "
-                "(e.g. .aws/.ssh/.netrc). Cron commands may not read credential "
-                "files directly."
-            )
+        if _CRON_CRED_PATH_RE.search(variant):
+            return _protected_path_refusal("command", _matched_sensitive_name(variant))
+        if _glob_could_reach_credentials(variant):
+            return _protected_path_refusal("command", None)
     if _CRON_SECRET_ENV_RE.search(command):
         return "Error: cron command blocked: references a protected secret environment variable"
     # After resolving tracked local assignments, any variable reference STILL
@@ -1273,10 +1355,7 @@ def _vet_script_contents(text: str) -> str | None:
             "than left unscanned"
         )
     if _CRON_CRED_PATH_RE.search(text):
-        return (
-            "Error: cron script blocked: references a credential path "
-            "(e.g. .aws/.ssh/.netrc). Cron scripts may not read credential files."
-        )
+        return _protected_path_refusal("script", _matched_sensitive_name(text))
     if _CRON_SECRET_ENV_RE.search(text) or _CRON_SECRET_NAME_RE.search(text):
         return "Error: cron script blocked: references a protected secret environment variable"
     exfil = scan_exfiltration_urls(text)
