@@ -52,6 +52,77 @@ The event, privacy and resource contract is in
 The Needs you inbox precedes cards, and all answer/approval authority stays in
 native controls. Disabling automatic content does not disable those controls.
 
+### The crew main dashboard: numbers from folds, three sentences from the model
+
+A ROOT session -- one with no parent edge -- gets a derived card built from folds rather
+than written by a model. On the Crew page that card IS the panel body: the shell drops
+its tiles, its progress bar and its per-session rows. The chat side panel and the fleet
+page receive the same card as one framed section and keep their own summaries beside it. The split is the point: **every number comes from a crew-log fold, and
+the model writes exactly three sentences.** A number never passes through a model,
+and it is no longer computed in the browser either.
+
+The chain is `crew log -> fold -> typed provider -> the template paints`.
+`dashboard_templates/crew_main.html` is an inert fragment whose fields bind
+through `data-dashboard-field`. `kiro_crew.crew_main_contract.CrewMainData` is that
+field set as a TypedDict, and `build_crew_main` is the one provider, deriving every
+count from five fold renders: `status` (state, phase, last recorded time,
+turns, log entries, agent, model), `work` (items open, reporting progress, blocked,
+accepted, awaiting a decision, and entries the fold dropped), `usage` (credits, the
+sub-agent share of them, tokens), `approvals` (tool approvals open and decided), and
+`panel` (the crew's published view). The remaining three — `lede`, `you`, `notes` —
+are the model's, capped at 160 characters each. `merge_crew_main` names every
+field rather than merging dicts, so a model field cannot land on a derived one.
+`test_crew_main_contract` asserts the template's field set and the TypedDict's are
+equal both ways, because mypy cannot see inside HTML.
+
+Which slot this applies to is `card_lifecycle.is_root_session`, and root means no
+parent edge in EITHER of the two places one can live. `_created_by` carries the
+birth-time edge, written once when a session dispatches another; the crew log's
+session tree carries the edge an adopt or release moves later, and `parent_slot is
+None` there is the same root notion the sidebar rows read through `parent_payload`.
+Both are required: the tree alone cannot tell "nothing cites a creator" from "not
+seeded yet", so it would hand a worker a panel on a gateway with the crew log off,
+and `_created_by` alone cannot see an adoption, because the adopt verb records the
+edge in the log and never touches that field. This is deliberately not a crew-DM
+test -- a member's DM slot is one kind of root session, not the definition of one.
+
+A worker gets no panel of its own and no row in a root's panel. Its state reaches the
+reader through the root's own fields where the folds carry it: the `work` fold records
+each item's worker-reported status, so `items_progress`, `items_blocked` and
+`items_question` are worker state summarised in the root's numbers. What no fold
+carries -- a worker's own turn count, spend or approvals -- is read by opening that
+worker, where its own panel answers for it. The React shell draws no summary number of its own —
+the Running/Blocked tiles and the progress bar are gone, the bar because it states a
+ratio while hiding both of its terms. What stays in React is everything that is a
+control: approval and question cards, the tab that filters them, and that tab's
+badge, which counts the cards on screen rather than summarising history. The chat
+side panel and the fleet page are unchanged.
+
+Absence is three-state and carried in words, because the data island is a flat map
+of strings: a fold key that is missing renders `not recorded`, a fold that could not
+be read renders `could not be read`, and the two are never collapsed — a zero
+standing in for an unknown is the one failure a reader cannot recover from. No value
+is ever a percentage, and every count states its denominator in words.
+
+Numbers never wait on the model. The derived publish rides the same host event that
+commits the entries the folds read, and it is deliberately outside the generator's
+queue: it takes none of the single permit and none of the hourly budget, so a crew
+whose sentences are queued, over budget, or failing outright still shows current
+numbers with the three sentences empty. The `dashboard.dynamic_dashboard_cards`
+toggle and the budget therefore gate the sentences alone.
+
+The ask_question inventory has no field here. It is a host read with no fold behind
+it, so there is no honest derived count of it; the two question-shaped numbers that
+ARE folds appear instead (`approvals_open` from `approvals`, `items_question` from
+`work`), and the question cards keep being rendered by React, which is where they
+belong anyway because each one is a control. The published view's content stays a
+sandboxed document React mounts beside this one — an iframe document cannot hold
+another framed document's React tree — so only its title is composed in.
+
+Nothing inside the template is a control or a link. The host already strips `href`,
+`src`, `alt` and `title` in card mode, and the template says so in words, so a count
+that reads like a link is still only text.
+
 An HTML/widget artifact tagged `task-dashboard` is a model-authored task view,
 not a fixed dashboard schema. The chat's **Dynamic Dashboard** side-panel tab
 (labelled **Dashboard**; a one-time hint card above the composer opens it once

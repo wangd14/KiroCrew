@@ -1,0 +1,132 @@
+<!-- The crew main dashboard. INERT: no script, no controls, no links, no remote bytes.
+     Every value arrives through data-dashboard-field, which the host binds as
+     textContent. The counts come from crew-log folds through build_crew_main, the
+     sentences line is the host's, and only lede, you and notes are written by a
+     model. No count is restated here: a number in this comment goes stale the
+     moment a field moves, and the parity gate already counts the fields.
+     Labels are real text nodes, never CSS generated content: the host strips
+     content/list-style/quotes/text-emphasis/text-overflow in card mode, so a label
+     declared in CSS would vanish from the page and from the backend's text scan of it.
+     There is no progress bar and no percentage anywhere: a bar states a ratio while
+     hiding both of its terms, so each count carries its denominator in words. -->
+<style>
+  .cm { display: flex; flex-direction: column; gap: 14px; max-width: 100%; }
+  .cm-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 10px; }
+  .cm-state {
+    font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--accent); border: 1px solid var(--accent); border-radius: 999px;
+    padding: 2px 9px; white-space: nowrap;
+  }
+  .cm-phase { font-size: 13px; color: var(--muted); }
+  .cm-lede { font-size: 15px; line-height: 1.5; }
+  .cm-say { display: flex; flex-direction: column; gap: 4px; }
+  .cm-label {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--muted);
+  }
+  .cm-you {
+    font-size: 14px; line-height: 1.5; border-left: 2px solid var(--accent); padding-left: 10px;
+  }
+  .cm-note { font-size: 12px; line-height: 1.5; color: var(--muted); }
+  /* A sentence the model left empty collapses its whole block rather than leaving a
+     heading with nothing under it. Where :has is unsupported the block simply stays,
+     showing a label and a blank line -- visibly empty, never a zero standing in for
+     something unsaid. */
+  .cm-say:has(.cm-v:empty) { display: none; }
+  .cm-sec {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--muted); border-top: 1px solid var(--muted); padding-top: 8px;
+  }
+  .cm-grid {
+    display: grid; gap: 10px 16px;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  }
+  .cm-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .cm-k { font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .cm-v { font-size: 13px; line-height: 1.4; overflow-wrap: break-word; }
+  .cm-model { font-size: 11px; line-height: 1.45; color: var(--muted); font-style: italic; }
+  .cm-foot { font-size: 11px; line-height: 1.5; color: var(--muted); }
+</style>
+<div class="cm">
+  <div class="cm-head">
+    <span class="cm-state" data-dashboard-field="state"></span>
+    <span class="cm-phase" data-dashboard-field="phase"></span>
+  </div>
+
+  <!-- Directly above the first model sentence, because it describes them and a reader
+       needs it before reading them. Never empty and never collapsed: a blank line here
+       and three blank sentences are the same page and mean different things. -->
+  <div class="cm-model" data-dashboard-field="sentences"></div>
+
+  <div class="cm-lede" data-dashboard-field="lede"></div>
+
+  <div class="cm-say">
+    <span class="cm-label">Your move</span>
+    <div class="cm-you cm-v" data-dashboard-field="you"></div>
+  </div>
+
+  <div class="cm-sec">Crew work</div>
+  <div class="cm-grid">
+    <div class="cm-cell"><span class="cm-k">Not yet done</span>
+      <span class="cm-v" data-dashboard-field="items_open"></span></div>
+    <!-- "Reporting progress", not "Running": this counts work ITEMS whose worker last
+         reported progress, not sessions that are awake. A session count would have to
+         include workers, which this panel does not show. -->
+    <div class="cm-cell"><span class="cm-k">Reporting progress</span>
+      <span class="cm-v" data-dashboard-field="items_progress"></span></div>
+    <div class="cm-cell"><span class="cm-k">Blocked</span>
+      <span class="cm-v" data-dashboard-field="items_blocked"></span></div>
+    <div class="cm-cell"><span class="cm-k">Accepted</span>
+      <span class="cm-v" data-dashboard-field="items_done"></span></div>
+    <div class="cm-cell"><span class="cm-k">Waiting on you</span>
+      <span class="cm-v" data-dashboard-field="items_question"></span></div>
+    <div class="cm-cell"><span class="cm-k">Entries dropped</span>
+      <span class="cm-v" data-dashboard-field="board_omitted"></span></div>
+  </div>
+
+  <div class="cm-sec">Tool approvals</div>
+  <div class="cm-grid">
+    <div class="cm-cell"><span class="cm-k">Still waiting</span>
+      <span class="cm-v" data-dashboard-field="approvals_open"></span></div>
+    <div class="cm-cell"><span class="cm-k">Answered</span>
+      <span class="cm-v" data-dashboard-field="approvals_decided"></span></div>
+  </div>
+
+  <div class="cm-sec">This session</div>
+  <div class="cm-grid">
+    <div class="cm-cell"><span class="cm-k">Turns</span>
+      <span class="cm-v" data-dashboard-field="turns"></span></div>
+    <div class="cm-cell"><span class="cm-k">Last recorded</span>
+      <span class="cm-v" data-dashboard-field="last_activity"></span></div>
+    <div class="cm-cell"><span class="cm-k">Log</span>
+      <span class="cm-v" data-dashboard-field="entries"></span></div>
+    <div class="cm-cell"><span class="cm-k">Agent</span>
+      <span class="cm-v" data-dashboard-field="agent"></span></div>
+    <div class="cm-cell"><span class="cm-k">Model</span>
+      <span class="cm-v" data-dashboard-field="model"></span></div>
+    <div class="cm-cell"><span class="cm-k">Published view</span>
+      <span class="cm-v" data-dashboard-field="published_view"></span></div>
+  </div>
+
+  <div class="cm-sec">Spend</div>
+  <div class="cm-grid">
+    <div class="cm-cell"><span class="cm-k">Credits</span>
+      <span class="cm-v" data-dashboard-field="credits"></span></div>
+    <div class="cm-cell"><span class="cm-k">Sub-agents</span>
+      <span class="cm-v" data-dashboard-field="credits_subagents"></span></div>
+    <div class="cm-cell"><span class="cm-k">Tokens</span>
+      <span class="cm-v" data-dashboard-field="tokens"></span></div>
+  </div>
+
+  <div class="cm-say">
+    <span class="cm-label">Caveat</span>
+    <div class="cm-note cm-v" data-dashboard-field="notes"></div>
+  </div>
+
+  <!-- One line, because the render showed the long version outweighing the numbers it
+       was explaining. What a reader cannot work out for themselves is that this is inert:
+       everything else that was here (which counts come from the log, why a worker has no
+       row) is in the module doc, where it is read once instead of on every render. -->
+  <div class="cm-foot">Nothing here is a link or a control. To act on anything above,
+    answer it in the Needs you card above this panel.</div>
+</div>

@@ -27,7 +27,7 @@ const STATE_KEYS: Record<RunState, string> = {
   blocked: 'commandCenter.blocked', waiting: 'commandCenter.waiting', needs_input: 'commandCenter.state_needs_input', stopped: 'commandCenter.stopped',
 }
 
-export default function CommandCenterPanel({ slot, active, publishedView, sessionReady = true }: {
+export default function CommandCenterPanel({ slot, active, publishedView, sessionReady = true, crewMain = false }: {
   slot: string | null
   active: boolean
   /** A Crew publication remains readable while its thread is revalidated;
@@ -36,6 +36,22 @@ export default function CommandCenterPanel({ slot, active, publishedView, sessio
   /** The Crew host supplies its existing published view, with its own sandbox.
    * Presentation composition never grants a document native action authority. */
   publishedView?: { title: string; content: ReactNode }
+  /** This is a crew's MAIN session, so the panel body is ONE template document
+   * (`dashboard_templates/crew_main.html`) whose every count `build_crew_main` derived
+   * from that crew's crew-log folds. The shell then draws no summary number of its own:
+   * the tiles and the progress bar come out, because a number computed here from the
+   * slot list is a second answer to a question the log already answers, and the two
+   * disagree the moment one source lags.
+   *
+   * Worker rows come out with them. This panel is about the CREW; a worker's detail is
+   * read by opening that worker, where its own panel answers for it.
+   *
+   * What stays is everything that is a CONTROL rather than a summary: the approval and
+   * question cards, the tab that filters them, and the badge on that tab -- which counts
+   * the cards on screen in this tab, a fact about the live inventory the reader is
+   * looking at, not a summary of the crew's history. Only the fleet page and the chat
+   * side panel are left as they were; neither passes this. */
+  crewMain?: boolean
 }) {
   const { t } = useTranslation()
   const data = useCommandCenter(slot, active && sessionReady)
@@ -66,12 +82,18 @@ export default function CommandCenterPanel({ slot, active, publishedView, sessio
       <p className="text-[12px] text-muted">{t('commandCenter.description')}</p>
       <div hidden={!sessionReady} className="space-y-3">
       {data.approvalMode === 'normal' && <p className="text-[12px] text-muted">{t('commandCenter.normal_help')}</p>}
-      <div className="grid grid-cols-2 gap-2" aria-live="polite">
+      {/* Running/Blocked and the progress bar are browser arithmetic over the slot list
+          and the work read. On a crew main session the template carries both, folded
+          from the log, with each count's denominator in words -- so these come out
+          rather than sit beside them saying something slightly different. The bar in
+          particular is a percentage drawn: it states a ratio while hiding both of its
+          terms, which is why it has no field in the contract to move to. */}
+      {!crewMain && <div className="grid grid-cols-2 gap-2" aria-live="polite">
         {([['commandCenter.running', data.running], ['commandCenter.blocked', data.blocked]] as const).map(([key, count]) => <div key={key} className="rounded-lg border border-border bg-card p-2">
           <div className="font-mono text-lg font-semibold">{fmtNumber(count)}</div><div className="text-[11px] text-muted">{t(key)}</div>
         </div>)}
-      </div>
-      {data.progress && <div className="space-y-1">
+      </div>}
+      {!crewMain && data.progress && <div className="space-y-1">
         <p className="text-[12px] text-muted">{t('commandCenter.progress', { done: fmtNumber(data.progress.done), total: fmtNumber(data.progress.total) })}</p>
         <progress className="w-full h-1.5 accent-accent" value={data.progress.done} max={data.progress.total} aria-label={t('commandCenter.progress_label')} />
       </div>}
@@ -115,7 +137,16 @@ export default function CommandCenterPanel({ slot, active, publishedView, sessio
           {/* No hand-off: pending QuestionCard answer drafts remain mounted below. */}
           <ErrorNotice message={requestDashboard.error?.message} />
         </div>}
-      <div hidden={!sessionReady}>
+      {/* The crew main body: ONE document, every count folded from this crew's log.
+          It replaces the activity list rather than sitting above it, because that list
+          is per-session and this panel is about the crew. */}
+      {crewMain && slot && sessionReady && <SessionStatusFrame panel slot={slot} title={t('commandCenter.title')} active={active && showingOverview} />}
+      {/* NOT `hidden` for the crew-main case, which is the difference between not being
+          seen and not existing. A hidden block stays MOUNTED, so every worker row's
+          SessionStatusFrame would keep fetching that worker's card -- one request per
+          worker, for rows nobody can see. The `hidden={!sessionReady}` below stays as it
+          was, because that case is transient and unsent question drafts live in it. */}
+      {!crewMain && <div hidden={!sessionReady}>
       <PanelSectionHeader label={t('commandCenter.live_activity')} />
       {data.loading && <p role="status" className="text-sm text-muted">{t('commandCenter.loading')}</p>}
       {data.nodes.map(node => <div key={node.id} className="flex items-start gap-2 py-2 border-b border-border last:border-0">
@@ -133,7 +164,7 @@ export default function CommandCenterPanel({ slot, active, publishedView, sessio
         <p>{item.title}</p><p className="text-muted text-[12px]">{t(STATE_KEYS[item.state])}{item.summary ? ` · ${item.summary}` : ''}</p>
       </div>)}
       <p className="flex gap-1.5 items-start text-[11px] text-muted"><ShieldCheck size={13} className="shrink-0" />{t('commandCenter.contained')}</p>
-      </div>
+      </div>}
     </div>
     </div>
     <footer hidden={!sessionReady} className="shrink-0 border-t border-border px-3 py-2 text-[11px] text-muted">

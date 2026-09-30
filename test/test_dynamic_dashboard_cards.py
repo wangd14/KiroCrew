@@ -35,6 +35,19 @@ def test_payload_limits_count_utf8_and_refuse_nested_data():
     assert normalize_card({"html": "<p>ok</p>", "data": {"x": "界" * 2048}}) is None
 
 
+async def _drain_derived(service) -> None:
+    """Await the DERIVED publisher's task, the second worker this producer owns.
+
+    The numbers are published on their own task so they never wait behind the model's
+    single permit, which means a case that asserts the producer left no background task
+    has to settle both. Its work is one fold read per queued slot, so in a fixture with
+    no crew log it finishes as soon as the read answers "could not be read".
+    """
+    worker = service._derived_worker
+    if worker is not None:
+        await asyncio.wait_for(asyncio.gather(worker, return_exceptions=True), 2)
+
+
 @pytest.mark.asyncio
 async def test_events_coalesce_and_reads_do_not_generate():
     calls = []
@@ -324,8 +337,37 @@ async def test_real_slot_events_ignore_replay_and_stream_reader_does_not_hide_ev
 
 @pytest.fixture
 def lifecycle(monkeypatch):
+    """The free-form card path, with the two process-global reads that choose it PINNED.
+
+    This file is the suite for the card a model authors: its slot has no crew log, so the
+    fold-derived panel has nothing to build from and the model's own html and data are
+    what publishes. That precondition is STATED here rather than left to the process,
+    because both reads behind it are process-global: a sibling case that leaves a readable
+    fold under the key ``one`` makes cases here take the derived path, which is a red that
+    depends on the ordering of a whole shard. Two pins:
+
+    * the fold read answers UNREADABLE for all five, which is what a slot with no crew log
+      is, and what makes the free-form path the one taken;
+    * the session-tree projection is reset, because it is a process singleton and
+      ``_eligible`` refuses a slot the tree calls a worker -- a fold left behind under the
+      key ``one`` would take the card away from every case in this file.
+
+    A case that wants the derived path lives in ``test_crew_main_contract.py``, which
+    supplies its own reads.
+    """
+    from kiro_crew.crew_log import session_tree_projection
     from kiro_crew.dashboard import card_lifecycle
     from kiro_crew.history import TranscriptWithheld
+
+    session_tree_projection.reset_for_tests()
+    monkeypatch.setattr(
+        card_lifecycle,
+        "_read_card_folds",
+        lambda key, session_key: {
+            name: card_lifecycle.FOLD_UNREADABLE
+            for name in ("status", "usage", "approvals", "work", "panel")
+        },
+    )
 
     class Log:
         allowed = True
@@ -1201,9 +1243,20 @@ async def test_disabled_cards_never_queue_or_spend(lifecycle):
     service, slot, state = lifecycle
     service.set_enabled(False)
     service.notify(slot, "done")
+    # The claim this case is about is SPEND, and it is unchanged: no model worker, no
+    # attempt charged, no permit taken.
     assert service.worker is None
-    assert not service.publisher.entries
-    assert (await service.read(slot))["status"] == "disabled"
+    assert not service.publisher.attempts
+    assert service.publisher.active is None
+    # What changed: the entry is kept rather than dropped, because the opt-in governs the
+    # three written sentences and the card's numbers are folded from the crew log at no
+    # model cost. Dropping it is what made every row on the live page read that content
+    # generation was unavailable while the log beside it held every number the row wanted.
+    # It is queued for the DERIVED publisher and explicitly not pending for the model one.
+    assert set(service.publisher.entries) == {slot.key}
+    assert service.publisher.entries[slot.key].pending is False
+    assert slot.key in service._derived_pending
+    assert (await service.read(slot))["status"] != "disabled"
 
 
 @pytest.mark.asyncio
@@ -1425,6 +1478,7 @@ async def test_rapid_toggle_waits_for_cancel_and_shutdown_does_not_respawn(lifec
         await asyncio.wait_for(restarted, 2)
     assert service.worker is restarted
     assert service.publisher.active is None
+    await _drain_derived(service)
     assert not state._background_tasks
 
 
@@ -1452,10 +1506,19 @@ async def test_gateway_live_config_owns_cost_opt_in(monkeypatch):
     initial = KiroCrewConfig()
     app = web.Application()
     _register_config_watch(app, state, initial)
+    # Registration still must not build (or import) the producer: that is a separate
+    # case, and this one only needs it to be absent before the post-bind kick.
     assert state._dynamic_cards is None
     _kick_config_watch(app, state)
     await asyncio.wait_for(asyncio.gather(*state._background_tasks), 2)
-    assert state._dynamic_cards is None
+    # Built even though the opt-in is OFF. The opt-in buys the three written sentences;
+    # a card's numbers are folded from the session's own crew log at no model cost, so a
+    # gateway that never gets this object is one where no session can show its numbers --
+    # which is why every row on the live page read that content generation was
+    # unavailable while the log beside it held every number the row wanted.
+    assert state._dynamic_cards is not None
+    assert state._dynamic_cards.enabled is False
+    assert state._dynamic_cards.worker is None
     updated = KiroCrewConfig()
     updated.dashboard.dynamic_dashboard_cards = True
     await watcher._dispatch(

@@ -1140,6 +1140,17 @@ export interface ChatSlot {
    * DM thread to the worker sessions it drives — the Crew Members drawer
    * filters the live slots on it. */
   created_by?: string
+  /** The session tree's parent edge for this slot, attached to every row by
+   * `_attach_slot_parents`: `{slot, key}`, or null when this slot has no parent.
+   * `slot` is the parent's own citation and `key` names the parent's row IN THIS
+   * payload (bare slot key), or null when the parent is not running or sits on a
+   * cycle.
+   *
+   * Distinct from `created_by`, and both are needed to know whether a slot is a
+   * root: `created_by` is the birth-time edge, written once, while this one
+   * carries the edge an adopt or release moves later. An adopted session has an
+   * empty `created_by` and a parent here. */
+  parent?: { slot: string; key: string | null } | null
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */

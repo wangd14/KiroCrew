@@ -4116,6 +4116,12 @@ export default function MembersPage() {
                   slot={activeSlot || null}
                   active={dashboardVisible && !!confirmedSlot}
                   sessionReady={!!confirmedSlot}
+                  // This slot is a crew member's MAIN session, so the panel body is one
+                  // template document whose counts are folded from this crew's own log
+                  // (`build_crew_main`), and the shell stops computing summary numbers
+                  // in the browser. Only this mount passes it: the chat side panel and
+                  // the fleet page keep the host-computed view they had.
+                  crewMain
                   publishedView={activeSlug && activeMemberName ? { title: crewDisplayName(activeView ?? active), content: <CrewWebview
                   slug={activeSlug}
                   member={activeMemberName}

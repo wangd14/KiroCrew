@@ -9967,13 +9967,25 @@ class DashboardState:
         _websocket_for(self).send_ws_slot_patch(json.dumps({"type": "slot_patch", "data": data}))
 
     def set_dynamic_cards_enabled(self, enabled: bool) -> None:
-        """Post-bind activation; retain the producer and its budgets across toggles."""
+        """Post-bind activation; retain the producer and its budgets across toggles.
+
+        The producer is built whether or not the opt-in is on. That opt-in buys the
+        three written SENTENCES; the numbers on a card are folded
+        from the session's own crew log and cost nothing, so a gateway that never gets
+        this object is a gateway where no session can show its own numbers -- which is
+        why every row on the page read that content generation was unavailable while the
+        log beside it held every number the row wanted.
+        """
         if self._dynamic_cards is None:
-            if not enabled:
-                return
             from kiro_crew.dashboard.card_lifecycle import CardLifecycle
 
             self._dynamic_cards = CardLifecycle(self)
+            # Seeded here rather than only inside ``set_enabled``: that method returns
+            # early when the flag has not moved, and on a gateway booting with the
+            # sentences off it has not, so nothing would ever publish the numbers.
+            self._dynamic_cards.set_enabled(enabled)
+            self._dynamic_cards.seed_open_sessions()
+            return
         self._dynamic_cards.set_enabled(enabled)
 
     def notify_dashboard_card(self, slot: "_ChatSlot", reason: str) -> None:

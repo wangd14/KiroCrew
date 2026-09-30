@@ -5206,9 +5206,11 @@ def _register_config_watch(
         await live.watch().stop()
         lifecycle = getattr(state, "_dynamic_cards", None)
         if lifecycle is not None:
-            lifecycle.set_enabled(False)
-            if lifecycle.worker is not None:
-                await asyncio.gather(lifecycle.worker, return_exceptions=True)
+            # One call rather than reaching for a worker attribute: the producer owns TWO
+            # tasks now -- the model queue and the derived publisher that folds the
+            # numbers -- and a teardown that awaited only the one it knew about left the
+            # other running past shutdown.
+            await lifecycle.shutdown()
 
     app.on_cleanup.append(_config_watch_shutdown)
 
