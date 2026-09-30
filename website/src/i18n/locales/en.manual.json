@@ -3739,7 +3739,6 @@
       "starter_suggest": "Suggest what you could help me with",
       "prompt_suggest": "Look through the past conversations and memory you’re allowed to use, and suggest a few things you could help me with. For each one, tell me what it’s based on. If there isn’t enough to go on yet, just say so.",
       "starter_create": "Create a crewmate",
-      "foot": "Starters fill in the message box below. Nothing is sent until you send it.",
       "draft_kept": "You already have a message in the box, so it was left as it is."
     },
     "guideLayer": {

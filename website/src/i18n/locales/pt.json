@@ -5614,7 +5614,6 @@
       "starter_suggest": "Sugira como você pode me ajudar",
       "prompt_suggest": "Veja as conversas anteriores e a memória que você tem permissão para usar e sugira algumas coisas em que poderia me ajudar. Para cada uma, diga em que ela se baseia. Se ainda não houver o suficiente, é só dizer.",
       "starter_create": "Criar um colega",
-      "foot": "As sugestões preenchem a caixa de mensagem abaixo. Nada é enviado até você enviar.",
       "draft_kept": "Já havia uma mensagem na caixa, então ela foi mantida como estava."
     },
     "guideLayer": {

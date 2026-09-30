@@ -337,6 +337,11 @@ const SORT_KEY = 'mc-members-sort'
  *  a per-member state, so the choice follows the user across members and
  *  reloads exactly as the chat page's own panel flag does. */
 const PANEL_OPEN_KEY = 'mc-members-panel-open'
+/** The Assistant's docked panel choice, hidden until the user opens it. The
+ *  Assistant is the landing chat for a first-time user, so its page opens on
+ *  the conversation alone; opening the panel there is remembered here without
+ *  moving the choice every other crewmate reads from `PANEL_OPEN_KEY`. */
+const ASSISTANT_PANEL_OPEN_KEY = 'mc-members-assistant-panel-open'
 /** Static key per menu row — a map, not a template, so `check-i18n-keys` can
  *  resolve every reference (assembled keys are a counted blind spot there). */
 const SOURCE_LABEL_KEY: Record<Exclude<MemberSourceFilter, 'all'>, string> = {
@@ -1198,7 +1203,14 @@ export default function MembersPage() {
   // permanent column is wanted at all, and whether the drawer is up right now
   // — so dismissing the drawer must not also hide the column the next time the
   // window widens.
-  const [dockedOpen, setDockedOpen] = usePersistedBool(PANEL_OPEN_KEY, true)
+  const [memberDockedOpen, setMemberDockedOpen] = usePersistedBool(PANEL_OPEN_KEY, true)
+  const [assistantDockedOpen, setAssistantDockedOpen] = usePersistedBool(ASSISTANT_PANEL_OPEN_KEY, false)
+  const onAssistant = useMemo(() => {
+    const open = members.find((m) => m.name === activeName)
+    return !!open && isAssistantMember(open)
+  }, [members, activeName])
+  const dockedOpen = onAssistant ? assistantDockedOpen : memberDockedOpen
+  const setDockedOpen = onAssistant ? setAssistantDockedOpen : setMemberDockedOpen
   const { panelVisible, showOpener } = panelChrome({ beside, dockedOpen, overlayOpen })
   const closeDocked = useCallback(() => setDockedOpen(false), [setDockedOpen])
   // One gesture drives whichever placement is live, so the header button and

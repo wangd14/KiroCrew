@@ -5614,7 +5614,6 @@
       "starter_suggest": "Sugiere en qué podrías ayudarme",
       "prompt_suggest": "Revisa las conversaciones anteriores y la memoria que puedes usar, y sugiere algunas cosas en las que podrías ayudarme. Para cada una, dime en qué se basa. Si todavía no hay suficiente información, dilo sin más.",
       "starter_create": "Crear un compañero",
-      "foot": "Las sugerencias rellenan el cuadro de mensaje de abajo. No se envía nada hasta que lo envíes tú.",
       "draft_kept": "Ya tienes un mensaje en el cuadro, así que se dejó tal cual."
     },
     "guideLayer": {

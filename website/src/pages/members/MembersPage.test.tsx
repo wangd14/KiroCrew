@@ -987,6 +987,22 @@ describe('MembersPage side panel (Notes / Work log / Dashboard / Schedules) and 
     expect(screen.getByTestId('member-panel-toggle')).toBeInTheDocument()
   })
 
+  it('the Assistant lands with its docked panel hidden, remembered apart from every other crewmate', async () => {
+    localStorage.removeItem('mc-members-assistant-panel-open')
+    await renderPage([defaultRow(), assistantRow(), row({ name: 'oncall', slug: 'oncall', bound: true, slot_key: 'member-oncall' })])
+    expect(await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)).toHaveTextContent('member-assistant')
+    expect(screen.queryByTestId('member-notes')).toBeNull()
+    // Hidden, not removed: the header opener brings it back.
+    fireEvent.click(screen.getByTestId('member-panel-toggle'))
+    expect(await screen.findByTestId('member-notes')).toBeInTheDocument()
+    expect(localStorage.getItem('mc-members-assistant-panel-open')).toBe('1')
+    fireEvent.click(screen.getByRole('button', { name: /close panel/i }))
+    await waitFor(() => expect(screen.queryByTestId('member-notes')).toBeNull())
+    // Another crewmate still opens with the panel shown: the Assistant's choice is its own.
+    fireEvent.click(await rosterRow('oncall'))
+    expect(await screen.findByTestId('member-notes')).toBeInTheDocument()
+  })
+
   it('the side-panel chord is inert on the empty pane, so it cannot hide the panel of the next member opened', async () => {
     const defaultRow = row({ name: 'default', slug: 'default' })
     const oncallRow = row({ name: 'oncall', bound: true, slot_key: 'member-oncall' })

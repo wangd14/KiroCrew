@@ -5614,7 +5614,6 @@
       "starter_suggest": "Suggère ce que tu pourrais faire pour moi",
       "prompt_suggest": "Parcours les conversations passées et la mémoire que tu as le droit d’utiliser, et suggère quelques façons de m’aider. Pour chacune, dis-moi sur quoi elle se fonde. S’il n’y a pas encore assez d’éléments, dis-le simplement.",
       "starter_create": "Créer un coéquipier",
-      "foot": "Les suggestions remplissent la zone de message ci-dessous. Rien n’est envoyé tant que tu ne l’envoies pas.",
       "draft_kept": "Tu as déjà un message dans la zone, il a donc été laissé tel quel."
     },
     "guideLayer": {

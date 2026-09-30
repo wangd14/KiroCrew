@@ -147,8 +147,14 @@ export default function AssistantWelcome({ compact, name, onStarter, onCreate }:
                     </Btn>
                   </li>
                 </ul>
-                <p className="m-0 mt-3 text-[12px] text-muted" role="status" aria-live="polite" data-testid="assistant-welcome-status">
-                  {draftKept ? i18nT('components.assistantWelcome.draft_kept') : i18nT('components.assistantWelcome.foot')}
+                {/* The live region stays mounted so the draft-kept notice is announced when it appears. */}
+                <p
+                  className={draftKept ? 'm-0 mt-3 text-[12px] text-muted' : 'sr-only'}
+                  role="status"
+                  aria-live="polite"
+                  data-testid="assistant-welcome-status"
+                >
+                  {draftKept ? i18nT('components.assistantWelcome.draft_kept') : null}
                 </p>
               </motion.div>
             )}

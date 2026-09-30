@@ -5524,7 +5524,6 @@
       "starter_suggest": "Schlag vor, wobei du mir helfen kannst",
       "prompt_suggest": "Sieh dir die früheren Unterhaltungen und Erinnerungen an, die du nutzen darfst, und schlag ein paar Dinge vor, bei denen du mir helfen könntest. Sag mir bei jedem, worauf es beruht. Wenn es dafür noch nicht genug gibt, sag das einfach.",
       "starter_create": "Einen Crewmate erstellen",
-      "foot": "Startvorschläge füllen das Nachrichtenfeld unten aus. Nichts wird gesendet, bis du es selbst sendest.",
       "draft_kept": "Im Nachrichtenfeld steht schon etwas, deshalb wurde es so gelassen."
     },
     "guideLayer": {
