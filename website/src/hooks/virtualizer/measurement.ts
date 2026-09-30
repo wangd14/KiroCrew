@@ -12,6 +12,7 @@ import { useCallback, useLayoutEffect, useMemo, useRef, useSyncExternalStore, ty
 import { isRailSettling } from '../useRailWidth'
 import { inPlaceDeltaAbove, resizedInPlaceBelow } from './inPlaceResize'
 import { HeightIndex } from './HeightIndex'
+import { boundWidthFamilyFor } from '../../utils/widthFamilyGc'
 import { repriceAboveFoldDelta } from './FollowController'
 import type { WindowRange } from './WindowCalculator'
 import { composerExplainsViewportChange } from '../../utils/composerResize'
@@ -136,6 +137,15 @@ export function useHeightOwner<T>(ctx: {
         return it ? getKeyRef.current(it, i) : null
       },
     })
+    // A scope change is the one moment a NEW per-width blob can join this
+    // slot's family, so it is where the family is bounded. Bound AFTER the
+    // owner exists so the scope just opened is spared (it is the current
+    // width, and a warm return re-opens exactly the width that must not be
+    // evicted); the least-recently-used OTHER widths are reclaimed. Operates
+    // only on the persisted derived caches -- never this live owner, a draft,
+    // or config -- and never caps the measurable width. No-op for a scope
+    // with no `:w<bucket>` suffix (a caller that did not width-scope).
+    boundWidthFamilyFor(heightScope)
   } else {
     // Transcripts grow while mounted; keep the cap in step with the row count.
     heightIndexRef.current.setRowCount(itemCount)

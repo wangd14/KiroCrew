@@ -26,8 +26,10 @@
 
 // localStorage key prefix — a storage identifier, never rendered. Not UI copy.
 // Kept in sync with SESSION_PREFIXES in `utils/storageGc.ts`, which garbage-
-// collects these keys; changing it orphans every persisted height map.
-const LS_KEY_PREFIX = 'vc_heights_'
+// collects these keys; changing it orphans every persisted height map. Also
+// read by `widthFamilyGc.ts`, which bounds how many per-width blobs one slot
+// retains -- another reason a rename must stay in lockstep across the module.
+export const LS_KEY_PREFIX = 'vc_heights_'
 // Baseline floor for the eviction cap. The effective cap grows with the
 // session's row count up to HARD_CEILING (see effectiveCap()).
 const MAX_ENTRIES = 2000
@@ -63,6 +65,14 @@ const MAX_MEAN_PX = 4000
 // constants and reports a literal matching none of its content exemptions,
 // and lowercase_snake is one of them. A storage identifier, never rendered.
 export const SCHEMA_VERSION_KEY = 'vc_schema_version'
+// Reserved own-property key holding the epoch-ms timestamp of this blob's last
+// WRITE. Read by `widthFamilyGc.ts` to order a slot's per-width blobs by
+// recency so the least-recently-used widths are the first evicted when the
+// family grows past its bound. Like SCHEMA_VERSION_KEY it is not a row: `flush`
+// never persists a row spelled this way and `load` never reads it as a height.
+// Spelled in the module's `vc_` storage vocabulary for the same i18n-strict-pass
+// reason as SCHEMA_VERSION_KEY. A storage identifier, never rendered.
+export const TOUCHED_AT_KEY = 'vc_touched_at'
 // Schema version of the persisted blob. BUMP IT whenever what a stored number
 // MEANS changes -- a different row layout, a different measurement point, a
 // different unit -- so blobs from the old semantics are dropped rather than
@@ -379,6 +389,10 @@ export class HeightCache {
       // Stamped FIRST so it survives a truncated read and is visible to a
       // human inspecting the blob.
       obj[SCHEMA_VERSION_KEY] = HEIGHT_SCHEMA_VERSION
+      // Recency stamp for the per-width family bound (widthFamilyGc.ts). Every
+      // write refreshes it, so a width the reader keeps returning to stays warm
+      // and the widths they abandoned sort oldest and are evicted first.
+      obj[TOUCHED_AT_KEY] = Date.now()
       // Retired keys are deliberately NOT persisted: the row is gone from the
       // transcript, so after a reload its height would be back in the mean
       // pricing rows that are still there. The in-memory entry is what serves a
@@ -387,7 +401,7 @@ export class HeightCache {
         if (this.retired.has(k)) continue
         // The version slot is not a row. A row key spelled like it loses its
         // persistence rather than overwriting the stamp.
-        if (k === SCHEMA_VERSION_KEY) continue
+        if (k === SCHEMA_VERSION_KEY || k === TOUCHED_AT_KEY) continue
         obj[k] = v
       }
       this.storage.setItem(this.storageKey, JSON.stringify(obj))
@@ -479,7 +493,7 @@ export class HeightCache {
     // instead makes the row unmeasured, which is the state the estimate path
     // and the write-side floor already handle.
     for (const k of Object.keys(parsed as Record<string, unknown>)) {
-      if (k === SCHEMA_VERSION_KEY) continue
+      if (k === SCHEMA_VERSION_KEY || k === TOUCHED_AT_KEY) continue
       const v = (parsed as Record<string, unknown>)[k]
       if (typeof v === 'number' && Number.isFinite(v) && v > 0) {
         this.cache.set(k, v)
