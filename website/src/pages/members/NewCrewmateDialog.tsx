@@ -42,6 +42,7 @@ import { Btn, Input } from '../../components/ui'
 import { api } from '../../api/client'
 import { MEMBERS_ROSTER_QUERY_KEY } from '../../api/membersQuery'
 import { usePublishNavigationStake, useRegisterNavigationLeaveGuard } from '../../components/NavigationLeaveGuard'
+import { useSidePanelLeaveGuard } from '../../components/SidePanelLayout'
 // From the side-effect-free module, not `api/client`: test doubles of the
 // client mock only `api`, and an `instanceof` against an undefined import
 // throws instead of falling through to the generic message.
@@ -441,11 +442,22 @@ export default function NewCrewmateDialog({ open, onClose, onCreated, existingNa
   // in flight asks too, since leaving loses the answer (the crewmate may be
   // created, but its chat will not open here).
   const atStake = open && (dirty || busy || (wsModalOpen && wsDirty))
-  useRegisterNavigationLeaveGuard(() => {
+  const mayLeave = () => {
     if (!atStake) return true
     return window.confirm(t(busy ? 'pages.membersPage.create_leave_busy' : 'pages.membersPage.create_leave_draft'))
-  })
+  }
+  useRegisterNavigationLeaveGuard(mayLeave)
   usePublishNavigationStake(atStake)
+  // When this dialog is opened from a pane inside a SidePanelLayout (the crew
+  // manager's Crews tab), the layout registers its own leave guard into the app
+  // shell's single slot AND gates its tab switches on a pane guard this dialog
+  // never filled — so a capability-tab switch, and the browser Back the layout
+  // forwards, would unmount the page and discard the typed draft with no
+  // confirm. Registering the same predicate through the side-panel channel
+  // fills that pane slot and rides the layout's forward to the shell. Outside a
+  // layout (the Crewmates page) the context is null and this is a no-op, so the
+  // direct app-shell registration above stays the only guard there.
+  useSidePanelLeaveGuard(mayLeave, atStake)
 
   const submit = () => {
     setError(''); setHint(''); setUnconfirmed(false)
