@@ -28,6 +28,10 @@ records operator-approved fingerprints for stubbed MCP launches. A fingerprint
 covers the declared environment text, so a changed `${VAR}` value keeps an
 approved launch approved only when the environment sidecar publishes; a failed
 sidecar pass persists no rebind. A changed declared text does not keep approval.
+A command or argument path inside the running install's `sys.prefix` is hashed
+install-relative, so the approval names the gateway's own interpreter rather
+than the versioned directory a release places it in; the encoding opens with a
+byte no UTF-8 token can contain, so no spelled-out argv collides with it.
 The residual: `${VAR}` values come from the gateway environment, so an
 unsealed source of it (such as a writable shell rc file) changes an approved
 launch's values silently instead of surfacing as a refusal.

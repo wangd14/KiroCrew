@@ -727,6 +727,13 @@ from the gateway environment (the operator's shell and the crew `.env`), which
 no agent can write. A sidecar publication failure drops every rebind from that
 pass, so gatewayd refuses the changed expansion and the next boot retries. A
 changed command, argument or declared env text is still refused.
+The command hash encodes a path inside the running install's `sys.prefix`
+install-relative (`hashing.launch_token_bytes`), so a launch the rewriter pinned to
+the gateway's own interpreter -- a manifest's bare `python3`, the `kirocrew` host
+CLI, the absolute `deps_boot` shim -- keeps its approval when an upgrade moves that
+interpreter to the next versioned directory. Only the prefix is folded away: a
+different interpreter, argument or path outside the install is still a changed
+launch, and a path outside the install hashes exactly as it did before.
 An absent or empty store approves nothing. A stub
 without a matching fingerprint stays on the session's unpooled, sandboxed launch
 path. A queued cold spawn reloads the store after admission and resolves the same

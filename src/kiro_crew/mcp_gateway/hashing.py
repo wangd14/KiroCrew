@@ -14,6 +14,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import sys
 from typing import Any, Collection, Mapping, Sequence
 
 #: One base64url JSON list carrying the stub's own flag tokens. Every raw value
@@ -82,6 +84,80 @@ def expand_stub_flags(argv: Sequence[Any]) -> list[Any]:
     return out
 
 
+#: Byte that opens and closes the install-relative encoding of a launch token
+#: (see :func:`launch_token_bytes`). ``0xFF`` never occurs in UTF-8, so no
+#: literal token -- and no sequence of literal tokens joined by the ``\0``
+#: separator -- can produce these bytes: the encoding cannot collide with a
+#: spelled-out path, so an agent cannot type a string that hashes like the
+#: gateway's own interpreter.
+_INSTALL_MARK = b"\xff"
+_INSTALL_TAG = b"kirocrew-install"
+_SEPARATORS = frozenset(sep for sep in (os.sep, os.altsep) if isinstance(sep, str) and sep)
+
+
+def _install_roots() -> tuple[tuple[bytes, str], ...]:
+    """``(role, directory)`` pairs whose contents move on every upgrade of this install.
+
+    ``sys.prefix`` / ``sys.exec_prefix`` are the running interpreter's install
+    tree: the interpreter itself, its stdlib and the ``site-packages`` that
+    carries ``kiro_crew``. The desktop and CLI installers lay each release out
+    under a VERSIONED directory (``.../kirocrew/<version>/payload/...``), so a
+    launch pinned to ``sys.executable`` -- the rewrite ``apps/bridges.py`` makes
+    for a bare ``python3`` and for the ``kirocrew`` host CLI -- and every argv
+    entry naming a module under the package (the ``deps_boot`` shim) spell a
+    different path after each upgrade while running exactly the same program.
+
+    Each root carries its ROLE (``prefix`` / ``exec-prefix``) into the encoding,
+    so on a split install (``sys.prefix != sys.exec_prefix``) the same relative
+    path under the two roots stays two different launches -- one root is never
+    a spelling of the other. The second role is dropped only when both roots
+    are the same directory, which is every venv and every bundled runtime.
+
+    Read on every call rather than cached, so a test can point the interpreter at
+    a throwaway prefix. A prefix that IS the filesystem root is skipped: it would
+    make every absolute path install-relative, which describes nothing.
+    """
+    roots: list[tuple[bytes, str]] = []
+    for role, prefix in ((b"prefix", sys.prefix), (b"exec-prefix", sys.exec_prefix)):
+        if not isinstance(prefix, str) or not prefix:
+            continue
+        cased = os.path.normcase(prefix.rstrip("".join(_SEPARATORS)))
+        if not cased or cased == os.path.normcase(os.path.splitdrive(prefix)[0]):
+            continue
+        if all(cased != seen for _role, seen in roots):
+            roots.append((role, cased))
+    return tuple(roots)
+
+
+def launch_token_bytes(token: str) -> bytes:
+    """The bytes :func:`hash_command` folds in for one command or argv token.
+
+    A token that lies inside this interpreter's install tree
+    (:func:`_install_roots`) is encoded install-relative --
+    ``\xff kirocrew-install:<role> \xff <path below that root>`` -- so the hash names
+    *the gateway's own interpreter / package file* rather than the versioned
+    directory it happens to live in this release. Everything else is its UTF-8
+    encoding, unchanged from before this rule existed, so a launch that names
+    nothing under the prefix computes byte-for-byte the hash it always did.
+
+    The comparison is a case-normalised string prefix on a path boundary, never
+    ``realpath``: hashing stays pure (no file is opened, no link is followed --
+    a caller-supplied token is untrusted and a resolve can be a network probe),
+    and the rewriter writes ``sys.executable`` and ``os.path.abspath`` spellings
+    literally, so the literal prefix is the one that matches.
+    """
+    cased = os.path.normcase(token)
+    for role, root in _install_roots():
+        if cased == root:
+            rel = ""
+        elif cased.startswith(root) and cased[len(root)] in _SEPARATORS:
+            rel = cased[len(root) + 1 :]
+        else:
+            continue
+        return _INSTALL_MARK + _INSTALL_TAG + b":" + role + _INSTALL_MARK + rel.encode("utf-8")
+    return token.encode("utf-8")
+
+
 def hash_command(command: str, args: list[str]) -> str:
     """SHA-256 over ``command\\0`` + each ``arg\\0``.
 
@@ -90,14 +166,24 @@ def hash_command(command: str, args: list[str]) -> str:
     ``--target-command`` + split ``--target-args`` through this to register a
     pool key; the rewriter hashes the same inputs to build the
     ``KIROCREW_MCP_TARGET_<SERVER>__<hash>`` env entry that
-    ``gatewayd.env_target_resolver`` looks up by that same key. Both call THIS
-    function so the wire-format can never drift between writer and reader.
+    ``gatewayd.env_target_resolver`` looks up by that same key; the launch
+    approval store (:mod:`kiro_crew.mcp_gateway.launch_approval`) records and
+    re-checks the same digest. All of them call THIS function so the
+    wire-format can never drift between writer and reader.
+
+    Each token goes through :func:`launch_token_bytes`: a path inside the
+    running install's prefix hashes install-relative, so an operator's approval
+    of a launch that pins the gateway's own interpreter (``python3`` rewritten to
+    ``sys.executable``) survives the upgrade that moves that interpreter to the
+    next versioned directory. The stub, gatewayd and the gateway all run from the
+    same install, so they agree on the prefix and on the digest. A launch that
+    names a path outside the install hashes exactly as it did before.
     """
     h = hashlib.sha256()
-    h.update(command.encode("utf-8"))
+    h.update(launch_token_bytes(command))
     h.update(b"\0")
     for a in args:
-        h.update(a.encode("utf-8"))
+        h.update(launch_token_bytes(a))
         h.update(b"\0")
     return h.hexdigest()
 
