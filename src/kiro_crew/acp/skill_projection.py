@@ -340,6 +340,14 @@ class NativeSkillProjection:
     specs: dict[str, dict[str, Any]] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
     search_agents: set[str] = field(default_factory=set)
+    #: The agent this process was LAUNCHED as, recorded by the spawn caller after
+    #: preparation. It is the one name whose ``session/set_mode`` activation the
+    #: request path tolerates when it has no prepared view -- the process is
+    #: already running as it, so refusing to activate it would strand a valid
+    #: startup. Every OTHER modeId stays strict, so a mid-session switch to a mode
+    #: this projection never prepared is still rejected. Empty until set, which
+    #: keeps the strict answer for a projection no spawn has claimed.
+    spawn_agent_name: str = ""
     _lease_finalizer: Any = field(default=None, repr=False, compare=False)
     # Aliases an EARLIER projection of this process published, alias -> agent. The
     # host may still hold them (every alias it loaded at spawn, say), so inbound
@@ -419,7 +427,17 @@ class NativeSkillProjection:
 
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "session/set_mode":
-            return {**params, "modeId": self.agent(str(params.get("modeId", "")))}
+            mode_id = str(params.get("modeId", ""))
+            # The launched agent's own activation is tolerated even with no
+            # prepared view: the process is already running as it, so the initial
+            # ``set_mode`` that activates it must not be refused. ``spawn_agent``
+            # gives that name back unchanged; every other modeId takes the strict
+            # ``agent``, so a mid-session switch to a mode this projection never
+            # prepared is still rejected and an agent cannot escape its scope.
+            resolve = (
+                self.spawn_agent if mode_id and mode_id == self.spawn_agent_name else self.agent
+            )
+            return {**params, "modeId": resolve(mode_id)}
         if method == "_kiro.dev/commands/execute":
             command = params.get("command", "")
             if isinstance(command, dict):

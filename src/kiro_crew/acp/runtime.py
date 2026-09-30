@@ -1871,6 +1871,11 @@ class AcpRuntime:
                 # lease -- and them -- out of the prune.
                 self._spawn_skill_projection = self._native_skill_projection
                 if self._native_skill_projection is not None:
+                    # The agent this process is launched as: its own initial
+                    # ``set_mode`` activation is tolerated even with no prepared
+                    # view (see NativeSkillProjection.request); later switches
+                    # stay strict.
+                    self._native_skill_projection.spawn_agent_name = self._agent
                     argv = list(argv)
                     agent_position = argv.index("--agent") + 1
                     try:
@@ -5434,6 +5439,14 @@ class AcpRuntime:
                 if spawn is not None:
                     prepared.recognise(spawn)
                 prepared.recognise(previous)
+                # A fresh projection starts with an empty spawn_agent_name, so carry
+                # the launch name across the refresh: the set_mode below activates the
+                # agent this process is running as, and that activation is tolerated
+                # with no prepared view only while the projection still remembers its
+                # launch name (see NativeSkillProjection.request). Dropping it here
+                # would make the strict agent() reject the very agent the process runs
+                # as.
+                prepared.spawn_agent_name = previous.spawn_agent_name
                 self._native_skill_projection = prepared
             # set_mode is a handshake request: switching to an agent boots THAT
             # agent's MCP servers, the same server (re-)initialization that gives
@@ -5464,7 +5477,15 @@ class AcpRuntime:
             sent_alias: str | None = None
             untranslated: dict[str, Any] = {}
             if projection_now is not None:
-                sent_alias = projection_now.agent(mode_agent)
+                # The launched agent's own activation is tolerated even with no
+                # prepared view: the process is already running as it, so its set_mode
+                # keeps the authored name (spawn_agent). Every other mode_agent takes
+                # the strict agent(), so a switch to a mode this projection never
+                # prepared is still rejected and an agent cannot escape its scope.
+                if mode_agent and mode_agent == projection_now.spawn_agent_name:
+                    sent_alias = projection_now.spawn_agent(mode_agent)
+                else:
+                    sent_alias = projection_now.agent(mode_agent)
                 wire = {**params, "modeId": sent_alias}
                 untranslated = {"translate": False}
             retries = iter(_PROJECTED_MODE_RETRY_DELAYS_SECS)

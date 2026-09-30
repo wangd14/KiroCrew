@@ -9570,6 +9570,87 @@ async def test_create_session_admits_spawn_agent_named_as_current_mode():
 
 
 @pytest.mark.asyncio
+async def test_activate_mode_bracketed_preserves_the_launch_name_exemption():
+    """The bracket rebuilds the projection to reflect the mode being activated, and
+    a fresh projection starts with an empty ``spawn_agent_name``. Carrying the launch
+    name across that refresh is what keeps the launched agent's own activation
+    tolerated: without it the strict ``agent()`` inside ``request('session/set_mode')``
+    would reject the very agent the process is running as with no prepared view."""
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "kirocrew"
+    # The live projection has no view for the launched agent but remembers it.
+    rt._native_skill_projection = NativeSkillProjection(aliases={}, spawn_agent_name="kirocrew")
+    # The refresh returns a *new* projection with no view and an empty launch name.
+    refreshed = NativeSkillProjection(aliases={})
+    captured: dict = {}
+
+    async def _send(method, params, *, timeout=None, **kwargs):
+        # The runtime pre-translates the modeId itself and sends translate=False;
+        # capture exactly what it puts on the wire to prove the set_mode is admitted.
+        captured["method"] = method
+        captured["params"] = params
+        captured["kwargs"] = kwargs
+        return {}
+
+    rt._send_and_await = AsyncMock(side_effect=_send)  # type: ignore[method-assign]
+
+    with patch(
+        "kiro_crew.acp.skill_projection.prepare_native_skill_projection",
+        return_value=refreshed,
+    ):
+        await rt._activate_mode_bracketed(
+            "s1",
+            "kirocrew",
+            budget=30.0,
+            payload_snapshot=None,
+            wire_registered=True,
+        )
+
+    # The launch name survived the refresh...
+    assert rt._native_skill_projection is refreshed
+    assert refreshed.spawn_agent_name == "kirocrew"
+    # ...so the launched agent's own set_mode activation is tolerated (its authored
+    # name goes on the wire), not rejected by the strict resolver.
+    assert captured["method"] == METHOD_SET_MODE
+    assert captured["params"]["modeId"] == "kirocrew"
+    assert captured["kwargs"].get("translate") is False
+
+
+@pytest.mark.asyncio
+async def test_activate_mode_bracketed_refresh_still_rejects_a_foreign_mode():
+    """The preserved exemption is narrow: only the launched agent passes with no
+    view. A mid-session switch to some OTHER unprepared mode after the refresh still
+    raises through the strict resolver — an agent cannot escape its launch scope."""
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "kirocrew"
+    rt._native_skill_projection = NativeSkillProjection(aliases={}, spawn_agent_name="kirocrew")
+    refreshed = NativeSkillProjection(aliases={})
+    # The strict resolver rejects a foreign mode BEFORE any send, so this must not run.
+    rt._send_and_await = AsyncMock()  # type: ignore[method-assign]
+    rt.terminate_session = AsyncMock()  # type: ignore[method-assign]
+
+    with patch(
+        "kiro_crew.acp.skill_projection.prepare_native_skill_projection",
+        return_value=refreshed,
+    ):
+        with pytest.raises(ValueError, match="no prepared skill discovery view"):
+            await rt._activate_mode_bracketed(
+                "s1",
+                "intruder",
+                budget=30.0,
+                payload_snapshot=None,
+                wire_registered=True,
+            )
+    rt._send_and_await.assert_not_called()
+    # Preservation happened regardless of which mode was being activated.
+    assert refreshed.spawn_agent_name == "kirocrew"
+
+
+@pytest.mark.asyncio
 async def test_create_session_spawn_agent_guard_skipped_on_kas_backend():
     """Guard (A2) is restricted to the backend whose argv carries `--agent`. On KAS
     the agent travels over the wire and is activated by set_mode, which Guard (A)

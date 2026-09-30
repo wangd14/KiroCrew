@@ -174,6 +174,27 @@ def test_transport_keeps_original_agent_identity_and_rejects_unprepared_modes():
         prepared.request("session/set_mode", {"modeId": "unknown"})
 
 
+def test_set_mode_activates_the_launched_agent_without_a_view_but_stays_strict():
+    """The launched agent's own activation passes; other unprepared modes do not.
+
+    The direct-client startup activates the agent with ``session/set_mode``. When
+    that agent has no prepared view, refusing its activation would strand a valid
+    startup, so the request path tolerates the modeId that equals the recorded
+    ``spawn_agent_name`` -- and only that one. A switch to any other mode this
+    projection never prepared is still rejected, so an agent cannot escape the
+    scope it launched under.
+    """
+    prepared = projection.NativeSkillProjection({"custom": "native-alias"})
+    prepared.spawn_agent_name = "kirocrew"
+    activated = prepared.request("session/set_mode", {"sessionId": "s", "modeId": "kirocrew"})
+    assert activated["modeId"] == "kirocrew"
+    # A prepared agent still maps to its alias.
+    assert prepared.request("session/set_mode", {"modeId": "custom"})["modeId"] == "native-alias"
+    # Any OTHER unprepared mode is still rejected, launched agent set or not.
+    with pytest.raises(ValueError, match="no prepared"):
+        prepared.request("session/set_mode", {"modeId": "some-other-agent"})
+
+
 @pytest.mark.parametrize(
     "command", ["/agent swap custom", {"command": "agent", "args": {"value": "swap custom"}}]
 )
