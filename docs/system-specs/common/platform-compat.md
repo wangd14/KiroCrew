@@ -9,6 +9,18 @@ for the helper, not the stdlib call, even in code you believe only runs on POSIX
 import alone is enough to break a Windows install, and the failure lands at import time
 in a module a Windows user cannot avoid.
 
+`platform_compat` is the import and patch surface for every helper below. Two families
+are defined in their own modules and forwarded from it: the cross-process file locks
+(`file_lock`, `flock_exclusive`, `acquire_lock` / `release_lock`, `try_acquire_lock`,
+`open_lock_file`, `open_create_or_existing`, `probe_file_persistence`) in
+`platform_lock_compat`, and the owner-only access helpers (`current_user_sid`,
+`process_owner_sid`, `local_user_id`, the two writability checks, `restrict_to_owner` /
+`restrict_dir_to_owner`, `make_owner_only_dir`) in `platform_owner_compat`. Import and
+patch them as `platform_compat.<name>`: a patch there lands on the owner. The owners read
+the platform flag, the lock modules, the clock, `ctypes`, the Win32 struct layouts and
+two shared constants from `platform_compat` when they run, so a patch of one of those
+there reaches them too.
+
 This is the contract. The Windows install and runtime story a user follows is
 [windows-install.md](../../guides/windows-install.md).
 
