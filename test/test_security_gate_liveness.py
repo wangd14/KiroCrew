@@ -131,7 +131,16 @@ def _url_payload_command(n: int) -> str:
 #: added here fails this gate and has to be re-pinned deliberately, with its reason
 #: written above. The guards that detect a monolith growing back are the per-file cap
 #: and the facade's share below, and both must stay untouched.
-_PACKAGE_LINE_BUDGET = 27_942
+#:
+#: The total covers the recursive-force ``rm`` deletion floor, which lives in its own
+#: ``rm_floor.py`` sibling module: an argv-structural gate that reads the ``rm``
+#: command's own argv (flags in any position/spelling, the ``$HOME``/``~``/glob
+#: targets, ``find -exec`` spans, interpreter ``-c``/``-e`` and stdin/heredoc/
+#: herestring code payloads, exec wrappers, and obfuscated nested spellings), the
+#: sole enforcement for those two rules with their catalog patterns stripped from the
+#: regex tier. The module header and imports it carries are counted here alongside the
+#: relocated code.
+_PACKAGE_LINE_BUDGET = 29_076
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
